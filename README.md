@@ -12,17 +12,6 @@ Once Stockholm is [installed](#installation-instructions), you can run it from t
 stockholm
 ```
 
-You'll also want to start an Interactive Brokers Gateway that Stockholm can talk to. You can do that via:
-
-```sh
-docker container run \
-  --env 'TRADING_MODE=live' \
-  --env 'TWS_USERID=your_ibkr_username' \
-  --env 'TWS_PASSWORD=your_ibkr_password' \
-  --publish 127.0.0.1:4001:4003 \
-  ghcr.io/gnzsnz/ib-gateway@sha256:8b1106efea6c27c14d1a53c881e149a124224e90b4565575334b7f305f7d35b3 # :10.45.1i
-```
-
 Here are the supported command-line options:
 
 ```
@@ -33,6 +22,17 @@ Options:
       --client-id <CLIENT_ID>  Client ID to use for the API connection [default: 100]
   -v, --version                Print version
   -h, --help                   Print help
+```
+
+You'll also need to start an Interactive Brokers Gateway that Stockholm can talk to. You can do that via:
+
+```sh
+docker container run \
+  --env 'TRADING_MODE=live' \
+  --env 'TWS_USERID=your_ibkr_username' \
+  --env 'TWS_PASSWORD=your_ibkr_password' \
+  --publish 127.0.0.1:4001:4003 \
+  ghcr.io/gnzsnz/ib-gateway@sha256:8b1106efea6c27c14d1a53c881e149a124224e90b4565575334b7f305f7d35b3 # :10.45.1i
 ```
 
 ## Installation instructions
