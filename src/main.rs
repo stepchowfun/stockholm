@@ -1,6 +1,6 @@
 use clap::{ArgAction, Parser};
 use ibapi::{
-    client::blocking::Client,
+    Client,
     contracts::{Contract, tick_types::TickType},
     market_data::{MarketDataType, realtime::TickTypes},
 };
@@ -8,7 +8,7 @@ use std::{error::Error, io, time::Duration};
 
 // These constants identify the demonstration instrument and bound the market data request.
 const SYMBOL: &str = "AAPL";
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(1);
 
 // This struct represents the command-line arguments.
 #[derive(Parser)]
@@ -36,17 +36,21 @@ struct Cli {
 }
 
 // Connect to Interactive Brokers and print the latest available AAPL trade price.
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     // Parse the command-line arguments.
     let cli = Cli::parse();
 
     // Request a bounded snapshot so the program exits after receiving the current quote.
-    let client = Client::connect(&cli.address, cli.client_id)?;
+    let client = Client::connect(&cli.address, cli.client_id).await?;
     let contract = Contract::stock(SYMBOL).build();
-    client.switch_market_data_type(MarketDataType::Delayed)?;
+    client
+        .switch_market_data_type(MarketDataType::Delayed)
+        .await?;
     let ticks = client
         .market_data(&contract)
-        .snapshot_once(SNAPSHOT_TIMEOUT)?;
+        .snapshot_once(SNAPSHOT_TIMEOUT)
+        .await?;
 
     // Prefer a real-time last trade, while accepting IBKR's delayed equivalent when supplied.
     let price = latest_price(&ticks).ok_or_else(|| {
