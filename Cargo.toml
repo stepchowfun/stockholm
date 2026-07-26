@@ -1,6 +1,6 @@
 [package]
 name = "stockholm"
-version = "0.0.0"
+version = "0.1.0"
 authors = ["Stephan Boyer <stephan@stephanboyer.com>"]
 edition = "2024"
 description = "An algorithmic trading bot."
@@ -18,3 +18,4 @@ rust.warnings = "deny"
 
 [dependencies]
 clap = { version = "4.6.4", features = ["derive"] }
+ibapi = { version = "3.3.0", default-features = false, features = ["sync"] }
