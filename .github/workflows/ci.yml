@@ -162,8 +162,12 @@ jobs:
         # Make Bash log commands and not silently ignore errors.
         set -euxo pipefail
 
-        # Run the installer script.
-        PREFIX=/tmp ./install.sh
+        # Run the installer script against the latest release, since the version in a release PR
+        # does not exist yet.
+        VERSION="$(git ls-remote --tags --refs --sort=-v:refname origin 'v*' |
+          awk 'NR == 1 { version=$2 } END { sub("^refs/tags/v", "", version); print version }')"
+        test -n "$VERSION"
+        PREFIX=/tmp VERSION="$VERSION" ./install.sh
 
         # Run the installed binary.
         /tmp/stockholm --help
@@ -176,8 +180,12 @@ jobs:
         # Make Bash log commands and not silently ignore errors.
         set -euxo pipefail
 
-        # Run the installer script.
-        PREFIX=/tmp ./install.sh
+        # Run the installer script against the latest release, since the version in a release PR
+        # does not exist yet.
+        VERSION="$(git ls-remote --tags --refs --sort=-v:refname origin 'v*' |
+          awk 'NR == 1 { version=$2 } END { sub("^refs/tags/v", "", version); print version }')"
+        test -n "$VERSION"
+        PREFIX=/tmp VERSION="$VERSION" ./install.sh
 
         # Run the installed binary.
         /tmp/stockholm --help
