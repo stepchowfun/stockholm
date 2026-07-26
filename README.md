@@ -2,7 +2,7 @@
 
 [![Build status](https://github.com/stepchowfun/stockholm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/stepchowfun/stockholm/actions?query=branch%3Amain)
 
-Stockholm is a laboratory for algorithmic trading.
+*Stockholm* is a laboratory for algorithmic trading.
 
 ## Usage
 
