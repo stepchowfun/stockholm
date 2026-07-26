@@ -1,0 +1,3 @@
+# Keep this in sync with [ref:excluded_input_paths].
+/artifacts/
+/target/

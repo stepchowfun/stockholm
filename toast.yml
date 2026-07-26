@@ -1,0 +1,262 @@
+image: ubuntu:26.04
+default: build
+user: user
+command_prefix: |
+  # Make not silently ignore errors.
+  set -euo pipefail
+
+  # Load the Rust startup file, if it exists.
+  if [ -f "$HOME/.cargo/env" ]; then
+    . "$HOME/.cargo/env"
+  fi
+
+  # Use this wrapper for `cargo` if network access is needed.
+  cargo-online () { cargo --locked "$@"; }
+
+  # Use this wrapper for `cargo` unless network access is needed.
+  cargo-offline () { cargo --frozen --offline "$@"; }
+
+  # Use this wrapper for formatting code or checking that code is formatted. We use a nightly Rust
+  # version for the `trailing_comma` formatting option [tag:rust_fmt_nightly_2026-07-18]. The
+  # nightly version was chosen as the latest available release with all components present
+  # according to this page:
+  #   https://rust-lang.github.io/rustup-components-history/x86_64-unknown-linux-gnu.html
+  cargo-fmt () { cargo +nightly-2026-07-18 --frozen --offline fmt --all -- "$@"; }
+
+  # Make Bash log commands.
+  set -x
+tasks:
+  install_packages:
+    description: Install system packages.
+    user: root
+    command: |
+      # Install the following packages:
+      #
+      # - build-essential       - Used to link some crates
+      # - curl                  - Used for installing Tagref and Rust
+      # - gcc-aarch64-linux-gnu - Used for linking the binary for AArch64
+      # - gcc-x86-64-linux-gnu  - Used for linking the binary for x86-64
+      # - ripgrep               - Used for various linting tasks
+      # - shellcheck            - Used for linting shell scripts
+      apt-get update
+      apt-get install --yes \
+        build-essential \
+        curl \
+        gcc-aarch64-linux-gnu \
+        gcc-x86-64-linux-gnu \
+        ripgrep \
+        shellcheck
+
+  install_tagref:
+    description: Install Tagref, a reference checking tool.
+    dependencies:
+      - install_packages
+    user: root
+    command: |
+      # Install Tagref using the official installer script.
+      curl https://raw.githubusercontent.com/stepchowfun/tagref/main/install.sh -LSfs | sh
+
+  create_user:
+    description: Create a user who doesn't have root privileges.
+    user: root
+    command: |
+      # Create a user named `user` with a home directory and with Bash as the login shell.
+      useradd user --create-home --shell /bin/bash
+
+  install_rust:
+    description: Install Rust, a systems programming language.
+    dependencies:
+      - install_packages
+      - create_user
+    command: |
+      # Install stable Rust [tag:rust_1.97.1].
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- \
+        -y \
+        --default-toolchain 1.97.1 \
+        --profile minimal \
+        --component clippy
+
+      # Add Rust tools to `$PATH`.
+      . "$HOME/.cargo/env"
+
+      # Install nightly Rust [ref:rust_fmt_nightly_2026-07-18].
+      rustup toolchain install nightly-2026-07-18 --profile minimal --component rustfmt
+
+  install_tools:
+    description: Install the tools needed to build and validate the program.
+    dependencies:
+      - install_rust
+      - install_tagref
+
+  fetch_crates:
+    description: Download and build Rust packages used by the program.
+    dependencies:
+      - install_tools
+    input_paths:
+      - Cargo.lock
+      - Cargo.toml
+    command: |
+      # Create a "hello world" project with the dependencies we want to fetch.
+      mv Cargo.lock Cargo.lock.og
+      mv Cargo.toml Cargo.toml.og
+      cargo-offline init --vcs none
+      mv Cargo.lock.og Cargo.lock
+      mv Cargo.toml.og Cargo.toml
+
+      # Ask Cargo to build the project in order to fetch the dependencies.
+      cargo-online build
+      cargo-online build --release
+      cargo-online clippy --all-features --all-targets --workspace
+
+      # Delete the build artifacts for the placeholder package while keeping the dependencies.
+      cargo-offline clean --package stockholm
+      cargo-offline clean --release --package stockholm
+
+      # Delete the "hello world" code.
+      rm -rf src
+
+  build:
+    description: Build the binary in non-release mode.
+    dependencies:
+      - fetch_crates
+    input_paths:
+      - src
+    command: |
+      # Build the project with Cargo.
+      cargo-offline build
+
+  test:
+    description: Run the test suite.
+    dependencies:
+      - build
+    command: |
+      # Run the tests with Cargo. The `NO_COLOR` variable is used to disable colored output for
+      # tests that make assertions regarding the output [tag:colorless_tests].
+      NO_COLOR=true cargo-offline test
+
+  lint:
+    description: Run the linters.
+    dependencies:
+      - build
+    input_paths:
+      - .
+    excluded_input_paths:
+      - .git
+
+      # [tag:excluded_input_paths] Keep this in sync with [file:.gitignore].
+      - artifacts
+      - target
+    command: |
+      # Check references with Tagref.
+      tagref
+      tagref list-unused --fail-if-any
+
+      # Lint shell files with ShellCheck.
+      find . -type f -name '*.sh' | xargs shellcheck
+
+      # Lint the code with Clippy.
+      cargo-offline clippy --all-features --all-targets --workspace
+
+      # Check code formatting with Rustfmt. See [ref:format_macros] for an explanation of the `rg`
+      # commands.
+      rg --type rust --files-with-matches '' src | xargs sed -i 's/!(/_(/g'
+      rg --type rust --files-with-matches '' src | xargs sed -i 's/^\([^ (]*\)_(/\1!(/g'
+      if ! cargo-fmt --check; then
+        echo 'ERROR: Please correct the formatting errors above.' 1>&2
+        exit 1
+      fi
+      rg --type rust --files-with-matches '' src | xargs sed -i 's/_(/!(/g'
+
+      # Enforce that lines span no more than 100 columns.
+      if rg --line-number --type rust '.{101}' src; then
+        echo 'There are lines spanning more than 100 columns.' >&2
+        exit 1
+      fi
+
+  run:
+    description: Run the program.
+    dependencies:
+      - build
+    command: |
+      # Run the program with Cargo.
+      cargo-offline run -- --help
+
+  format:
+    description: Format the source code.
+    dependencies:
+      - fetch_crates
+    input_paths:
+      - src
+    output_paths:
+      - src
+    command: |
+      # Format the code with Rustfmt. We temporarily convert macro invocations into function calls
+      # so Rustfmt's `trailing_comma` feature applies to macro arguments [tag:format_macros].
+      rg --type rust --files-with-matches '' src | xargs sed -i 's/!(/_(/g'
+      rg --type rust --files-with-matches '' src | xargs sed -i 's/^\([^ (]*\)_(/\1!(/g'
+      cargo-fmt
+      rg --type rust --files-with-matches '' src | xargs sed -i 's/_(/!(/g'
+
+  release:
+    description: Build and output the release binaries for Linux.
+    dependencies:
+      - fetch_crates
+    input_paths:
+      - src
+    output_paths:
+      - artifacts
+    command: |
+      # Add the targets.
+      rustup target add x86_64-unknown-linux-gnu
+      rustup target add x86_64-unknown-linux-musl
+      rustup target add aarch64-unknown-linux-gnu
+      rustup target add aarch64-unknown-linux-musl
+
+      # Set the linkers.
+      export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc
+      export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-gnu-gcc
+      export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+      export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+
+      # Build the project with Cargo for each Linux target.
+      cargo-online build --release --target x86_64-unknown-linux-gnu
+      cargo-online build --release --target x86_64-unknown-linux-musl
+      cargo-online build --release --target aarch64-unknown-linux-gnu
+      cargo-online build --release --target aarch64-unknown-linux-musl
+
+      # Move the binaries to a more conveniennt location for exporting.
+      mkdir artifacts
+      cp \
+        target/x86_64-unknown-linux-gnu/release/stockholm \
+        artifacts/stockholm-x86_64-unknown-linux-gnu
+      cp \
+        target/x86_64-unknown-linux-musl/release/stockholm \
+        artifacts/stockholm-x86_64-unknown-linux-musl
+      cp \
+        target/aarch64-unknown-linux-gnu/release/stockholm \
+        artifacts/stockholm-aarch64-unknown-linux-gnu
+      cp \
+        target/aarch64-unknown-linux-musl/release/stockholm \
+        artifacts/stockholm-aarch64-unknown-linux-musl
+
+  publish:
+    description: Publish the crate to crates.io.
+    dependencies:
+      - fetch_crates
+    environment:
+      CRATES_IO_TOKEN: null
+    input_paths:
+      - README.md
+      - src
+    command: |
+      # Fetch the program version.
+      VERSION="$(cargo-offline pkgid | grep --extended-regexp --only-matching '[0-9.]+$')"
+
+      # If this version of the package already exists on crates.io, there's nothing more to do.
+      if cargo-online search stockholm | grep "stockholm = \"$VERSION\"" > /dev/null; then
+        echo "Version $VERSION of crate already exists."
+        exit
+      fi
+
+      # Publish to crates.io.
+      cargo-online publish --token "$CRATES_IO_TOKEN"
