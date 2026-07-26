@@ -1,0 +1,20 @@
+[package]
+name = "stockholm"
+version = "0.0.0"
+authors = ["Stephan Boyer <stephan@stephanboyer.com>"]
+edition = "2024"
+description = "An algorithmic trading bot."
+license = "MIT"
+documentation = "https://github.com/stepchowfun/stockholm"
+homepage = "https://github.com/stepchowfun/stockholm"
+repository = "https://github.com/stepchowfun/stockholm"
+readme = "README.md"
+
+[lints]
+clippy.all = { level = "deny", priority = -1 }
+clippy.default_numeric_fallback = "deny"
+clippy.pedantic = { level = "deny", priority = -1 }
+rust.warnings = "deny"
+
+[dependencies]
+clap = { version = "4.6.4", features = ["derive"] }
