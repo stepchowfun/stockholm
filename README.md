@@ -12,8 +12,6 @@ Once Stockholm is [installed](#installation-instructions), you can run it from t
 stockholm
 ```
 
-Running Stockholm submits a day limit order to buy 5 shares of AAPL at $100 per share through the connected Interactive Brokers Gateway, then immediately requests its cancellation.
-
 Here are the supported command-line options:
 
 ```
