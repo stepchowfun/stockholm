@@ -12,6 +12,8 @@ Once Stockholm is [installed](#installation-instructions), you can run it from t
 stockholm
 ```
 
+Running Stockholm submits a day limit order to buy 5 shares of AAPL at $100 per share through the connected Interactive Brokers Gateway, then immediately requests its cancellation.
+
 Here are the supported command-line options:
 
 ```
@@ -28,6 +30,7 @@ You'll also need to start an Interactive Brokers Gateway that Stockholm can talk
 
 ```sh
 docker container run \
+  --env 'READ_ONLY_API=no' \
   --env 'TRADING_MODE=live' \
   --env 'TWS_USERID=your_ibkr_username' \
   --env 'TWS_PASSWORD=your_ibkr_password' \
