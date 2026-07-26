@@ -18,4 +18,5 @@ rust.warnings = "deny"
 
 [dependencies]
 clap = { version = "4.6.4", features = ["derive"] }
-ibapi = { version = "3.3.0", default-features = false, features = ["sync"] }
+ibapi = "3.3.0"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
