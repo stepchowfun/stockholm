@@ -12,7 +12,7 @@ Once Stockholm is [installed](#installation-instructions), you can run it from t
 stockholm
 ```
 
-You'll also want to start an Interactive Brokers Gateway that Stockholm can talk to. You can do that via:
+You'll also need to start an Interactive Brokers Gateway that Stockholm can talk to. You can do that via:
 
 ```sh
 docker container run \
