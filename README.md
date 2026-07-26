@@ -13,14 +13,20 @@ follows:
 stockholm
 ```
 
+Stockholm connects to a running Interactive Brokers Gateway paper-trading API at
+`127.0.0.1:4001` and prints the latest available delayed AAPL trade price. Pass `--address` or
+`--client-id` to override the connection settings.
+
 Here are the supported command-line options:
 
 ```
-Usage: stockholm
+Usage: stockholm [OPTIONS]
 
 Options:
-  -v, --version  Print version
-  -h, --help     Print help
+      --address <ADDRESS>      Address of the running TWS or IB Gateway API [default: 127.0.0.1:4001]
+      --client-id <CLIENT_ID>  Client ID to use for the API connection [default: 100]
+  -v, --version                Print version
+  -h, --help                   Print help
 ```
 
 ## Installation instructions
