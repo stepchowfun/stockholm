@@ -28,13 +28,15 @@ You'll also need to start an Interactive Brokers Gateway that Stockholm can talk
 
 ```sh
 docker container run \
+  --env 'ALLOW_BLIND_TRADING=yes' \
+  --env 'EXISTING_SESSION_DETECTED_ACTION=primary' \
   --env 'READ_ONLY_API=no' \
-  --env 'TRADING_MODE=live' \
-  --env 'TWS_USERID=your_ibkr_username' \
-  --env 'TWS_PASSWORD=your_ibkr_password' \
-  --env 'TWOFA_TIMEOUT_ACTION=exit' \
   --env 'RELOGIN_AFTER_TWOFA_TIMEOUT=no' \
+  --env 'TRADING_MODE=live' \
   --env 'TWOFA_EXIT_INTERVAL=60' \
+  --env 'TWOFA_TIMEOUT_ACTION=exit' \
+  --env 'TWS_PASSWORD=your_ibkr_password' \
+  --env 'TWS_USERID=your_ibkr_username' \
   --publish 127.0.0.1:4001:4003 \
   ghcr.io/gnzsnz/ib-gateway@sha256:8b1106efea6c27c14d1a53c881e149a124224e90b4565575334b7f305f7d35b3 # :10.45.1i
 ```
