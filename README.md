@@ -38,10 +38,11 @@ docker container run \
   --env 'TWOFA_EXIT_INTERVAL=60' \
   --env 'TWOFA_TIMEOUT_ACTION=restart' \
   --env 'TWS_ACCEPT_INCOMING=accept' \
+  --env 'TWS_COLD_RESTART=17:00' \
   --env 'TWS_PASSWORD=your_ibkr_password' \
   --env 'TWS_USERID=your_ibkr_username' \
-  --restart unless-stopped \
   --publish 127.0.0.1:4001:4003 \
+  --restart unless-stopped \
   ghcr.io/gnzsnz/ib-gateway@sha256:8b1106efea6c27c14d1a53c881e149a124224e90b4565575334b7f305f7d35b3 # :10.45.1i
 ```
 
