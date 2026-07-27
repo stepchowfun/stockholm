@@ -8,7 +8,7 @@ use std::{error::Error, io, time::Duration};
 
 // These constants identify the demonstration instrument and bound the market data request.
 const SYMBOL: &str = "AAPL";
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(1);
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 
 // This struct represents the command-line arguments.
 #[derive(Parser)]
@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let client = Client::connect(&cli.address, cli.client_id).await?;
     let contract = Contract::stock(SYMBOL).build();
     client
-        .switch_market_data_type(MarketDataType::Delayed)
+        .switch_market_data_type(MarketDataType::Realtime)
         .await?;
     let ticks = client
         .market_data(&contract)
