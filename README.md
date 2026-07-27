@@ -35,16 +35,19 @@ docker container run \
   --env 'RELOGIN_AFTER_TWOFA_TIMEOUT=yes' \
   --env 'TIME_ZONE=America/New_York' \
   --env 'TRADING_MODE=live' \
-  --env 'TWOFA_EXIT_INTERVAL=60' \
   --env 'TWOFA_TIMEOUT_ACTION=restart' \
   --env 'TWS_ACCEPT_INCOMING=accept' \
   --env 'TWS_COLD_RESTART=17:00' \
   --env 'TWS_PASSWORD=your_ibkr_password' \
   --env 'TWS_USERID=your_ibkr_username' \
+  --env 'VNC_SERVER_PASSWORD=some_password' \
   --publish 127.0.0.1:4001:4003 \
+  --publish 127.0.0.1:5900:5900 \
   --restart unless-stopped \
   ghcr.io/gnzsnz/ib-gateway@sha256:8b1106efea6c27c14d1a53c881e149a124224e90b4565575334b7f305f7d35b3 # :10.45.1i
 ```
+
+For debugging, you can connect to the VNC server at `vnc://127.0.0.1:5900` using the password provided in the `VNC_SERVER_PASSWORD` environment variable above. In macOS, you can do this from Finder with Cmd+k.
 
 Stockholm assumes a *US Equity and Options Add-On Streaming Bundle (NP)* market data subscription.
 
