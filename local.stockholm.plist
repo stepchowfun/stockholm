@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <key>Label</key>
+        <string>local.stockholm</string>
+        <key>Program</key>
+        <string>/usr/local/bin/stockholm</string>
+        <key>ProgramArguments</key>
+        <array>
+            <string>/usr/local/bin/stockholm</string>
+        </array>
+        <key>StandardOutPath</key>
+        <string>/var/log/stockholm.log</string>
+        <key>StandardErrorPath</key>
+        <string>/var/log/stockholm.log</string>
+        <key>KeepAlive</key>
+        <true/>
+    </dict>
+</plist>

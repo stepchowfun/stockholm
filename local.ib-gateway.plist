@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <key>Label</key>
+        <string>local.ib-gateway</string>
+        <key>Program</key>
+        <string>/bin/bash</string>
+        <key>ProgramArguments</key>
+        <array>
+            <string>/bin/bash</string>
+            <string>/usr/local/bin/run-ib-gateway.sh</string>
+        </array>
+        <key>StandardOutPath</key>
+        <string>/var/log/ib-gateway.log</string>
+        <key>StandardErrorPath</key>
+        <string>/var/log/ib-gateway.log</string>
+        <key>EnvironmentVariables</key>
+        <dict>
+            <key>PATH</key>
+            <string>/bin:/usr/bin:/usr/local/bin</string>
+            <key>TWS_USERID</key>
+            <string>your_ibkr_username</string>
+            <key>TWS_PASSWORD</key>
+            <string>your_ibkr_password</string>
+        </dict>
+        <key>KeepAlive</key>
+        <true/>
+    </dict>
+</plist>
