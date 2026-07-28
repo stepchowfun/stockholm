@@ -1,13 +1,12 @@
 use clap::{ArgAction, Parser};
 use ibapi::{Client, contracts::Contract, market_data::MarketDataType};
 use std::error::Error;
-use tokio::time::{self, Duration, MissedTickBehavior};
+use tokio::time::{self, Duration};
 
 // These constants identify the demonstration instrument and bound the market data request.
 const SYMBOL: &str = "AAPL";
 const RETRY_DELAY: Duration = Duration::from_secs(10);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
-const SNAPSHOT_INTERVAL: Duration = Duration::from_mins(1);
 
 // This struct represents the command-line arguments.
 #[derive(Parser)]
@@ -50,7 +49,7 @@ async fn main() {
     }
 }
 
-// Connect to Interactive Brokers and print snapshots of the raw AAPL market data.
+// Connect to Interactive Brokers and print a snapshot of the raw AAPL market data.
 async fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
     // Connect to the configured TWS or IB Gateway instance.
     let client = Client::connect(&cli.address, cli.client_id).await?;
@@ -60,37 +59,25 @@ async fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
         .switch_market_data_type(MarketDataType::Realtime)
         .await?;
 
-    // Prepare the demonstration instrument and schedule the first snapshot immediately.
+    // Prepare the demonstration instrument.
     let contract = Contract::stock(SYMBOL).build();
-    let mut interval = time::interval(SNAPSHOT_INTERVAL);
-    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    // Request and print a bounded snapshot every minute until the process is stopped.
-    loop {
-        interval.tick().await;
+    // Mark the start of the request before collecting its snapshot.
+    println!("Requesting {SYMBOL} market data snapshot…\n");
 
-        // Mark the start of each iteration before requesting its snapshot.
-        println!("Requesting {SYMBOL} market data snapshot…\n");
+    // Collect a complete bounded snapshot and propagate failures to the retry loop.
+    let ticks = client
+        .market_data(&contract)
+        .snapshot_once(SNAPSHOT_TIMEOUT)
+        .await?;
 
-        // Collect a complete snapshot, logging failures before the next scheduled attempt.
-        let ticks = match client
-            .market_data(&contract)
-            .snapshot_once(SNAPSHOT_TIMEOUT)
-            .await
-        {
-            Ok(ticks) => ticks,
-            Err(error) => {
-                eprintln!("Failed to request {SYMBOL} market data snapshot: {error}");
-                continue;
-            }
-        };
-
-        // Print every tick without interpreting or filtering the market data.
-        for tick in ticks {
-            println!("{tick:?}");
-        }
-        println!();
+    // Print every tick without interpreting or filtering the market data.
+    for tick in ticks {
+        println!("{tick:?}");
     }
+    println!();
+
+    Ok(())
 }
 
 #[cfg(test)]
