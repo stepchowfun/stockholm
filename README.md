@@ -83,7 +83,7 @@ Stockholm depends on IB Gateway, so the repository provides sample service defin
 
 #### Creating launchd services on macOS
 
-On macOS, [launchd](https://www.launchd.info/) can be used to run Stockholm and IB Gateway as daemons. Copy [`local.stockholm.plist`](local.stockholm.plist) and [`local.ib-gateway.plist`](local.ib-gateway.plist) to `/Library/LaunchDaemons/`, copy [`run-ib-gateway.sh`](run-ib-gateway.sh) to `/usr/local/bin/`, and make sure all three files are owned by root.
+On macOS, [launchd](https://www.launchd.info/) can be used to run Stockholm and IB Gateway as daemons. Copy [`local.stockholm.plist`](service_configs/local.stockholm.plist) and [`local.ib-gateway.plist`](service_configs/local.ib-gateway.plist) from the `service_configs` directory to `/Library/LaunchDaemons/`, copy [`run-ib-gateway.sh`](run-ib-gateway.sh) to `/usr/local/bin/`, and make sure all three files are owned by root.
 
 Run the following commands to start the services:
 
@@ -96,6 +96,6 @@ You can view the logs with `tail -F /var/log/ib-gateway.log /var/log/stockholm.l
 
 #### Creating systemd services on Linux
 
-On most Linux distributions, [systemd](https://www.freedesktop.org/wiki/Software/systemd/) can be used to run Stockholm and IB Gateway as daemons. Copy [`stockholm.service`](stockholm.service) and [`ib-gateway.service`](ib-gateway.service) to `/etc/systemd/system/`, copy [`run-ib-gateway.sh`](run-ib-gateway.sh) to `/root/run-ib-gateway.sh`, and make sure all three files are owned by root.
+On most Linux distributions, [systemd](https://www.freedesktop.org/wiki/Software/systemd/) can be used to run Stockholm and IB Gateway as daemons. Copy [`stockholm.service`](service_configs/stockholm.service) and [`ib-gateway.service`](service_configs/ib-gateway.service) from the `service_configs` directory to `/etc/systemd/system/`, copy [`run-ib-gateway.sh`](run-ib-gateway.sh) to `/root/run-ib-gateway.sh`, and make sure all three files are owned by root.
 
 Run `sudo systemctl enable ib-gateway stockholm --now` to enable and start the services. You can view the logs with `sudo journalctl --follow --unit ib-gateway --unit stockholm`.
