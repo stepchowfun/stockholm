@@ -5,6 +5,7 @@ use tokio::time::{self, Duration, MissedTickBehavior};
 
 // These constants identify the demonstration instrument and bound the market data request.
 const SYMBOL: &str = "AAPL";
+const RETRY_DELAY: Duration = Duration::from_secs(10);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 const SNAPSHOT_INTERVAL: Duration = Duration::from_mins(1);
 
@@ -33,12 +34,24 @@ struct Cli {
     client_id: i32,
 }
 
-// Connect to Interactive Brokers and print a snapshot of the raw AAPL market data.
+// Parse the configuration and retry the application after top-level failures.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() {
     // Parse the command-line arguments.
     let cli = Cli::parse();
 
+    // Restart the application after a delay whenever a top-level operation fails.
+    loop {
+        if let Err(error) = run(&cli).await {
+            eprintln!("Application failed: {error}");
+        }
+
+        time::sleep(RETRY_DELAY).await;
+    }
+}
+
+// Connect to Interactive Brokers and print snapshots of the raw AAPL market data.
+async fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
     // Connect to the configured TWS or IB Gateway instance.
     let client = Client::connect(&cli.address, cli.client_id).await?;
 
