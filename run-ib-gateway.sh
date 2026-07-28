@@ -20,4 +20,6 @@ docker container run \
   --env 'VNC_SERVER_PASSWORD=vnc_password' \
   --publish 127.0.0.1:4001:4003 \
   --publish 127.0.0.1:5900:5900 \
+  --name ib-gateway \
+  --rm \
   ghcr.io/gnzsnz/ib-gateway@sha256:8b1106efea6c27c14d1a53c881e149a124224e90b4565575334b7f305f7d35b3 # :10.45.1i
