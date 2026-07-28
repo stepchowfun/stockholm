@@ -1,0 +1,11 @@
+[Unit]
+Description=Stockholm
+After=ib-gateway.service
+Wants=ib-gateway.service
+
+[Service]
+ExecStart=/usr/local/bin/stockholm
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
