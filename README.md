@@ -24,7 +24,7 @@ Options:
   -h, --help                   Print help
 ```
 
-You'll also need to start an Interactive Brokers Gateway that Stockholm can talk to. You can do that via the provided `run-ib-gateway.sh` script:
+You'll also need to start an Interactive Brokers Gateway that Stockholm can talk to. You can run it in a Docker container via the provided `run-ib-gateway.sh` script:
 
 ```sh
 TWS_USERID='your_ibkr_username' TWS_PASSWORD='your_ibkr_password' ./run-ib-gateway.sh
