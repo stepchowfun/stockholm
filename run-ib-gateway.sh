@@ -18,15 +18,12 @@ cleanup
 # Run the gateway.
 docker container run \
   --env 'ALLOW_BLIND_TRADING=yes' \
-  --env 'AUTO_RESTART_TIME=11:59 PM' \
   --env 'EXISTING_SESSION_DETECTED_ACTION=primary' \
   --env 'READ_ONLY_API=no' \
-  --env 'RELOGIN_AFTER_TWOFA_TIMEOUT=yes' \
   --env 'TIME_ZONE=America/New_York' \
   --env 'TRADING_MODE=live' \
-  --env 'TWOFA_TIMEOUT_ACTION=restart' \
+  --env 'TWOFA_TIMEOUT_ACTION=exit' \
   --env 'TWS_ACCEPT_INCOMING=accept' \
-  --env 'TWS_COLD_RESTART=17:00' \
   --env 'TWS_PASSWORD' \
   --env 'TWS_USERID' \
   --env 'VNC_SERVER_PASSWORD=vnc_password' \
