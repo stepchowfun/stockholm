@@ -1,12 +1,11 @@
 use clap::{ArgAction, Parser};
-use ibapi::{Client, contracts::Contract, market_data::MarketDataType};
+use ibapi::{Client, contracts::Contract, market_data::MarketDataType, prelude::StreamExt};
 use std::error::Error;
 use tokio::time::{self, Duration};
 
-// These constants identify the demonstration instrument and bound the market data request.
-const SYMBOL: &str = "AAPL";
+// These constants identify the demonstration instrument and configure failure recovery.
+const SYMBOL: &str = "SOXL";
 const RETRY_DELAY: Duration = Duration::from_secs(10);
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 
 // This struct represents the command-line arguments.
 #[derive(Parser)]
@@ -49,7 +48,7 @@ async fn main() {
     }
 }
 
-// Connect to Interactive Brokers and print a snapshot of the raw AAPL market data.
+// Connect to Interactive Brokers and stream the raw SOXL market data.
 async fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
     // Connect to the configured TWS or IB Gateway instance.
     let client = Client::connect(&cli.address, cli.client_id).await?;
@@ -62,20 +61,20 @@ async fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
     // Prepare the demonstration instrument.
     let contract = Contract::stock(SYMBOL).build();
 
-    // Mark the start of the request before collecting its snapshot.
-    println!("Requesting {SYMBOL} market data snapshot…\n");
+    // Mark the start of the request before streaming its ticks.
+    println!("Streaming {SYMBOL} market data…\n");
 
-    // Collect a complete bounded snapshot and propagate failures to the retry loop.
-    let ticks = client
+    // Subscribe to a continuous stream and propagate setup failures to the retry loop.
+    let mut subscription = client
         .market_data(&contract)
-        .snapshot_once(SNAPSHOT_TIMEOUT)
+        .streaming()
+        .subscribe()
         .await?;
 
-    // Print every tick without interpreting or filtering the market data.
-    for tick in ticks {
+    // Print every tick without interpreting or filtering the stream.
+    while let Some(tick) = subscription.next().await {
         println!("{tick:?}");
     }
-    println!();
 
     Ok(())
 }
