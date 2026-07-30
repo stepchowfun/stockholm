@@ -5,7 +5,8 @@ Wants=ib-gateway.service
 
 [Service]
 ExecStart=/usr/local/bin/stockholm
-Restart=on-failure
+Restart=always
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target

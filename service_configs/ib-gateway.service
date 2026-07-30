@@ -7,7 +7,8 @@ Wants=docker.service
 Environment='TWS_USERID=your_ibkr_username'
 Environment='TWS_PASSWORD=your_ibkr_password'
 ExecStart=/usr/bin/bash /root/run-ib-gateway.sh
-Restart=on-failure
+Restart=always
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
