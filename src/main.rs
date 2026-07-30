@@ -71,9 +71,9 @@ async fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
         .subscribe()
         .await?;
 
-    // Print every tick without interpreting or filtering the stream.
+    // Print every tick and propagate stream failures to the retry loop.
     while let Some(tick) = subscription.next().await {
-        println!("{tick:?}");
+        println!("{:?}", tick?);
     }
 
     Ok(())
