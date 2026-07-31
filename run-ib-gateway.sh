@@ -18,6 +18,7 @@ cleanup
 # Run the gateway.
 docker container run \
   --env 'ALLOW_BLIND_TRADING=yes' \
+  --env 'BYPASS_WARNING=yes' \
   --env 'EXISTING_SESSION_DETECTED_ACTION=primary' \
   --env 'READ_ONLY_API=no' \
   --env 'TIME_ZONE=America/New_York' \
