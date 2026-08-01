@@ -17,18 +17,19 @@ cleanup
 
 # Run the gateway.
 docker container run \
-  --env 'ALLOW_BLIND_TRADING=yes' \
-  --env 'BYPASS_WARNING=yes' \
-  --env 'EXISTING_SESSION_DETECTED_ACTION=primary' \
-  --env 'READ_ONLY_API=no' \
-  --env 'RELOGIN_AFTER_TWOFA_TIMEOUT=yes' \
-  --env 'TIME_ZONE=America/New_York' \
-  --env 'TRADING_MODE=live' \
-  --env 'TWOFA_TIMEOUT_ACTION=exit' \
-  --env 'TWS_ACCEPT_INCOMING=accept' \
-  --env 'TWS_PASSWORD' \
-  --env 'TWS_USERID' \
-  --env 'VNC_SERVER_PASSWORD=vnc_password' \
+  --env "TWS_USERID=$(cat "$HOME/ib-username")" \
+  --env ALLOW_BLIND_TRADING=yes \
+  --env BYPASS_WARNING=yes \
+  --env EXISTING_SESSION_DETECTED_ACTION=primary \
+  --env READ_ONLY_API=no \
+  --env RELOGIN_AFTER_TWOFA_TIMEOUT=yes \
+  --env TIME_ZONE=America/New_York \
+  --env TRADING_MODE=live \
+  --env TWOFA_TIMEOUT_ACTION=exit \
+  --env TWS_ACCEPT_INCOMING=accept \
+  --env TWS_PASSWORD_FILE=/home/ibgateway/ib-password \
+  --env VNC_SERVER_PASSWORD=vnc_password \
+  --mount "type=bind,src=$HOME/ib-password,dst=/home/ibgateway/ib-password,ro" \
   --publish 127.0.0.1:4001:4003 \
   --publish 127.0.0.1:5900:5900 \
   --name "$CONTAINER_NAME" \

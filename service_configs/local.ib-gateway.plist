@@ -19,10 +19,6 @@
         <dict>
             <key>PATH</key>
             <string>/bin:/usr/bin:/usr/local/bin</string>
-            <key>TWS_USERID</key>
-            <string>your_ibkr_username</string>
-            <key>TWS_PASSWORD</key>
-            <string>your_ibkr_password</string>
         </dict>
         <key>KeepAlive</key>
         <true/>

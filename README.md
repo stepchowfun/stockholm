@@ -27,8 +27,10 @@ Options:
 You'll also need to start an Interactive Brokers Gateway that Stockholm can talk to. You can run that in a Docker container via the provided `run-ib-gateway.sh` script:
 
 ```sh
-TWS_USERID='your_ibkr_username' TWS_PASSWORD='your_ibkr_password' ./run-ib-gateway.sh
+./run-ib-gateway.sh
 ```
+
+The script expects the Interactive Brokers username to be in a file called `$HOME/ib-username`, and it looks for the password in `$HOME/ib-password`.
 
 You probably want to run Stockholm and IB Gateway as daemons, e.g., with [launchd](https://www.launchd.info/) or [systemd](https://www.freedesktop.org/wiki/Software/systemd/). See the [Configuring your operating system to run Stockholm as a daemon](#configuring-your-operating-system-to-run-stockholm-as-a-daemon) section below for instructions.
 
@@ -79,7 +81,7 @@ You can run that command with `--force` to update an existing installation.
 
 ### Configuring your operating system to run Stockholm as a daemon
 
-Stockholm depends on IB Gateway, so the repository provides sample service definitions for running both programs as daemons. Adjust the paths, credentials, and other settings in these files as needed before installing them.
+Stockholm depends on IB Gateway, so the repository provides sample service definitions for running both programs as daemons. Adjust the paths, arguments, and other settings in these files as needed before installing them.
 
 #### Creating launchd services on macOS
 
