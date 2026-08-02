@@ -72,11 +72,11 @@ async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<d
                     .fetch()
                     .await?;
 
-                // Print only bars inside this window because IB may clamp requests.
+                // Print bar-start timestamps inside this window because IB may clamp requests.
                 for bar in historical_data
                     .bars
                     .into_iter()
-                    .filter(|bar| bar.date > chunk_start.into() && bar.date <= chunk_end.into())
+                    .filter(|bar| bar.date >= chunk_start.into() && bar.date < chunk_end.into())
                 {
                     println!(
                         "{},{},{},{},{},{},{},{}",
