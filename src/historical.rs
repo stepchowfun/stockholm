@@ -121,9 +121,9 @@ mod tests {
         let cli = TestCli::try_parse_from([
             "historical",
             "--start",
-            "2026-07-31T13:30:00Z",
+            "2026-07-31T09:30:00-04:00",
             "--end",
-            "2026-07-31T20:00:00Z",
+            "2026-07-31T16:00:00-04:00",
         ])
         .unwrap();
 
