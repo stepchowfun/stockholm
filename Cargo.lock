@@ -598,6 +598,7 @@ version = "0.2.5"
 dependencies = [
  "clap",
  "ibapi",
+ "time",
  "tokio",
 ]
 

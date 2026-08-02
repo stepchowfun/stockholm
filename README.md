@@ -15,13 +15,24 @@ stockholm
 Here are the supported command-line options:
 
 ```
-Usage: stockholm [OPTIONS]
+Usage: stockholm [OPTIONS] [COMMAND]
+
+Commands:
+  run         Run the trading bot (default)
+  historical  Fetch historical market data as CSV
+  help        Print this message or the help of the given subcommand(s)
 
 Options:
       --address <ADDRESS>      Address of the running TWS or IB Gateway API [default: 127.0.0.1:4001]
       --client-id <CLIENT_ID>  Client ID to use for the API connection [default: 100]
   -v, --version                Print version
   -h, --help                   Print help
+```
+
+You can fetch historical one-second bars as CSV with the `historical` subcommand. The duration accepts a quantity followed by `s`, `d`, `w`, `m`, or `y`, and the date is the inclusive ending date:
+
+```sh
+stockholm historical --duration 1d --date 2026-07-31 --symbol SOXL
 ```
 
 You'll also need to start an Interactive Brokers Gateway that Stockholm can talk to. You can run that in a Docker container via the provided `run-ib-gateway.sh` script:
