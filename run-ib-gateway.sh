@@ -18,6 +18,7 @@ cleanup
 # Run the gateway.
 docker container run \
   --env "TWS_USERID=$(cat "$HOME/ib-username")" \
+  --env 'AUTO_LOGOFF_TIME=10:00 PM' \
   --env ALLOW_BLIND_TRADING=yes \
   --env BYPASS_WARNING=yes \
   --env EXISTING_SESSION_DETECTED_ACTION=primary \
