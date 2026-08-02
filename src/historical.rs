@@ -3,7 +3,7 @@ use clap::Args as ClapArgs;
 use ibapi::{
     Client,
     contracts::Contract,
-    market_data::historical::{self, BarSize},
+    market_data::{TradingHours, historical::BarSize},
 };
 use std::error::Error;
 use time::{self, OffsetDateTime, format_description::well_known::Iso8601};
@@ -36,63 +36,39 @@ pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<d
 
 // Fetch historical one-second bars and print them as CSV rows.
 async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<dyn Error>> {
-    // Validate and convert the requested range for the Interactive Brokers API.
-    let duration = args.end - args.start;
-    if !duration.is_positive() {
+    // Reject empty and reversed ranges before submitting requests.
+    if args.end <= args.start {
         return Err("end datetime must be after start datetime".into());
     }
-    let duration_seconds =
-        i32::try_from(duration.whole_seconds() + i64::from(duration.subsec_nanoseconds() != 0_i32))
-            .map_err(|_| "historical range is too large")?;
 
-    // Find the regular trading sessions within the requested datetime range.
+    // Request every chunk in the range so extended-hours data is not skipped.
     let contract = Contract::stock(&args.symbol).build();
-    let schedule = client
-        .historical_schedules(&contract, historical::Duration::seconds(duration_seconds))
-        .ending(args.end)
-        .fetch()
-        .await?;
-
-    // Print each completed session window while preserving chronological order.
     println!("date,open,high,low,close,volume,wap,count");
-    for session in schedule.sessions {
-        // Intersect each session with the requested calendar range.
-        let session_start = session.start.max(args.start);
-        let session_end = session.end.min(args.end);
-        if session_end > session_start {
-            let mut chunk_start = session_start;
+    let mut chunk_start = args.start;
 
-            // Divide the session into windows supported for one-second bars.
-            while chunk_start < session_end {
-                let chunk_end = (chunk_start + time::Duration::seconds(HISTORICAL_CHUNK_SECONDS))
-                    .min(session_end);
-                let historical_data = client
-                    .historical_data(&contract, BarSize::Sec)
-                    .between(chunk_start, chunk_end)
-                    .fetch()
-                    .await?;
+    // Divide the range into windows supported for one-second bars.
+    while chunk_start < args.end {
+        let chunk_end =
+            (chunk_start + time::Duration::seconds(HISTORICAL_CHUNK_SECONDS)).min(args.end);
+        let historical_data = client
+            .historical_data(&contract, BarSize::Sec)
+            .trading_hours(TradingHours::Extended)
+            .between(chunk_start - time::Duration::SECOND, chunk_end)
+            .fetch()
+            .await?;
 
-                // Print bar-start timestamps inside this window.
-                for bar in historical_data
-                    .bars
-                    .into_iter()
-                    .filter(|bar| bar.date >= chunk_start.into() && bar.date < chunk_end.into())
-                {
-                    println!(
-                        "{},{},{},{},{},{},{},{}",
-                        bar.date,
-                        bar.open,
-                        bar.high,
-                        bar.low,
-                        bar.close,
-                        bar.volume,
-                        bar.wap,
-                        bar.count,
-                    );
-                }
-                chunk_start = chunk_end;
-            }
+        // Print bar-start timestamps inside this window.
+        for bar in historical_data
+            .bars
+            .into_iter()
+            .filter(|bar| bar.date >= chunk_start.into() && bar.date < chunk_end.into())
+        {
+            println!(
+                "{},{},{},{},{},{},{},{}",
+                bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.wap, bar.count,
+            );
         }
+        chunk_start = chunk_end;
     }
 
     Ok(())
