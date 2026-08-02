@@ -2,7 +2,11 @@ mod historical;
 mod run;
 
 use clap::{ArgAction, Parser, Subcommand as ClapSubcommand};
+use ibapi::Client;
 use std::error::Error;
+
+// This delay controls recovery from connection and top-level runtime failures.
+const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 
 // This struct represents the command-line arguments.
 #[derive(Parser)]
@@ -50,8 +54,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Decide what to do based on the subcommand.
     match cli.command.unwrap_or(Subcommand::Run) {
-        Subcommand::Run => run::run(&cli.address, cli.client_id).await,
-        Subcommand::Historical(args) => historical::run(&cli.address, cli.client_id, &args).await,
+        Subcommand::Run => run(&cli.address, cli.client_id).await,
+        Subcommand::Historical(args) => {
+            let client = Client::connect(&cli.address, cli.client_id).await?;
+            historical::run(&client, &args).await
+        }
+    }
+}
+
+// Reconnect and restart the trading bot after top-level failures.
+async fn run(address: &str, client_id: i32) -> Result<(), Box<dyn Error>> {
+    // Restart the application after a delay whenever a top-level operation completes.
+    loop {
+        // Connect to the configured TWS or IB Gateway instance for this attempt.
+        match Client::connect(address, client_id).await {
+            Ok(client) => {
+                if let Err(error) = run::run(&client).await {
+                    eprintln!("Error: {error}");
+                }
+            }
+            Err(error) => eprintln!("Connection to Interactive Brokers Gateway failed: {error}"),
+        }
+
+        tokio::time::sleep(RETRY_DELAY).await;
     }
 }
 
