@@ -17,6 +17,8 @@
         <string>/var/log/ib-gateway.log</string>
         <key>EnvironmentVariables</key>
         <dict>
+            <key>HOME</key>
+            <string>/var/root</string>
             <key>PATH</key>
             <string>/bin:/usr/bin:/usr/local/bin</string>
         </dict>
