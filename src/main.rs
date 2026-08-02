@@ -4,6 +4,9 @@ mod run;
 use clap::{ArgAction, Parser, Subcommand as ClapSubcommand};
 use std::error::Error;
 
+// This symbol is used when the user does not select an instrument.
+const DEFAULT_SYMBOL: &str = "SOXL";
+
 // This struct represents the command-line arguments.
 #[derive(Parser)]
 #[command(

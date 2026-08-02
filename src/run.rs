@@ -1,3 +1,4 @@
+use crate::DEFAULT_SYMBOL;
 use ibapi::{
     Client,
     accounts::PositionUpdate,
@@ -9,7 +10,6 @@ use ibapi::{
 use std::error::Error;
 
 // These constants configure the instrument and failure recovery.
-const SYMBOL: &str = "SOXL";
 const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 
@@ -54,17 +54,17 @@ async fn stream_live_data(client: &Client) -> Result<(), Box<dyn Error>> {
         .await?;
 
     // Subscribe to the default SMART-routed contract for consolidated data.
-    let contract = Contract::stock(SYMBOL).build();
+    let contract = Contract::stock(DEFAULT_SYMBOL).build();
     let mut subscription = client
         .market_data(&contract)
         .streaming()
         .subscribe()
         .await?;
-    println!("[market data] Streaming {SYMBOL} market data…");
+    println!("[market data] Streaming {DEFAULT_SYMBOL} market data…");
 
     // Print every tick and propagate stream failures to the connection loop.
     while let Some(tick) = subscription.next().await {
-        println!("[market data] {SYMBOL}: {:?}", tick?);
+        println!("[market data] {DEFAULT_SYMBOL}: {:?}", tick?);
     }
 
     Err(ibapi::Error::UnexpectedEndOfStream.into())

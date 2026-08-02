@@ -1,3 +1,4 @@
+use crate::DEFAULT_SYMBOL;
 use clap::Args as ClapArgs;
 use ibapi::{
     Client,
@@ -9,7 +10,6 @@ use time::{self, OffsetDateTime, format_description::well_known::Iso8601};
 
 // These constants configure historical data requests.
 const HISTORICAL_CHUNK_SECONDS: i64 = 1_800;
-const SYMBOL: &str = "SOXL";
 
 // These arguments configure a historical data request.
 #[derive(ClapArgs)]
@@ -23,7 +23,7 @@ pub struct Args {
     end: OffsetDateTime,
 
     /// Symbol whose historical data should be fetched.
-    #[arg(long, default_value = SYMBOL)]
+    #[arg(long, default_value = DEFAULT_SYMBOL)]
     symbol: String,
 }
 
