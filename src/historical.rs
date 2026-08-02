@@ -59,16 +59,13 @@ async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<d
         // Intersect each session with the requested calendar range.
         let session_start = session.start.max(args.start);
         let session_end = session.end.min(args.end);
-        let session_seconds = (session_end - session_start).whole_seconds();
-        if session_seconds > 0 {
-            let chunk_count = divide_rounding_up(session_seconds, HISTORICAL_CHUNK_SECONDS);
-            let chunk_seconds = divide_rounding_up(session_seconds, chunk_count);
+        if session_end > session_start {
             let mut chunk_start = session_start;
 
             // Divide the session into windows supported for one-second bars.
             while chunk_start < session_end {
-                let chunk_end =
-                    (chunk_start + time::Duration::seconds(chunk_seconds)).min(session_end);
+                let chunk_end = (chunk_start + time::Duration::seconds(HISTORICAL_CHUNK_SECONDS))
+                    .min(session_end);
                 let historical_data = client
                     .historical_data(&contract, BarSize::Sec)
                     .between(chunk_start, chunk_end)
@@ -99,11 +96,6 @@ async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<d
     }
 
     Ok(())
-}
-
-// Divide positive integers while rounding any partial quotient upward.
-fn divide_rounding_up(dividend: i64, divisor: i64) -> i64 {
-    dividend / divisor + i64::from(dividend % divisor != 0)
 }
 
 // Parse an ISO 8601 datetime with an explicit UTC offset.
