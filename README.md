@@ -29,10 +29,10 @@ Options:
   -h, --help                   Print help
 ```
 
-You can fetch historical one-second bars as CSV with the `historical` subcommand. The duration accepts a quantity followed by `s`, `d`, `w`, `m`, or `y`, and the date is the inclusive ending date:
+You can fetch historical one-second bars as CSV with the `historical` subcommand. The start and end are ISO 8601 datetimes with explicit UTC offsets:
 
 ```sh
-stockholm historical --duration 1d --date 2026-07-31 --symbol SOXL
+stockholm historical --start 2026-07-31T13:30:00Z --end 2026-07-31T20:00:00Z --symbol SOXL
 ```
 
 You'll also need to start an Interactive Brokers Gateway that Stockholm can talk to. You can run that in a Docker container via the provided `run-ib-gateway.sh` script:

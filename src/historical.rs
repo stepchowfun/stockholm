@@ -5,7 +5,7 @@ use ibapi::{
     market_data::historical::{self, BarSize},
 };
 use std::error::Error;
-use time::{self, Date, OffsetDateTime, Time, format_description::well_known::Iso8601};
+use time::{self, OffsetDateTime, format_description::well_known::Iso8601};
 
 // These constants configure historical data requests.
 const HISTORICAL_CHUNK_SECONDS: i64 = 1_800;
@@ -14,24 +14,17 @@ const SYMBOL: &str = "SOXL";
 // These arguments configure a historical data request.
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Amount of data preceding the ending date.
-    #[arg(long, default_value = "1d", value_parser = parse_historical_duration)]
-    duration: HistoricalDuration,
+    /// Beginning of the requested range as an ISO 8601 datetime.
+    #[arg(long, value_parser = parse_datetime)]
+    start: OffsetDateTime,
 
-    /// Ending date in YYYY-MM-DD format.
-    #[arg(long, default_value = "today", value_parser = parse_date)]
-    date: Date,
+    /// End of the requested range as an ISO 8601 datetime.
+    #[arg(long, value_parser = parse_datetime)]
+    end: OffsetDateTime,
 
     /// Symbol whose historical data should be fetched.
     #[arg(long, default_value = SYMBOL)]
     symbol: String,
-}
-
-// This type represents a historical duration as an exact number of seconds.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct HistoricalDuration {
-    seconds: i64,
-    ib_duration: historical::Duration,
 }
 
 // Connect to Interactive Brokers and fetch the requested historical data.
@@ -43,13 +36,19 @@ pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<d
 
 // Fetch historical one-second bars and print them as CSV rows.
 async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<dyn Error>> {
-    // Find the regular trading sessions within the requested calendar range.
-    let end = args.date.with_time(Time::MAX).assume_utc();
-    let start = end - time::Duration::seconds(args.duration.seconds);
+    // Validate and convert the requested range for the Interactive Brokers API.
+    let duration_seconds = (args.end - args.start).whole_seconds();
+    if duration_seconds <= 0 {
+        return Err("end datetime must be after start datetime".into());
+    }
+    let duration_seconds =
+        i32::try_from(duration_seconds).map_err(|_| "historical range is too large")?;
+
+    // Find the regular trading sessions within the requested datetime range.
     let contract = Contract::stock(&args.symbol).build();
     let schedule = client
-        .historical_schedules(&contract, args.duration.ib_duration)
-        .ending(end)
+        .historical_schedules(&contract, historical::Duration::seconds(duration_seconds))
+        .ending(args.end)
         .fetch()
         .await?;
 
@@ -57,8 +56,8 @@ async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<d
     println!("date,open,high,low,close,volume,wap,count");
     for session in schedule.sessions {
         // Intersect each session with the requested calendar range.
-        let session_start = session.start.max(start);
-        let session_end = session.end.min(end);
+        let session_start = session.start.max(args.start);
+        let session_end = session.end.min(args.end);
         let session_seconds = (session_end - session_start).whole_seconds();
         if session_seconds > 0 {
             let chunk_count = divide_rounding_up(session_seconds, HISTORICAL_CHUNK_SECONDS);
@@ -108,54 +107,9 @@ fn divide_rounding_up(dividend: i64, divisor: i64) -> i64 {
     dividend / divisor + i64::from(dividend % divisor != 0)
 }
 
-// Parse compact historical durations such as `1d` into IB's duration type.
-fn parse_historical_duration(value: &str) -> Result<HistoricalDuration, String> {
-    // Separate the positive numeric quantity from its one-letter unit.
-    if !value.is_ascii() {
-        return Err("duration must contain only ASCII characters".to_owned());
-    }
-    let split_at = value
-        .len()
-        .checked_sub(1)
-        .ok_or("duration cannot be empty")?;
-    let (quantity, unit) = value.split_at(split_at);
-    let quantity = quantity.parse::<i64>().map_err(|error| error.to_string())?;
-    if quantity <= 0 {
-        return Err("duration must be positive".to_owned());
-    }
-
-    // Convert every supported unit into an exact duration for chunking.
-    let (multiplier, ib_duration): (i64, fn(i32) -> historical::Duration) =
-        match unit.to_ascii_lowercase().as_str() {
-            "s" => (1, historical::Duration::seconds),
-            "d" => (24 * 60 * 60, historical::Duration::days),
-            "w" => (7 * 24 * 60 * 60, historical::Duration::weeks),
-            "m" => (30 * 24 * 60 * 60, historical::Duration::months),
-            "y" => (365 * 24 * 60 * 60, historical::Duration::years),
-            _ => return Err("duration unit must be s, d, w, m, or y".to_owned()),
-        };
-    let seconds = quantity
-        .checked_mul(multiplier)
-        .ok_or("duration is too large")?;
-
-    let quantity = i32::try_from(quantity).map_err(|_| "duration quantity is too large")?;
-
-    Ok(HistoricalDuration {
-        seconds,
-        ib_duration: ib_duration(quantity),
-    })
-}
-
-// Parse an ISO date or resolve the convenient `today` default locally.
-fn parse_date(value: &str) -> Result<Date, String> {
-    // Resolve today's date using the local offset when it is available.
-    if value.eq_ignore_ascii_case("today") {
-        return Ok(OffsetDateTime::now_local()
-            .unwrap_or_else(|_| OffsetDateTime::now_utc())
-            .date());
-    }
-
-    Date::parse(value, &Iso8601::DATE).map_err(|error| error.to_string())
+// Parse an ISO 8601 datetime with an explicit UTC offset.
+fn parse_datetime(value: &str) -> Result<OffsetDateTime, String> {
+    OffsetDateTime::parse(value, &Iso8601::DEFAULT).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -171,11 +125,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_defaults() {
-        // Confirm the historical subcommand uses the documented defaults.
-        let cli = TestCli::try_parse_from(["historical"]).unwrap();
+    fn parse_range() {
+        // Confirm the historical subcommand accepts explicit datetime bounds.
+        let cli = TestCli::try_parse_from([
+            "historical",
+            "--start",
+            "2026-07-31T13:30:00Z",
+            "--end",
+            "2026-07-31T20:00:00Z",
+        ])
+        .unwrap();
 
-        assert_eq!(cli.args.duration.seconds, 86_400);
+        assert_eq!((cli.args.end - cli.args.start).whole_seconds(), 23_400);
         assert_eq!(cli.args.symbol, "SOXL");
     }
 }

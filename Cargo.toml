@@ -19,5 +19,5 @@ rust.warnings = "deny"
 [dependencies]
 clap = { version = "4.6.4", features = ["derive"] }
 ibapi = "3.3.0"
-time = { version = "0.3.54", features = ["local-offset", "parsing"] }
+time = { version = "0.3.54", features = ["parsing"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
