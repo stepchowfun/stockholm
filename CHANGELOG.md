@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6] - 2026-08-02
+
+### Added
+- Fetch historical one-second bars as CSV for an explicit datetime range.
+- List current positions alongside open orders.
+
+### Changed
+- Prefix order and market data output to identify its source.
+- Organize the run and historical commands into separate modules.
+
 ## [0.2.5] - 2026-07-31
 
 ### Added
