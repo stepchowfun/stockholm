@@ -65,7 +65,14 @@ async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<d
         {
             println!(
                 "{},{},{},{},{},{},{},{}",
-                bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.wap, bar.count,
+                bar.date,
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                bar.volume,
+                bar.wap,
+                bar.count,
             );
         }
         chunk_start = chunk_end;
