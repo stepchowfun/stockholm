@@ -8,12 +8,31 @@ use ibapi::{
 };
 use std::error::Error;
 
-// These constants configure the instrument and execution cadence.
+// These constants configure the instrument and failure recovery.
 const SYMBOL: &str = "SOXL";
 const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
+const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+
+// Run the main trading loop.
+pub async fn run(address: &str, client_id: i32) -> Result<(), Box<dyn Error>> {
+    // Restart the application after a delay whenever a top-level operation completes.
+    loop {
+        // Connect to the configured TWS or IB Gateway instance for this attempt.
+        match Client::connect(address, client_id).await {
+            Ok(client) => {
+                if let Err(error) = run_with_connection(&client).await {
+                    eprintln!("Error: {error}");
+                }
+            }
+            Err(error) => eprintln!("Connection to Interactive Brokers Gateway failed: {error}"),
+        }
+
+        tokio::time::sleep(RETRY_DELAY).await;
+    }
+}
 
 // Run the order loop and market data stream concurrently on one connection.
-pub async fn run(client: &Client) -> Result<(), Box<dyn Error>> {
+async fn run_with_connection(client: &Client) -> Result<(), Box<dyn Error>> {
     tokio::try_join!(run_steps(client), stream_live_data(client))?;
 
     Ok(())

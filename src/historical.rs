@@ -34,8 +34,15 @@ struct HistoricalDuration {
     ib_duration: historical::Duration,
 }
 
+// Connect to Interactive Brokers and fetch the requested historical data.
+pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<dyn Error>> {
+    // Connect once because historical requests are not retried indefinitely.
+    let client = Client::connect(address, client_id).await?;
+    fetch_historical_data(&client, args).await
+}
+
 // Fetch historical one-second bars and print them as CSV rows.
-pub async fn run(client: &Client, args: &Args) -> Result<(), Box<dyn Error>> {
+async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<dyn Error>> {
     // Find the regular trading sessions within the requested calendar range.
     let end = args.date.with_time(Time::MAX).assume_utc();
     let start = end - time::Duration::seconds(args.duration.seconds);
