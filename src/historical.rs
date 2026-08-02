@@ -37,10 +37,12 @@ pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<d
 // Fetch historical one-second bars and print them as CSV rows.
 async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<dyn Error>> {
     // Validate and convert the requested range for the Interactive Brokers API.
-    let duration_seconds = (args.end - args.start).whole_seconds();
-    if duration_seconds <= 0 {
+    let duration = args.end - args.start;
+    if !duration.is_positive() {
         return Err("end datetime must be after start datetime".into());
     }
+    let duration_seconds =
+        duration.whole_seconds() + i64::from(duration.subsec_nanoseconds() != 0_i32);
     let duration_seconds =
         i32::try_from(duration_seconds).map_err(|_| "historical range is too large")?;
 
