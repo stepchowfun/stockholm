@@ -42,9 +42,8 @@ async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<d
         return Err("end datetime must be after start datetime".into());
     }
     let duration_seconds =
-        duration.whole_seconds() + i64::from(duration.subsec_nanoseconds() != 0_i32);
-    let duration_seconds =
-        i32::try_from(duration_seconds).map_err(|_| "historical range is too large")?;
+        i32::try_from(duration.whole_seconds() + i64::from(duration.subsec_nanoseconds() != 0_i32))
+            .map_err(|_| "historical range is too large")?;
 
     // Find the regular trading sessions within the requested datetime range.
     let contract = Contract::stock(&args.symbol).build();
