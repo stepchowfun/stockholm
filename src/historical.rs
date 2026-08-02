@@ -10,6 +10,7 @@ use time::{self, OffsetDateTime, format_description::well_known::Iso8601};
 
 // These constants configure historical data requests.
 const HISTORICAL_CHUNK_SECONDS: i64 = 1_800;
+const HISTORICAL_MINIMUM_SECONDS: i64 = 60;
 
 // These arguments configure a historical data request.
 #[derive(ClapArgs)]
@@ -50,10 +51,11 @@ async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<d
     while chunk_start < args.end {
         let chunk_end =
             (chunk_start + time::Duration::seconds(HISTORICAL_CHUNK_SECONDS)).min(args.end);
+        let request_start = historical_request_start(chunk_start, chunk_end);
         let historical_data = client
             .historical_data(&contract, BarSize::Sec)
             .trading_hours(TradingHours::Extended)
-            .between(chunk_start - time::Duration::SECOND, chunk_end)
+            .between(request_start, chunk_end)
             .fetch()
             .await?;
 
@@ -81,6 +83,15 @@ async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<d
     Ok(())
 }
 
+// Include the preceding second while respecting IBKR's minimum request duration.
+fn historical_request_start(
+    chunk_start: OffsetDateTime,
+    chunk_end: OffsetDateTime,
+) -> OffsetDateTime {
+    (chunk_start - time::Duration::SECOND)
+        .min(chunk_end - time::Duration::seconds(HISTORICAL_MINIMUM_SECONDS))
+}
+
 // Parse an ISO 8601 datetime with an explicit UTC offset.
 fn parse_datetime(value: &str) -> Result<OffsetDateTime, String> {
     OffsetDateTime::parse(value, &Iso8601::DEFAULT).map_err(|error| error.to_string())
@@ -88,8 +99,9 @@ fn parse_datetime(value: &str) -> Result<OffsetDateTime, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
+    use super::{Args, historical_request_start};
     use clap::Parser;
+    use time::OffsetDateTime;
 
     // This parser exposes the historical arguments for focused tests.
     #[derive(Parser)]
@@ -112,5 +124,25 @@ mod tests {
 
         assert_eq!((cli.args.end - cli.args.start).whole_seconds(), 23_400);
         assert_eq!(cli.args.symbol, "SOXL");
+    }
+
+    #[test]
+    fn pad_short_request() {
+        // Confirm a short output window is requested using IBKR's minimum duration.
+        let chunk_start = OffsetDateTime::from_unix_timestamp(1_785_527_995).unwrap();
+        let chunk_end = OffsetDateTime::from_unix_timestamp(1_785_528_005).unwrap();
+        let request_start = historical_request_start(chunk_start, chunk_end);
+
+        assert_eq!((chunk_end - request_start).whole_seconds(), 60);
+    }
+
+    #[test]
+    fn overlap_full_request() {
+        // Confirm a full output window retains the preceding-second overlap.
+        let chunk_start = OffsetDateTime::from_unix_timestamp(1_785_504_600).unwrap();
+        let chunk_end = OffsetDateTime::from_unix_timestamp(1_785_506_400).unwrap();
+        let request_start = historical_request_start(chunk_start, chunk_end);
+
+        assert_eq!((chunk_start - request_start).whole_seconds(), 1);
     }
 }
