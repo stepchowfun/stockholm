@@ -4,6 +4,7 @@ After=docker.service
 Wants=docker.service
 
 [Service]
+Environment='HOME=/root'
 ExecStart=/usr/bin/bash /usr/local/bin/run-ib-gateway.sh
 Restart=always
 RestartSec=10
