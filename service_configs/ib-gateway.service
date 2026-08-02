@@ -4,8 +4,6 @@ After=docker.service
 Wants=docker.service
 
 [Service]
-Environment='TWS_USERID=your_ibkr_username'
-Environment='TWS_PASSWORD=your_ibkr_password'
 ExecStart=/usr/bin/bash /usr/local/bin/run-ib-gateway.sh
 Restart=always
 RestartSec=10
