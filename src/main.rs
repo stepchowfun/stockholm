@@ -54,7 +54,7 @@ async fn main() {
                     eprintln!("Error: {error}");
                 }
             }
-            Err(error) => eprintln!("Connection failed: {error}"),
+            Err(error) => eprintln!("Connection to Interactive Brokers Gateway failed: {error}"),
         }
 
         time::sleep(RETRY_DELAY).await;
