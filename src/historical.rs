@@ -68,11 +68,9 @@ async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<d
             while chunk_start < session_end {
                 let chunk_end =
                     (chunk_start + time::Duration::seconds(chunk_seconds)).min(session_end);
-                let request_seconds = i32::try_from((chunk_end - chunk_start).whole_seconds())?;
                 let historical_data = client
                     .historical_data(&contract, BarSize::Sec)
-                    .duration(historical::Duration::seconds(request_seconds))
-                    .ending(chunk_end)
+                    .between(chunk_start, chunk_end)
                     .fetch()
                     .await?;
 
