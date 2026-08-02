@@ -13,7 +13,7 @@ const SYMBOL: &str = "SOXL";
 
 // These arguments configure a historical data request.
 #[derive(ClapArgs)]
-pub(crate) struct Args {
+pub struct Args {
     /// Amount of data preceding the ending date.
     #[arg(long, default_value = "1d", value_parser = parse_historical_duration)]
     duration: HistoricalDuration,
@@ -35,7 +35,7 @@ struct HistoricalDuration {
 }
 
 // Connect to Interactive Brokers and fetch the requested historical data.
-pub(crate) async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<dyn Error>> {
+pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<dyn Error>> {
     // Connect once because historical requests are not retried indefinitely.
     let client = Client::connect(address, client_id).await?;
     fetch_historical_data(&client, args).await

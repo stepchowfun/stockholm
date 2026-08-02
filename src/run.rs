@@ -14,7 +14,7 @@ const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 
 // Run the main trading loop.
-pub(crate) async fn run(address: &str, client_id: i32) -> Result<(), Box<dyn Error>> {
+pub async fn run(address: &str, client_id: i32) -> Result<(), Box<dyn Error>> {
     // Restart the application after a delay whenever a top-level operation completes.
     loop {
         // Connect to the configured TWS or IB Gateway instance for this attempt.
