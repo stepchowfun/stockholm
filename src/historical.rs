@@ -76,7 +76,7 @@ async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<d
                 for bar in historical_data
                     .bars
                     .into_iter()
-                    .filter(|bar| bar.date > chunk_start.into() && bar.date <= chunk_end.into())
+                    .filter(|bar| bar.date >= chunk_start.into() && bar.date < chunk_end.into())
                 {
                     println!(
                         "{},{},{},{},{},{},{},{}",
