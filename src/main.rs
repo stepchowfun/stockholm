@@ -39,7 +39,7 @@ struct Cli {
 #[derive(ClapSubcommand)]
 enum Subcommand {
     #[command(about = "Run the trading bot (default)")]
-    Run,
+    Run(run::Args),
 
     #[command(about = "Fetch historical market data as CSV")]
     Historical(historical::Args),
@@ -52,9 +52,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     // Decide what to do based on the subcommand.
-    match cli.command.unwrap_or(Subcommand::Run) {
-        Subcommand::Run => run::run(&cli.address, cli.client_id).await,
-        Subcommand::Historical(args) => historical::run(&cli.address, cli.client_id, &args).await,
+    match cli.command {
+        Some(Subcommand::Run(args)) => run::run(&cli.address, cli.client_id, &args).await,
+        Some(Subcommand::Historical(args)) => {
+            historical::run(&cli.address, cli.client_id, &args).await
+        }
+        None => run::run(&cli.address, cli.client_id, &run::Args::default()).await,
     }
 }
 
