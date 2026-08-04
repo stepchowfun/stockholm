@@ -17,18 +17,16 @@ use burn::{
 use clap::Args as ClapArgs;
 use std::{error::Error, fs, marker::PhantomData, path::PathBuf, sync::Arc};
 
-// These constants configure the initial training workflow.
-const BATCH_SIZE: usize = 64;
-const EPOCHS: usize = 50;
-const LEARNING_RATE: f64 = 1e-3;
-const SEED: u64 = 42;
-const TRAINING_PERCENT: usize = 80;
-
 // These arguments configure a time-series training run.
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Text file containing one positive stock price per line.
-    path: PathBuf,
+    /// CSV files used to train the model.
+    #[arg(long, required = true, num_args = 1..)]
+    training_paths: Vec<PathBuf>,
+
+    /// CSV files used only to validate the model.
+    #[arg(long, required = true, num_args = 1..)]
+    validation_paths: Vec<PathBuf>,
 
     /// Number of recent returns supplied to the model.
     #[arg(long, default_value_t = 20, value_parser = parse_positive_usize)]
@@ -37,6 +35,22 @@ pub struct Args {
     /// Number of future returns predicted by the model.
     #[arg(long, default_value_t = 5, value_parser = parse_positive_usize)]
     outputs: usize,
+
+    /// Number of examples processed in each optimization step.
+    #[arg(long, default_value_t = 64, value_parser = parse_positive_usize)]
+    batch_size: usize,
+
+    /// Number of complete passes through the training dataset.
+    #[arg(long, default_value_t = 50, value_parser = parse_positive_usize)]
+    epochs: usize,
+
+    /// Step size used by the Adam optimizer.
+    #[arg(long, default_value_t = 1e-3, value_parser = parse_positive_f64)]
+    learning_rate: f64,
+
+    /// Seed used for model initialization and training-data shuffling.
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
 
     /// Directory where the trained model and its metadata will be saved.
     #[arg(long, default_value = "model")]
@@ -141,17 +155,35 @@ struct PreparedData {
 
 // Read the price history and train a forecasting model.
 pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
-    // Load and validate every raw price before deriving returns.
-    let contents = fs::read_to_string(&args.path)?;
-    let prices = parse_prices(&contents)?;
-    let returns = log_returns(&prices);
-    let data = prepare_data(&returns, args.inputs, args.outputs)?;
+    // Load the two file groups independently so validation data never enters training.
+    let training_series = load_series(&args.training_paths)?;
+    let validation_series = load_series(&args.validation_paths)?;
+    let data = prepare_data(
+        &training_series,
+        &validation_series,
+        args.inputs,
+        args.outputs,
+    )?;
 
     // Use Burn's portable CPU backend for deterministic local training.
     let device = NdArrayDevice::Cpu;
     train::<Autodiff<NdArray>>(&device, args, &data)?;
 
     Ok(())
+}
+
+// Load opening-price returns while preserving every file as an independent series.
+fn load_series(paths: &[PathBuf]) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
+    paths
+        .iter()
+        .map(|path| {
+            let contents = fs::read_to_string(path)
+                .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+            let prices = parse_prices(&contents)
+                .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+            Ok(log_returns(&prices))
+        })
+        .collect()
 }
 
 // Train the model, evaluate it chronologically, and save its artifacts.
@@ -161,7 +193,7 @@ fn train<B: AutodiffBackend>(
     data: &PreparedData,
 ) -> Result<(), Box<dyn Error>> {
     // Seed Burn and construct a modest model based on the requested dimensions.
-    B::seed(device, SEED);
+    B::seed(device, args.seed);
     let hidden = (args.inputs + args.outputs).next_power_of_two().max(32);
     let config = ModelConfig::new(args.inputs, hidden, args.outputs);
     let mut model = config.init::<B>(device);
@@ -169,12 +201,12 @@ fn train<B: AutodiffBackend>(
 
     // Scan all windows while shuffling only the training order each epoch.
     let training_loader = DataLoaderBuilder::new(SeriesBatcher::<B>::new())
-        .batch_size(BATCH_SIZE)
-        .shuffle(SEED)
+        .batch_size(args.batch_size)
+        .shuffle(args.seed)
         .num_workers(1)
         .build(InMemDataset::new(data.training.clone()));
     let validation_loader = DataLoaderBuilder::new(SeriesBatcher::<B::InnerBackend>::new())
-        .batch_size(BATCH_SIZE)
+        .batch_size(args.batch_size)
         .num_workers(1)
         .build(InMemDataset::new(data.validation.clone()));
 
@@ -184,11 +216,18 @@ fn train<B: AutodiffBackend>(
         data.training.len(),
         data.validation.len(),
     );
-    for epoch in 1..=EPOCHS {
-        let training_loss = train_epoch(&mut model, &mut optimizer, &training_loader);
+    for epoch in 1..=args.epochs {
+        let training_loss = train_epoch(
+            &mut model,
+            &mut optimizer,
+            &training_loader,
+            args.learning_rate,
+        );
         let validation_loss = validation_loss(&model.valid(), &validation_loader);
         println!(
-            "Epoch {epoch:>2}/{EPOCHS}: train RMSE {:.6}, validation RMSE {:.6}",
+            "Epoch {:>2}/{}: train RMSE {:.6}, validation RMSE {:.6}",
+            epoch,
+            args.epochs,
             training_loss.sqrt(),
             validation_loss.sqrt(),
         );
@@ -221,6 +260,7 @@ fn train_epoch<B: AutodiffBackend, O>(
     model: &mut Model<B>,
     optimizer: &mut O,
     loader: &Arc<dyn DataLoader<B, SeriesBatch<B>>>,
+    learning_rate: f64,
 ) -> f32
 where
     O: Optimizer<Model<B>, B>,
@@ -237,7 +277,7 @@ where
 
         // Associate gradients with model parameters before applying Adam.
         let gradients = GradientsParams::from_grads(loss.backward(), model);
-        *model = optimizer.step(LEARNING_RATE, model.clone(), gradients);
+        *model = optimizer.step(learning_rate, model.clone(), gradients);
     }
 
     total_loss / usize_to_f32(total_items)
@@ -262,27 +302,36 @@ fn validation_loss<B: Backend>(
     total_loss / usize_to_f32(total_items)
 }
 
-// Parse one finite positive stock price from each nonempty input line.
+// Parse finite positive opening prices from a historical-data CSV file.
 fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
+    // Locate the opening-price column by name so column order remains explicit.
+    let mut reader = csv::Reader::from_reader(contents.as_bytes());
+    let headers = reader.headers()?;
+    let open_index = headers
+        .iter()
+        .position(|header| header == "open")
+        .ok_or("the CSV file must contain an open column")?;
+
     // Attach line numbers to malformed values so input problems are actionable.
     let mut prices = Vec::new();
-    for (index, line) in contents.lines().enumerate() {
-        let value = line.trim();
-        if value.is_empty() {
-            continue;
-        }
+    for (index, result) in reader.records().enumerate() {
+        let record = result?;
+        let line = index + 2;
+        let value = record
+            .get(open_index)
+            .ok_or_else(|| format!("missing opening price on line {line}"))?;
         let price: f32 = value
             .parse()
-            .map_err(|error| format!("invalid price on line {}: {error}", index + 1))?;
+            .map_err(|error| format!("invalid opening price on line {line}: {error}"))?;
         if !price.is_finite() || price <= 0.0 {
-            return Err(format!("price on line {} must be finite and positive", index + 1).into());
+            return Err(format!("opening price on line {line} must be finite and positive").into());
         }
         prices.push(price);
     }
 
     // At least two prices are required to derive one return.
     if prices.len() < 2 {
-        return Err("the input file must contain at least two prices".into());
+        return Err("the CSV file must contain at least two data rows".into());
     }
 
     Ok(prices)
@@ -299,6 +348,17 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+// Parse a finite positive floating-point parameter from the command line.
+fn parse_positive_f64(value: &str) -> Result<f64, String> {
+    // Reject values that would make optimizer updates invalid or ineffective.
+    let parsed = value.parse::<f64>().map_err(|error| error.to_string())?;
+    if !parsed.is_finite() || parsed <= 0.0_f64 {
+        return Err("value must be finite and greater than zero".to_string());
+    }
+
+    Ok(parsed)
+}
+
 // Convert raw prices into stationary relative changes.
 fn log_returns(prices: &[f32]) -> Vec<f32> {
     prices
@@ -307,40 +367,61 @@ fn log_returns(prices: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-// Split chronologically, normalize from training history, and create every window.
+// Normalize from training files and create windows within every independent series.
 fn prepare_data(
-    returns: &[f32],
+    training_series: &[Vec<f32>],
+    validation_series: &[Vec<f32>],
     inputs: usize,
     outputs: usize,
 ) -> Result<PreparedData, Box<dyn Error>> {
-    // Reserve the final portion exclusively for future validation targets.
-    let split = returns.len() * TRAINING_PERCENT / 100;
-    if split < inputs + outputs || returns.len() - split < outputs || split < inputs {
-        return Err(format!(
-            "need more prices for {inputs} inputs, {outputs} outputs, and an 80/20 split",
-        )
-        .into());
+    // Require every file to contain at least one complete model window.
+    for (kind, series) in [
+        ("training", training_series),
+        ("validation", validation_series),
+    ] {
+        if series.is_empty() {
+            return Err(format!("at least one {kind} file is required").into());
+        }
+        for (index, returns) in series.iter().enumerate() {
+            if returns.len() < inputs + outputs {
+                return Err(format!(
+                    "{kind} file {} is too short for {inputs} inputs and {outputs} outputs",
+                    index + 1,
+                )
+                .into());
+            }
+        }
     }
 
-    // Fit normalization only to data available before the validation boundary.
-    let mean = returns[..split].iter().sum::<f32>() / usize_to_f32(split);
-    let variance = returns[..split]
+    // Fit normalization exclusively to returns from the training files.
+    let training_count = training_series.iter().map(Vec::len).sum::<usize>();
+    let training_sum = training_series.iter().flatten().sum::<f32>();
+    let mean = training_sum / usize_to_f32(training_count);
+    let variance = training_series
         .iter()
+        .flatten()
         .map(|value| (value - mean).powi(2))
         .sum::<f32>()
-        / usize_to_f32(split);
+        / usize_to_f32(training_count);
     let deviation = variance.sqrt();
     if !deviation.is_finite() || deviation <= f32::EPSILON {
         return Err("training returns must have nonzero finite variance".into());
     }
-    let normalized = returns
-        .iter()
-        .map(|value| (value - mean) / deviation)
-        .collect::<Vec<_>>();
 
-    // Keep all training targets before the split and validation targets after it.
-    let training = windows(&normalized[..split], inputs, outputs);
-    let validation = windows(&normalized[split - inputs..], inputs, outputs);
+    // Normalize and window each file separately so no example crosses a file boundary.
+    let prepare = |series: &[Vec<f32>]| {
+        let mut items = Vec::new();
+        for returns in series {
+            let normalized = returns
+                .iter()
+                .map(|value| (value - mean) / deviation)
+                .collect::<Vec<_>>();
+            items.extend(windows(&normalized, inputs, outputs));
+        }
+        items
+    };
+    let training = prepare(training_series);
+    let validation = prepare(validation_series);
 
     Ok(PreparedData {
         training,
@@ -384,9 +465,16 @@ fn usize_to_f32(value: usize) -> f32 {
 fn save_metadata(args: &Args, data: &PreparedData) -> Result<(), Box<dyn Error>> {
     // Use a simple text format that remains readable without model tooling.
     let metadata = format!(
-        "inputs={}\noutputs={}\nreturn_mean={}\nreturn_deviation={}\n",
+        concat!(
+            "inputs={}\noutputs={}\nbatch_size={}\nepochs={}\n",
+            "learning_rate={}\nseed={}\nreturn_mean={}\nreturn_deviation={}\n",
+        ),
         args.inputs,
         args.outputs,
+        args.batch_size,
+        args.epochs,
+        args.learning_rate,
+        args.seed,
         data.mean,
         data.deviation,
     );
@@ -405,21 +493,44 @@ mod tests {
     #[test]
     fn parse_train_subcommand() {
         // Confirm the training mode supplies useful defaults for optional settings.
-        let cli = Cli::try_parse_from(["stockholm", "train", "prices.txt"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "stockholm",
+            "train",
+            "--training-paths",
+            "monday.csv",
+            "tuesday.csv",
+            "--validation-paths",
+            "wednesday.csv",
+        ])
+        .unwrap();
 
         let Some(Subcommand::Train(args)) = cli.command else {
             panic!("expected train subcommand");
         };
-        assert_eq!(args.path, PathBuf::from("prices.txt"));
+        assert_eq!(
+            args.training_paths,
+            vec![PathBuf::from("monday.csv"), PathBuf::from("tuesday.csv")],
+        );
+        assert_eq!(args.validation_paths, vec![PathBuf::from("wednesday.csv")]);
         assert_eq!(args.inputs, 20);
         assert_eq!(args.outputs, 5);
+        assert_eq!(args.batch_size, 64);
+        assert_eq!(args.epochs, 50);
+        assert!((args.learning_rate - 1e-3).abs() < f64::EPSILON);
+        assert_eq!(args.seed, 42);
         assert_eq!(args.model_directory, PathBuf::from("model"));
     }
 
     #[test]
     fn parse_price_lines() {
-        // Confirm whitespace and blank lines do not alter valid observations.
-        let prices = parse_prices("100\n 101.5 \n\n99\n").unwrap();
+        // Confirm the header and unused historical columns do not alter opening prices.
+        let prices = parse_prices(concat!(
+            "date,open,high,low,close,volume,wap,count\n",
+            "1,100,900,1,2,3,4,5\n",
+            "2,101.5,800,1,2,3,4,5\n",
+            "3,99,700,1,2,3,4,5\n",
+        ))
+        .unwrap();
 
         assert_eq!(prices, vec![100.0, 101.5, 99.0]);
     }
@@ -427,20 +538,33 @@ mod tests {
     #[test]
     fn reject_nonpositive_prices() {
         // Confirm logarithmic preprocessing rejects values outside its domain.
-        let error = parse_prices("100\n0\n").unwrap_err();
+        let error = parse_prices("date,open\n1,100\n2,0\n").unwrap_err();
 
         assert!(error.to_string().contains("finite and positive"));
     }
 
     #[test]
-    fn create_chronological_windows() {
-        // Confirm validation targets begin strictly after the training boundary.
+    fn create_separate_training_and_validation_windows() {
+        // Confirm complete files contribute only to their selected dataset.
         let prices = (1_u16..=101).map(f32::from).collect::<Vec<_>>();
         let returns = log_returns(&prices);
-        let data = prepare_data(&returns, 4, 2).unwrap();
+        let series = std::slice::from_ref(&returns);
+        let data = prepare_data(series, series, 4, 2).unwrap();
 
-        assert_eq!(data.training.len(), 75);
-        assert_eq!(data.validation.len(), 19);
+        assert_eq!(data.training.len(), 95);
+        assert_eq!(data.validation.len(), 95);
         assert!(baseline_loss(&data.validation, data.mean, data.deviation).is_finite());
+    }
+
+    #[test]
+    fn keep_file_windows_separate() {
+        // Confirm combining files does not add windows across their boundary.
+        let prices = (1_u16..=101).map(f32::from).collect::<Vec<_>>();
+        let returns = log_returns(&prices);
+        let series = [returns.clone(), returns];
+        let data = prepare_data(&series, &series, 4, 2).unwrap();
+
+        assert_eq!(data.training.len(), 190);
+        assert_eq!(data.validation.len(), 190);
     }
 }
