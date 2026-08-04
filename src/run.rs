@@ -1,4 +1,5 @@
 use crate::DEFAULT_SYMBOL;
+use clap::Args as ClapArgs;
 use ibapi::{
     Client,
     accounts::PositionUpdate,
@@ -15,14 +16,31 @@ const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 const SMART_EXCHANGE: &str = "SMART";
 const OVERNIGHT_EXCHANGE: &str = "OVERNIGHT";
 
+// These arguments configure the trading bot.
+#[derive(ClapArgs)]
+pub struct Args {
+    /// Symbol whose live market data should be streamed.
+    #[arg(long, default_value = DEFAULT_SYMBOL)]
+    symbol: String,
+}
+
+// Supply the same defaults when the run subcommand is omitted.
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            symbol: DEFAULT_SYMBOL.to_string(),
+        }
+    }
+}
+
 // Run the main trading loop.
-pub async fn run(address: &str, client_id: i32) -> Result<(), Box<dyn Error>> {
+pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<dyn Error>> {
     // Restart the application after a delay whenever a top-level operation completes.
     loop {
         // Connect to the configured TWS or IB Gateway instance for this attempt.
         match Client::connect(address, client_id).await {
             Ok(client) => {
-                if let Err(error) = run_with_connection(&client).await {
+                if let Err(error) = run_with_connection(&client, &args.symbol).await {
                     eprintln!("Error: {error}");
                 }
             }
@@ -34,7 +52,7 @@ pub async fn run(address: &str, client_id: i32) -> Result<(), Box<dyn Error>> {
 }
 
 // Run the order loop and both market data streams concurrently on one connection.
-async fn run_with_connection(client: &Client) -> Result<(), Box<dyn Error>> {
+async fn run_with_connection(client: &Client, symbol: &str) -> Result<(), Box<dyn Error>> {
     // Configure subsequent requests to use subscribed real-time market data.
     client
         .switch_market_data_type(MarketDataType::Realtime)
@@ -43,9 +61,9 @@ async fn run_with_connection(client: &Client) -> Result<(), Box<dyn Error>> {
     // Keep every operating loop alive until any one of them requires a reconnect.
     tokio::try_join!(
         run_steps(client),
-        stream_live_data(client),
-        stream_realtime_bars(client, SMART_EXCHANGE),
-        stream_realtime_bars(client, OVERNIGHT_EXCHANGE),
+        stream_live_data(client, symbol),
+        stream_realtime_bars(client, symbol, SMART_EXCHANGE),
+        stream_realtime_bars(client, symbol, OVERNIGHT_EXCHANGE),
     )?;
 
     Ok(())
@@ -60,41 +78,43 @@ async fn run_steps(client: &Client) -> Result<(), Box<dyn Error>> {
 }
 
 // Stream live market data for the configured symbol.
-async fn stream_live_data(client: &Client) -> Result<(), Box<dyn Error>> {
+async fn stream_live_data(client: &Client, symbol: &str) -> Result<(), Box<dyn Error>> {
     // Subscribe to the default SMART-routed contract for consolidated data.
-    let contract = Contract::stock(DEFAULT_SYMBOL).build();
+    let contract = Contract::stock(symbol).build();
     let mut subscription = client
         .market_data(&contract)
         .streaming()
         .subscribe()
         .await?;
-    println!("[market data] Streaming {DEFAULT_SYMBOL} market data…");
+    println!("[market data] Streaming {symbol} market data…");
 
     // Print every tick and propagate stream failures to the connection loop.
     while let Some(tick) = subscription.next().await {
-        println!("[market data] {DEFAULT_SYMBOL}: {:?}", tick?);
+        println!("[market data] {symbol}: {:?}", tick?);
     }
 
     Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
 // Stream real-time five-second bars for the configured symbol and exchange.
-async fn stream_realtime_bars(client: &Client, exchange: &str) -> Result<(), Box<dyn Error>> {
+async fn stream_realtime_bars(
+    client: &Client,
+    symbol: &str,
+    exchange: &str,
+) -> Result<(), Box<dyn Error>> {
     // Subscribe to trade bars for the requested routing venue across all sessions.
-    let contract = Contract::stock(DEFAULT_SYMBOL)
-        .on_exchange(exchange)
-        .build();
+    let contract = Contract::stock(symbol).on_exchange(exchange).build();
     let subscription = client
         .realtime_bars(&contract)
         .trading_hours(TradingHours::Extended)
         .subscribe()
         .await?;
     let mut bars = subscription.filter_data();
-    println!("[bars] Streaming {DEFAULT_SYMBOL} five-second bars from {exchange}…");
+    println!("[bars] Streaming {symbol} five-second bars from {exchange}…");
 
     // Print every completed bar and propagate stream failures to the connection loop.
     while let Some(bar) = bars.next().await {
-        println!("[bars] {DEFAULT_SYMBOL} ({exchange}): {:?}", bar?);
+        println!("[bars] {symbol} ({exchange}): {:?}", bar?);
     }
 
     Err(ibapi::Error::UnexpectedEndOfStream.into())
@@ -173,4 +193,33 @@ async fn list_positions(client: &Client) -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    // This parser exposes the run arguments for focused tests.
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    #[test]
+    fn default_symbol() {
+        // Confirm the run command falls back to the shared default symbol.
+        let cli = TestCli::try_parse_from(["run"]).unwrap();
+
+        assert_eq!(cli.args.symbol, "SOXL");
+    }
+
+    #[test]
+    fn explicit_symbol() {
+        // Confirm the run command accepts an explicit symbol.
+        let cli = TestCli::try_parse_from(["run", "--symbol", "AAPL"]).unwrap();
+
+        assert_eq!(cli.args.symbol, "AAPL");
+    }
 }

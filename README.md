@@ -29,6 +29,12 @@ Options:
   -h, --help                   Print help
 ```
 
+You can select the symbol whose live market data and five-second bars should be streamed with the `run` subcommand:
+
+```sh
+stockholm run --symbol AAPL
+```
+
 You can fetch historical one-second bars as CSV with the `historical` subcommand. The start and end are ISO 8601 datetimes with explicit UTC offsets:
 
 ```sh
