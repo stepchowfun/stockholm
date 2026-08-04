@@ -35,10 +35,10 @@ You can select the symbol whose live market data and five-second bars should be 
 stockholm run --symbol AAPL
 ```
 
-You can fetch historical one-second bars as CSV with the `historical` subcommand. The start and end are ISO 8601 datetimes with explicit UTC offsets:
+You can fetch historical bars as CSV with the `historical` subcommand. The start and end are ISO 8601 datetimes with explicit UTC offsets, and the interval defaults to `SEC`:
 
 ```sh
-stockholm historical --start 2026-07-31T13:30:00Z --end 2026-07-31T20:00:00Z --symbol SOXL
+stockholm historical --start 2026-07-31T13:30:00Z --end 2026-07-31T20:00:00Z --symbol SOXL --interval MIN5
 ```
 
 You'll also need to start an Interactive Brokers Gateway that Stockholm can talk to. You can run that in a Docker container via the provided `run-ib-gateway.sh` script:
