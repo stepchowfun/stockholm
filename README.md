@@ -42,13 +42,13 @@ You can fetch historical bars as CSV with the `historical` subcommand. The start
 stockholm historical --start 2026-07-31T13:30:00Z --end 2026-07-31T20:00:00Z --symbol SOXL --interval MIN5
 ```
 
-The `train` subcommand trains a simple neural network to predict multiple future samples from a fixed window of historical stock prices. The input file must contain one positive price per line:
+The `train` subcommand trains a simple neural network to predict multiple future samples from a fixed window of historical stock prices. Each input must be a CSV file produced by the `historical` subcommand; only its `open` column is used. Training and validation files are specified separately, and every file is treated as an independent time series so windows never span file boundaries:
 
 ```sh
-stockholm train prices.txt
+stockholm train --training-paths monday.csv tuesday.csv --validation-paths wednesday.csv
 ```
 
-Training uses log returns, a chronological 80/20 training and validation split, and every available overlapping window. By default, the model uses 20 inputs to predict 5 outputs and writes the trained Burn model and its preprocessing metadata to `model`; these settings can be changed with `--inputs`, `--outputs`, and `--model-directory`.
+Training uses log returns and every available overlapping window. Normalization is fitted exclusively from the training files. By default, the model uses 20 inputs to predict 5 outputs, a batch size of 64, 50 epochs, a learning rate of 0.001, and a seed of 42, and writes the trained Burn model and its preprocessing metadata to `model`; these settings can be changed with `--inputs`, `--outputs`, `--batch-size`, `--epochs`, `--learning-rate`, `--seed`, and `--model-directory`.
 
 You'll also need to start an Interactive Brokers Gateway that Stockholm can talk to. You can run that in a Docker container via the provided `run-ib-gateway.sh` script:
 

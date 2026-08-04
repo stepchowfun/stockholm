@@ -1,6 +1,6 @@
 [package]
 name = "stockholm"
-version = "0.2.11"
+version = "0.2.12"
 authors = ["Stephan Boyer <stephan@stephanboyer.com>"]
 edition = "2024"
 description = "An algorithmic trading bot."
@@ -19,6 +19,7 @@ rust.warnings = "deny"
 [dependencies]
 burn = { version = "0.21.0", default-features = false, features = ["autodiff", "dataset", "ndarray", "std"] }
 clap = { version = "4.6.5", features = ["derive"] }
+csv = "1.4.0"
 ibapi = "3.3.0"
 time = { version = "0.3.55", features = ["parsing"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
