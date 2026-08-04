@@ -3,7 +3,7 @@ use ibapi::{
     Client,
     accounts::PositionUpdate,
     contracts::Contract,
-    market_data::MarketDataType,
+    market_data::{MarketDataType, TradingHours},
     orders::Orders,
     prelude::{StreamExt, SubscriptionItemStreamExt},
 };
@@ -12,6 +12,8 @@ use std::error::Error;
 // These constants configure the instrument and failure recovery.
 const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+const SMART_EXCHANGE: &str = "SMART";
+const OVERNIGHT_EXCHANGE: &str = "OVERNIGHT";
 
 // Run the main trading loop.
 pub async fn run(address: &str, client_id: i32) -> Result<(), Box<dyn Error>> {
@@ -31,9 +33,20 @@ pub async fn run(address: &str, client_id: i32) -> Result<(), Box<dyn Error>> {
     }
 }
 
-// Run the order loop and market data stream concurrently on one connection.
+// Run the order loop and both market data streams concurrently on one connection.
 async fn run_with_connection(client: &Client) -> Result<(), Box<dyn Error>> {
-    tokio::try_join!(run_steps(client), stream_live_data(client))?;
+    // Configure subsequent requests to use subscribed real-time market data.
+    client
+        .switch_market_data_type(MarketDataType::Realtime)
+        .await?;
+
+    // Keep every operating loop alive until any one of them requires a reconnect.
+    tokio::try_join!(
+        run_steps(client),
+        stream_live_data(client),
+        stream_realtime_bars(client, SMART_EXCHANGE),
+        stream_realtime_bars(client, OVERNIGHT_EXCHANGE),
+    )?;
 
     Ok(())
 }
@@ -48,11 +61,6 @@ async fn run_steps(client: &Client) -> Result<(), Box<dyn Error>> {
 
 // Stream live market data for the configured symbol.
 async fn stream_live_data(client: &Client) -> Result<(), Box<dyn Error>> {
-    // Configure subsequent requests to use subscribed real-time market data.
-    client
-        .switch_market_data_type(MarketDataType::Realtime)
-        .await?;
-
     // Subscribe to the default SMART-routed contract for consolidated data.
     let contract = Contract::stock(DEFAULT_SYMBOL).build();
     let mut subscription = client
@@ -65,6 +73,28 @@ async fn stream_live_data(client: &Client) -> Result<(), Box<dyn Error>> {
     // Print every tick and propagate stream failures to the connection loop.
     while let Some(tick) = subscription.next().await {
         println!("[market data] {DEFAULT_SYMBOL}: {:?}", tick?);
+    }
+
+    Err(ibapi::Error::UnexpectedEndOfStream.into())
+}
+
+// Stream real-time five-second bars for the configured symbol and exchange.
+async fn stream_realtime_bars(client: &Client, exchange: &str) -> Result<(), Box<dyn Error>> {
+    // Subscribe to trade bars for the requested routing venue across all sessions.
+    let contract = Contract::stock(DEFAULT_SYMBOL)
+        .on_exchange(exchange)
+        .build();
+    let subscription = client
+        .realtime_bars(&contract)
+        .trading_hours(TradingHours::Extended)
+        .subscribe()
+        .await?;
+    let mut bars = subscription.filter_data();
+    println!("[bars] Streaming {DEFAULT_SYMBOL} five-second bars from {exchange}…");
+
+    // Print every completed bar and propagate stream failures to the connection loop.
+    while let Some(bar) = bars.next().await {
+        println!("[bars] {DEFAULT_SYMBOL} ({exchange}): {:?}", bar?);
     }
 
     Err(ibapi::Error::UnexpectedEndOfStream.into())
