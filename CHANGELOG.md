@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.8] - 2026-08-03
+
+### Added
+- Stream real-time five-second bars from the SMART and OVERNIGHT venues alongside live market data in the run command.
+
 ## [0.2.7] - 2026-08-02
 
 ### Fixed
