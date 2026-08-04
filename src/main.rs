@@ -1,5 +1,6 @@
 mod historical;
 mod run;
+mod train;
 
 use clap::{ArgAction, Parser, Subcommand as ClapSubcommand};
 use std::error::Error;
@@ -43,6 +44,9 @@ enum Subcommand {
 
     #[command(about = "Fetch historical market data as CSV")]
     Historical(historical::Args),
+
+    #[command(about = "Train a neural network on historical stock data")]
+    Train(train::Args),
 }
 
 // Parse the configuration and run the selected operating mode.
@@ -57,6 +61,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(Subcommand::Historical(args)) => {
             historical::run(&cli.address, cli.client_id, &args).await
         }
+        Some(Subcommand::Train(args)) => train::run(&args),
         None => run::run(&cli.address, cli.client_id, &run::Args::default()).await,
     }
 }
