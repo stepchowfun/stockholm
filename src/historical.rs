@@ -9,8 +9,8 @@ use std::error::Error;
 use time::{self, OffsetDateTime, format_description::well_known::Iso8601};
 
 // These constants configure historical data requests.
-const HISTORICAL_MINIMUM_CHUNK_SECONDS: i64 = 1_800;
-const HISTORICAL_MINIMUM_SECONDS: i64 = 60;
+const MINIMUM_CHUNK_SECONDS: i64 = 1_800;
+const MINIMUM_REQUEST_SECONDS: i64 = 60;
 
 // These arguments configure a historical data request.
 #[derive(ClapArgs)]
@@ -40,11 +40,11 @@ pub struct Args {
 pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<dyn Error>> {
     // Connect once because historical requests are not retried indefinitely.
     let client = Client::connect(address, client_id).await?;
-    fetch_historical_data(&client, args).await
+    fetch_data(&client, args).await
 }
 
 // Fetch historical bars and print them as CSV rows.
-async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<dyn Error>> {
+async fn fetch_data(client: &Client, args: &Args) -> Result<(), Box<dyn Error>> {
     // Reject empty and reversed ranges before submitting requests.
     if args.end <= args.start {
         return Err("end datetime must be after start datetime".into());
@@ -54,21 +54,22 @@ async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<d
     let contract = Contract::stock(&args.symbol).build();
     println!("date,open,high,low,close,volume,wap,count");
     let mut chunk_start = args.start;
-    let chunk_seconds = historical_chunk_seconds(args.interval);
+    let chunk_duration_seconds = chunk_seconds(args.interval);
 
     // Divide the range into windows supported for the selected bar size.
     while chunk_start < args.end {
-        let chunk_end = (chunk_start + time::Duration::seconds(chunk_seconds)).min(args.end);
-        let request_start = historical_request_start(chunk_start, chunk_end, args.interval);
-        let historical_data = client
+        let chunk_end =
+            (chunk_start + time::Duration::seconds(chunk_duration_seconds)).min(args.end);
+        let request_begin = request_start(chunk_start, chunk_end, args.interval);
+        let data = client
             .historical_data(&contract, args.interval)
             .trading_hours(TradingHours::Extended)
-            .between(request_start, chunk_end)
+            .between(request_begin, chunk_end)
             .fetch()
             .await?;
 
         // Print bar-start timestamps inside this window.
-        for bar in historical_data
+        for bar in data
             .bars
             .into_iter()
             .filter(|bar| bar.date >= chunk_start.into() && bar.date < chunk_end.into())
@@ -92,19 +93,19 @@ async fn fetch_historical_data(client: &Client, args: &Args) -> Result<(), Box<d
 }
 
 // Include the preceding second while requesting enough time for the selected bar size.
-fn historical_request_start(
+fn request_start(
     chunk_start: OffsetDateTime,
     chunk_end: OffsetDateTime,
     interval: BarSize,
 ) -> OffsetDateTime {
     // Pad short final chunks to IBKR's minimum duration or one complete bar.
-    let minimum_seconds = HISTORICAL_MINIMUM_SECONDS.max(bar_size_seconds(interval));
+    let minimum_seconds = MINIMUM_REQUEST_SECONDS.max(bar_size_seconds(interval));
     (chunk_start - time::Duration::SECOND).min(chunk_end - time::Duration::seconds(minimum_seconds))
 }
 
 // Use chunks that can contain at least one bar without shrinking one-second requests.
-fn historical_chunk_seconds(interval: BarSize) -> i64 {
-    HISTORICAL_MINIMUM_CHUNK_SECONDS.max(bar_size_seconds(interval))
+fn chunk_seconds(interval: BarSize) -> i64 {
+    MINIMUM_CHUNK_SECONDS.max(bar_size_seconds(interval))
 }
 
 // Convert each IBKR bar size to a conservative duration in seconds.
@@ -142,7 +143,7 @@ fn parse_datetime(value: &str) -> Result<OffsetDateTime, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, historical_chunk_seconds, historical_request_start};
+    use super::{Args, chunk_seconds, request_start};
     use clap::Parser;
     use ibapi::market_data::historical::BarSize;
     use time::OffsetDateTime;
@@ -193,7 +194,7 @@ mod tests {
         // Confirm a short output window is requested using IBKR's minimum duration.
         let chunk_start = OffsetDateTime::from_unix_timestamp(1_785_527_995).unwrap();
         let chunk_end = OffsetDateTime::from_unix_timestamp(1_785_528_005).unwrap();
-        let request_start = historical_request_start(chunk_start, chunk_end, BarSize::Sec);
+        let request_start = request_start(chunk_start, chunk_end, BarSize::Sec);
 
         assert_eq!((chunk_end - request_start).whole_seconds(), 60);
     }
@@ -203,7 +204,7 @@ mod tests {
         // Confirm a full output window retains the preceding-second overlap.
         let chunk_start = OffsetDateTime::from_unix_timestamp(1_785_504_600).unwrap();
         let chunk_end = OffsetDateTime::from_unix_timestamp(1_785_506_400).unwrap();
-        let request_start = historical_request_start(chunk_start, chunk_end, BarSize::Sec);
+        let request_start = request_start(chunk_start, chunk_end, BarSize::Sec);
 
         assert_eq!((chunk_start - request_start).whole_seconds(), 1);
     }
@@ -211,7 +212,7 @@ mod tests {
     #[test]
     fn expand_chunks_for_large_intervals() {
         // Confirm each request window can contain at least one selected bar.
-        assert_eq!(historical_chunk_seconds(BarSize::Hour), 3_600);
-        assert_eq!(historical_chunk_seconds(BarSize::Day), 86_400);
+        assert_eq!(chunk_seconds(BarSize::Hour), 3_600);
+        assert_eq!(chunk_seconds(BarSize::Day), 86_400);
     }
 }
