@@ -205,10 +205,25 @@ fn train<B: AutodiffBackend>(
         .shuffle(args.seed)
         .num_workers(1)
         .build(InMemDataset::new(data.training.clone()));
+    let training_evaluation_loader =
+        DataLoaderBuilder::new(SeriesBatcher::<B::InnerBackend>::new())
+            .batch_size(args.batch_size)
+            .num_workers(1)
+            .build(InMemDataset::new(data.training.clone()));
     let validation_loader = DataLoaderBuilder::new(SeriesBatcher::<B::InnerBackend>::new())
         .batch_size(args.batch_size)
         .num_workers(1)
         .build(InMemDataset::new(data.validation.clone()));
+
+    // Report the initialized model's error before applying any optimizer steps.
+    let initial_model = model.valid();
+    let initial_training_loss = validation_loss(&initial_model, &training_evaluation_loader);
+    let initial_validation_loss = validation_loss(&initial_model, &validation_loader);
+    println!(
+        "Initial RMSE: train {:.2} bps, validation {:.2} bps",
+        initial_training_loss.sqrt() * data.deviation * 10_000.0,
+        initial_validation_loss.sqrt() * data.deviation * 10_000.0,
+    );
 
     // Optimize mean-squared error and display validation progress each epoch.
     println!(
