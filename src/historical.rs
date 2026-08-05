@@ -5,7 +5,7 @@ use ibapi::{
     contracts::Contract,
     market_data::{TradingHours, historical::BarSize},
 };
-use std::error::Error;
+use std::{error::Error, io};
 use time::{self, OffsetDateTime, format_description::well_known::Iso8601};
 
 // These constants configure historical data requests.
@@ -50,9 +50,13 @@ async fn fetch_data(client: &Client, args: &Args) -> Result<(), Box<dyn Error>> 
         return Err("end datetime must be after start datetime".into());
     }
 
-    // Request every chunk in the range so extended-hours data is not skipped.
+    // Write the CSV header once before requesting every chunk in the range.
     let contract = Contract::stock(&args.symbol).build();
-    println!("date,open,high,low,close,volume,wap,count");
+    let stdout = io::stdout();
+    let mut writer = csv::Writer::from_writer(stdout.lock());
+    writer.write_record([
+        "date", "open", "high", "low", "close", "volume", "wap", "count",
+    ])?;
     let mut chunk_start = args.start;
     let chunk_duration_seconds = chunk_seconds(args.interval);
 
@@ -68,27 +72,28 @@ async fn fetch_data(client: &Client, args: &Args) -> Result<(), Box<dyn Error>> 
             .fetch()
             .await?;
 
-        // Print bar-start timestamps inside this window.
+        // Write bar-start timestamps inside this window as CSV records.
         for bar in data
             .bars
             .into_iter()
             .filter(|bar| bar.date >= chunk_start.into() && bar.date < chunk_end.into())
         {
-            println!(
-                "{},{},{},{},{},{},{},{}",
-                bar.date,
-                bar.open,
-                bar.high,
-                bar.low,
-                bar.close,
-                bar.volume,
-                bar.wap,
-                bar.count,
-            );
+            writer.write_record([
+                bar.date.to_string(),
+                bar.open.to_string(),
+                bar.high.to_string(),
+                bar.low.to_string(),
+                bar.close.to_string(),
+                bar.volume.to_string(),
+                bar.wap.to_string(),
+                bar.count.to_string(),
+            ])?;
         }
         chunk_start = chunk_end;
     }
 
+    // Surface any buffered output error before reporting success.
+    writer.flush()?;
     Ok(())
 }
 
