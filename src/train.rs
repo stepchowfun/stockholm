@@ -225,11 +225,11 @@ fn train<B: AutodiffBackend>(
         );
         let validation_loss = validation_loss(&model.valid(), &validation_loader);
         println!(
-            "Epoch {:>2}/{}: train RMSE {:.6}, validation RMSE {:.6}",
+            "Epoch {:>2}/{}: train RMSE {:.2} bps, validation RMSE {:.2} bps",
             epoch,
             args.epochs,
-            training_loss.sqrt(),
-            validation_loss.sqrt(),
+            training_loss.sqrt() * data.deviation * 10_000.0,
+            validation_loss.sqrt() * data.deviation * 10_000.0,
         );
     }
 
@@ -327,11 +327,6 @@ fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
             return Err(format!("opening price on line {line} must be finite and positive").into());
         }
         prices.push(price);
-    }
-
-    // At least two prices are required to derive one return.
-    if prices.len() < 2 {
-        return Err("the CSV file must contain at least two data rows".into());
     }
 
     Ok(prices)
