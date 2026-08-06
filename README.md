@@ -38,6 +38,18 @@ You can evaluate a strategy over historical CSV files with the `backtest` subcom
 stockholm backtest --strategy buy-and-hold --data-paths data/validation/*.csv
 ```
 
+The `market-maker` strategy repeatedly places whole-share limit orders below and above each one-second bar's closing price. Existing orders fill when a subsequent bar trades through their limit and expire after their configured lifetime. During the final rows of each complete daily CSV selected by `--liquidation-seconds` (900 by default), the strategy cancels all buy orders, places no new buys, and liquidates all shares at the current closing price. The reported result is final marked-to-market profit:
+
+```sh
+stockholm backtest --strategy market-maker --data-paths data/validation/*.csv --initial-cash 1000000 --buy-ttl 3600 --sell-ttl 14400 --discount-percent 0.25 --markup-percent 0.25
+```
+
+The `market-maker-grid` strategy evaluates buy and sell TTLs of 5, 15, 30, 60, 120, 300, 900, 3,600, 7,200, 14,400, 43,200, and 86,400 seconds and discount and markup percentages of 0.01, 0.03, 0.1, 0.3, 1, 3, and 10 by default, then prints the most profitable of the resulting 7,056 combinations as CSV. Override each side of the search space independently with comma-separated `--buy-ttls`, `--sell-ttls`, `--discount-percentages`, and `--markup-percentages` values. Search progress is written to standard error, leaving standard output as machine-readable CSV. Initial cash and liquidation duration remain configurable, while the single-run TTL and percentage options do not affect grid mode:
+
+```sh
+stockholm backtest --strategy market-maker-grid --data-paths data/training/*.csv
+```
+
 You can select the symbol whose live market data and five-second bars should be streamed with the `run` subcommand:
 
 ```sh

@@ -5,18 +5,113 @@ use std::{error::Error, fs, path::PathBuf};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum Strategy {
     BuyAndHold,
+    MarketMaker,
+    MarketMakerGrid,
 }
 
 // These arguments configure a backtest run.
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Trading strategy to evaluate.
+    /// Trading strategy to evaluate. Required for every backtest.
     #[arg(long, value_enum)]
     strategy: Strategy,
 
-    /// CSV files containing historical market data.
+    /// CSV files containing historical market data. Required by every strategy.
     #[arg(long, required = true, num_args = 1..)]
     data_paths: Vec<PathBuf>,
+
+    /// Starting cash used by market-maker and market-maker-grid.
+    #[arg(long, default_value_t = 1_000_000.0, value_parser = parse_positive_f64)]
+    initial_cash: f64,
+
+    /// Buy-order lifetime used by market-maker. Ignored by other strategies.
+    #[arg(long, default_value_t = 3_600)]
+    buy_ttl: u64,
+
+    /// Sell-order lifetime used by market-maker. Ignored by other strategies.
+    #[arg(long, default_value_t = 14_400)]
+    sell_ttl: u64,
+
+    /// Buy-limit discount used by market-maker. Ignored by other strategies.
+    #[arg(long, default_value_t = 0.25, value_parser = parse_discount_percent)]
+    discount_percent: f64,
+
+    /// Sell-limit markup used by market-maker. Ignored by other strategies.
+    #[arg(long, default_value_t = 0.25, value_parser = parse_nonnegative_f64)]
+    markup_percent: f64,
+
+    /// Buy-order lifetimes searched by market-maker-grid. Ignored by other strategies.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        num_args = 1..,
+        default_value = "5,15,30,60,120,300,900,3600,7200,14400,43200,86400"
+    )]
+    buy_ttls: Vec<u64>,
+
+    /// Sell-order lifetimes searched by market-maker-grid. Ignored by other strategies.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        num_args = 1..,
+        default_value = "5,15,30,60,120,300,900,3600,7200,14400,43200,86400"
+    )]
+    sell_ttls: Vec<u64>,
+
+    /// Buy-limit discounts searched by market-maker-grid. Ignored by other strategies.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        num_args = 1..,
+        default_value = "0.01,0.03,0.1,0.3,1,3,10",
+        value_parser = parse_discount_percent
+    )]
+    discount_percentages: Vec<f64>,
+
+    /// Sell-limit markups searched by market-maker-grid. Ignored by other strategies.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        num_args = 1..,
+        default_value = "0.01,0.03,0.1,0.3,1,3,10",
+        value_parser = parse_nonnegative_f64
+    )]
+    markup_percentages: Vec<f64>,
+
+    /// Number of final rows liquidated in each file. Used by both market-maker strategies.
+    #[arg(long, default_value_t = 900)]
+    liquidation_seconds: usize,
+}
+
+// This bar contains the prices needed to simulate limit-order fills.
+struct Bar {
+    low: f64,
+    high: f64,
+    close: f64,
+    liquidate: bool,
+}
+
+// This order reserves either cash or shares until it fills or expires.
+struct LimitOrder {
+    placed_at: u64,
+    shares: f64,
+    limit: f64,
+}
+
+// This configuration defines one market-maker simulation candidate.
+#[derive(Clone, Copy)]
+struct MarketMakerConfig {
+    initial_cash: f64,
+    buy_ttl: u64,
+    sell_ttl: u64,
+    discount_percent: f64,
+    markup_percent: f64,
+}
+
+// This result identifies the most profitable grid candidate.
+struct GridResult {
+    config: MarketMakerConfig,
+    profit: f64,
 }
 
 // Backtest a trading strategy.
@@ -41,9 +136,262 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
             let change = buy_and_hold(&files)?;
             println!("{change}");
         }
+        Strategy::MarketMaker => {
+            let profit = market_maker(&files, args)?;
+            println!("{profit}");
+        }
+        Strategy::MarketMakerGrid => {
+            let result = market_maker_grid(&files, args)?;
+            write_grid_result(&result)?;
+        }
     }
 
     Ok(())
+}
+
+// Simulate repeatedly buying below and selling above the current market price.
+fn market_maker(files: &[(PathBuf, String)], args: &Args) -> Result<f64, Box<dyn Error>> {
+    // Parse every chronological bar before changing the simulated portfolio.
+    let bars = parse_bars(files, args.liquidation_seconds)?;
+    simulate_market_maker(&bars, market_maker_config(args))
+}
+
+// Evaluate nearby parameter combinations and return the most profitable one.
+fn market_maker_grid(
+    files: &[(PathBuf, String)],
+    args: &Args,
+) -> Result<GridResult, Box<dyn Error>> {
+    // Parse the historical bars once because every candidate uses identical market data.
+    let bars = parse_bars(files, args.liquidation_seconds)?;
+
+    // Track completed candidates while keeping progress messages separate from CSV output.
+    let candidates_per_ttl_pair = args.discount_percentages.len() * args.markup_percentages.len();
+    let total_candidates = args.buy_ttls.len() * args.sell_ttls.len() * candidates_per_ttl_pair;
+    let mut completed_candidates = 0_usize;
+    eprintln!("Searching {total_candidates} market-maker configurations...");
+
+    // Search the Cartesian product while retaining the first candidate in a tie.
+    let mut best = None::<GridResult>;
+    for &buy_ttl in &args.buy_ttls {
+        for &sell_ttl in &args.sell_ttls {
+            for &discount_percent in &args.discount_percentages {
+                for &markup_percent in &args.markup_percentages {
+                    let config = MarketMakerConfig {
+                        initial_cash: args.initial_cash,
+                        buy_ttl,
+                        sell_ttl,
+                        discount_percent,
+                        markup_percent,
+                    };
+                    let profit = simulate_market_maker(&bars, config)?;
+                    if best.as_ref().is_none_or(|result| profit > result.profit) {
+                        best = Some(GridResult { config, profit });
+                    }
+                }
+            }
+            completed_candidates += candidates_per_ttl_pair;
+            let progress_tenths = 1_000 * completed_candidates / total_candidates;
+            eprintln!(
+                "Searched {completed_candidates}/{total_candidates} configurations ({}.{:01}%)",
+                progress_tenths / 10,
+                progress_tenths % 10,
+            );
+        }
+    }
+
+    best.ok_or_else(|| "the parameter grid contains no valid candidates".into())
+}
+
+// Simulate one market-maker configuration over already parsed bars.
+fn simulate_market_maker(bars: &[Bar], config: MarketMakerConfig) -> Result<f64, Box<dyn Error>> {
+    // Start each independent candidate with the same entirely liquid portfolio.
+    let mut available_cash = config.initial_cash;
+    let mut available_shares = 0.0_f64;
+    let mut buy_orders = Vec::<LimitOrder>::new();
+    let mut sell_orders = Vec::<LimitOrder>::new();
+
+    // Cancel, fill, and replace orders once for every one-second bar.
+    for (second, bar) in bars.iter().enumerate() {
+        let second = u64::try_from(second)?;
+
+        // Liquidate at the current close throughout the final fifteen minutes of each day.
+        if bar.liquidate {
+            available_cash += buy_orders
+                .drain(..)
+                .map(|order| order.shares * order.limit)
+                .sum::<f64>();
+            available_shares += sell_orders.drain(..).map(|order| order.shares).sum::<f64>();
+            available_cash += available_shares * bar.close;
+            available_shares = 0.0_f64;
+            continue;
+        }
+
+        // Return resources reserved by orders older than their configured lifetimes.
+        buy_orders.retain(|order| {
+            if second.saturating_sub(order.placed_at) > config.buy_ttl {
+                available_cash += order.shares * order.limit;
+                false
+            } else {
+                true
+            }
+        });
+        sell_orders.retain(|order| {
+            if second.saturating_sub(order.placed_at) > config.sell_ttl {
+                available_shares += order.shares;
+                false
+            } else {
+                true
+            }
+        });
+
+        // Fill complete existing orders when this bar trades through their limits.
+        buy_orders.retain(|order| {
+            if bar.low <= order.limit {
+                available_shares += order.shares;
+                false
+            } else {
+                true
+            }
+        });
+        sell_orders.retain(|order| {
+            if bar.high >= order.limit {
+                available_cash += order.shares * order.limit;
+                false
+            } else {
+                true
+            }
+        });
+
+        // Reserve available cash for the largest whole-share discounted buy order.
+        let buy_limit = bar.close * (1.0_f64 - config.discount_percent / 100.0_f64);
+        let buy_shares = (available_cash / buy_limit).floor();
+        if buy_shares >= 1.0_f64 {
+            available_cash -= buy_shares * buy_limit;
+            buy_orders.push(LimitOrder {
+                placed_at: second,
+                shares: buy_shares,
+                limit: buy_limit,
+            });
+        }
+
+        // Reserve every available share for one marked-up sell order.
+        if available_shares > 0.0_f64 {
+            let sell_limit = bar.close * (1.0_f64 + config.markup_percent / 100.0_f64);
+            sell_orders.push(LimitOrder {
+                placed_at: second,
+                shares: available_shares,
+                limit: sell_limit,
+            });
+            available_shares = 0.0_f64;
+        }
+    }
+
+    // Mark reserved cash and all held shares to the final close before reporting profit.
+    let final_price = bars.last().unwrap().close;
+    let reserved_cash = buy_orders
+        .iter()
+        .map(|order| order.shares * order.limit)
+        .sum::<f64>();
+    let reserved_shares = sell_orders.iter().map(|order| order.shares).sum::<f64>();
+    let final_value =
+        available_cash + reserved_cash + (available_shares + reserved_shares) * final_price;
+
+    Ok(final_value - config.initial_cash)
+}
+
+// Copy market-maker command-line values into one simulation configuration.
+fn market_maker_config(args: &Args) -> MarketMakerConfig {
+    // Keep simulation code independent from unrelated backtest arguments.
+    MarketMakerConfig {
+        initial_cash: args.initial_cash,
+        buy_ttl: args.buy_ttl,
+        sell_ttl: args.sell_ttl,
+        discount_percent: args.discount_percent,
+        markup_percent: args.markup_percent,
+    }
+}
+
+// Print the winning grid candidate as one machine-readable CSV record.
+fn write_grid_result(result: &GridResult) -> Result<(), Box<dyn Error>> {
+    // Include every fixed and searched value needed to reproduce the result.
+    let mut writer = csv::Writer::from_writer(std::io::stdout().lock());
+    writer.write_record([
+        "profit",
+        "initial_cash",
+        "buy_ttl",
+        "sell_ttl",
+        "discount_percent",
+        "markup_percent",
+    ])?;
+    writer.write_record([
+        result.profit.to_string(),
+        result.config.initial_cash.to_string(),
+        result.config.buy_ttl.to_string(),
+        result.config.sell_ttl.to_string(),
+        result.config.discount_percent.to_string(),
+        result.config.markup_percent.to_string(),
+    ])?;
+    writer.flush()?;
+
+    Ok(())
+}
+
+// Parse the low, high, and closing prices from every input row.
+fn parse_bars(
+    files: &[(PathBuf, String)],
+    liquidation_seconds: usize,
+) -> Result<Vec<Bar>, Box<dyn Error>> {
+    // Preserve the already sorted file and record order while validating each price.
+    let mut bars = Vec::new();
+    for (path, contents) in files {
+        let mut reader = csv::Reader::from_reader(contents.as_bytes());
+        let headers = reader.headers()?;
+        let low_index = column_index(headers, path, "low")?;
+        let high_index = column_index(headers, path, "high")?;
+        let close_index = column_index(headers, path, "close")?;
+        let records = reader.records().collect::<Result<Vec<_>, _>>()?;
+        if records.is_empty() {
+            return Err(format!("{} must contain at least one data row", path.display()).into());
+        }
+        let liquidation_start = records.len().saturating_sub(liquidation_seconds);
+        for (index, record) in records.iter().enumerate() {
+            let line = index + 2;
+            bars.push(Bar {
+                low: parse_price(record.get(low_index), path, &format!("low on line {line}"))?,
+                high: parse_price(
+                    record.get(high_index),
+                    path,
+                    &format!("high on line {line}"),
+                )?,
+                close: parse_price(
+                    record.get(close_index),
+                    path,
+                    &format!("close on line {line}"),
+                )?,
+                liquidate: liquidation_seconds > 0
+                    && records.len() >= liquidation_seconds
+                    && index >= liquidation_start,
+            });
+        }
+    }
+    if bars.is_empty() {
+        return Err("at least one data file is required".into());
+    }
+
+    Ok(bars)
+}
+
+// Locate one required CSV price column.
+fn column_index(
+    headers: &csv::StringRecord,
+    path: &std::path::Path,
+    name: &str,
+) -> Result<usize, Box<dyn Error>> {
+    // Report the source file when a required market-data field is absent.
+    headers
+        .iter()
+        .position(|header| header == name)
+        .ok_or_else(|| format!("{} must contain a {name} column", path.display()).into())
 }
 
 // Calculate the absolute price change produced by buying first and selling last.
@@ -102,9 +450,45 @@ fn parse_price(
     Ok(price)
 }
 
+// Parse a finite positive floating-point command-line argument.
+fn parse_positive_f64(value: &str) -> Result<f64, String> {
+    // Reject values that cannot represent usable starting capital.
+    let value = value.parse::<f64>().map_err(|error| error.to_string())?;
+    if !value.is_finite() || value <= 0.0_f64 {
+        return Err("value must be finite and greater than zero".to_string());
+    }
+
+    Ok(value)
+}
+
+// Parse a finite nonnegative floating-point command-line argument.
+fn parse_nonnegative_f64(value: &str) -> Result<f64, String> {
+    // Permit a zero markup while rejecting negative and nonfinite percentages.
+    let value = value.parse::<f64>().map_err(|error| error.to_string())?;
+    if !value.is_finite() || value < 0.0_f64 {
+        return Err("value must be finite and nonnegative".to_string());
+    }
+
+    Ok(value)
+}
+
+// Parse a discount percentage that always produces a positive limit price.
+fn parse_discount_percent(value: &str) -> Result<f64, String> {
+    // Reject discounts at or above one hundred percent to keep buy limits valid.
+    let value = parse_nonnegative_f64(value)?;
+    if value >= 100.0_f64 {
+        return Err("value must be less than 100".to_string());
+    }
+
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Strategy, buy_and_hold};
+    use super::{
+        Args, Bar, MarketMakerConfig, Strategy, buy_and_hold, market_maker, market_maker_grid,
+        simulate_market_maker,
+    };
     use crate::{Cli, Subcommand};
     use clap::Parser;
     use std::path::PathBuf;
@@ -131,6 +515,24 @@ mod tests {
             args.data_paths,
             vec![PathBuf::from("monday.csv"), PathBuf::from("tuesday.csv")],
         );
+        assert!((args.initial_cash - 1_000_000.0).abs() < f64::EPSILON);
+        assert_eq!(args.buy_ttl, 3_600);
+        assert_eq!(args.sell_ttl, 14_400);
+        assert!((args.discount_percent - 0.25).abs() < f64::EPSILON);
+        assert!((args.markup_percent - 0.25).abs() < f64::EPSILON);
+        assert_eq!(args.buy_ttls.len(), 12);
+        assert_eq!(args.buy_ttls.first(), Some(&5));
+        assert_eq!(args.buy_ttls.last(), Some(&86_400));
+        assert_eq!(args.sell_ttls.len(), 12);
+        assert_eq!(args.sell_ttls.first(), Some(&5));
+        assert_eq!(args.sell_ttls.last(), Some(&86_400));
+        assert_eq!(args.discount_percentages.len(), 7);
+        assert_eq!(args.discount_percentages.first(), Some(&0.01_f64));
+        assert_eq!(args.discount_percentages.last(), Some(&10.0_f64));
+        assert_eq!(args.markup_percentages.len(), 7);
+        assert_eq!(args.markup_percentages.first(), Some(&0.01_f64));
+        assert_eq!(args.markup_percentages.last(), Some(&10.0_f64));
+        assert_eq!(args.liquidation_seconds, 900);
     }
 
     #[test]
@@ -148,5 +550,114 @@ mod tests {
         ];
 
         assert!((buy_and_hold(&files).unwrap() - 130.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fill_market_maker_orders() {
+        // Confirm discounted buys and marked-up sells reserve and return resources.
+        let files = vec![(
+            PathBuf::from("prices.csv"),
+            concat!(
+                "low,high,close\n",
+                "100,100,100\n",
+                "99,100,100\n",
+                "100,101,100\n",
+            )
+            .to_string(),
+        )];
+        let args = market_maker_args(1_000.0, 3_600, 14_400);
+
+        assert!((market_maker(&files, &args).unwrap() - 20.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn refund_expired_market_maker_orders() {
+        // Confirm canceling an expired buy restores its reserved cash.
+        let files = vec![(
+            PathBuf::from("prices.csv"),
+            "low,high,close\n100,100,100\n200,200,200\n".to_string(),
+        )];
+        let args = market_maker_args(1_000.0, 0, 14_400);
+
+        assert!(market_maker(&files, &args).unwrap().abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn liquidate_market_maker_inventory() {
+        // Confirm the liquidation window cancels orders and sells every held share at the close.
+        let bars = vec![
+            Bar {
+                low: 100.0,
+                high: 100.0,
+                close: 100.0,
+                liquidate: false,
+            },
+            Bar {
+                low: 99.0,
+                high: 100.0,
+                close: 100.0,
+                liquidate: false,
+            },
+            Bar {
+                low: 90.0,
+                high: 90.0,
+                close: 90.0,
+                liquidate: true,
+            },
+        ];
+        let config = MarketMakerConfig {
+            initial_cash: 1_000.0,
+            buy_ttl: 3_600,
+            sell_ttl: 14_400,
+            discount_percent: 1.0,
+            markup_percent: 1.0,
+        };
+
+        assert!((simulate_market_maker(&bars, config).unwrap() + 90.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn select_best_market_maker_grid_candidate() {
+        // Confirm the grid chooses the most profitable reproducible parameters.
+        let files = vec![(
+            PathBuf::from("prices.csv"),
+            concat!(
+                "low,high,close\n",
+                "100,100,100\n",
+                "99,100,100\n",
+                "100,102,100\n",
+            )
+            .to_string(),
+        )];
+        let args = market_maker_args(1_000.0, 10, 10);
+        let result = market_maker_grid(&files, &args).unwrap();
+
+        assert!((result.profit - 20.0).abs() < f64::EPSILON);
+        assert!((result.config.discount_percent - 1.0).abs() < f64::EPSILON);
+        assert!((result.config.markup_percent - 1.0).abs() < f64::EPSILON);
+        assert_eq!(result.config.buy_ttl, 5);
+        assert_eq!(result.config.sell_ttl, 5);
+    }
+
+    // Construct focused market-maker settings without invoking command-line parsing.
+    fn market_maker_args(initial_cash: f64, buy_ttl: u64, sell_ttl: u64) -> Args {
+        Args {
+            strategy: Strategy::MarketMaker,
+            data_paths: Vec::new(),
+            initial_cash,
+            buy_ttl,
+            sell_ttl,
+            discount_percent: 1.0,
+            markup_percent: 1.0,
+            buy_ttls: vec![
+                5, 15, 30, 60, 120, 300, 900, 3_600, 7_200, 14_400, 43_200, 86_400,
+            ],
+            sell_ttls: vec![
+                5, 15, 30, 60, 120, 300, 900, 3_600, 7_200, 14_400, 43_200, 86_400,
+            ],
+            discount_percentages: vec![0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
+            markup_percentages: vec![0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
+            liquidation_seconds: 900,
+        }
     }
 }
