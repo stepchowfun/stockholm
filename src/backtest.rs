@@ -81,6 +81,10 @@ pub struct Args {
     /// Number of final rows liquidated in each file. Used by both market-maker strategies.
     #[arg(long, default_value_t = 900)]
     liquidation_seconds: usize,
+
+    /// Maximum shares of each eligible order filled per bar. Used by both market-maker strategies.
+    #[arg(long, default_value_t = 1_000.0, value_parser = parse_positive_f64)]
+    bar_volume_limit: f64,
 }
 
 // This bar contains the prices needed to simulate limit-order fills.
@@ -106,6 +110,7 @@ struct MarketMakerConfig {
     sell_ttl: u64,
     discount_percent: f64,
     markup_percent: f64,
+    bar_volume_limit: f64,
 }
 
 // This result identifies the most profitable grid candidate.
@@ -182,6 +187,7 @@ fn market_maker_grid(
                         sell_ttl,
                         discount_percent,
                         markup_percent,
+                        bar_volume_limit: args.bar_volume_limit,
                     };
                     let profit = simulate_market_maker(&bars, config)?;
                     if best.as_ref().is_none_or(|result| profit > result.profit) {
@@ -214,15 +220,16 @@ fn simulate_market_maker(bars: &[Bar], config: MarketMakerConfig) -> Result<f64,
     for (second, bar) in bars.iter().enumerate() {
         let second = u64::try_from(second)?;
 
-        // Liquidate at the current close throughout the final fifteen minutes of each day.
+        // Cancel pending orders and sell up to one bar's volume at the current close.
         if bar.liquidate {
             available_cash += buy_orders
                 .drain(..)
                 .map(|order| order.shares * order.limit)
                 .sum::<f64>();
             available_shares += sell_orders.drain(..).map(|order| order.shares).sum::<f64>();
-            available_cash += available_shares * bar.close;
-            available_shares = 0.0_f64;
+            let filled_shares = available_shares.min(config.bar_volume_limit);
+            available_cash += filled_shares * bar.close;
+            available_shares -= filled_shares;
             continue;
         }
 
@@ -244,23 +251,25 @@ fn simulate_market_maker(bars: &[Bar], config: MarketMakerConfig) -> Result<f64,
             }
         });
 
-        // Fill complete existing orders when this bar trades through their limits.
-        buy_orders.retain(|order| {
+        // Partially fill each eligible buy order by at most one bar's configured volume.
+        for order in &mut buy_orders {
             if bar.low <= order.limit {
-                available_shares += order.shares;
-                false
-            } else {
-                true
+                let filled_shares = order.shares.min(config.bar_volume_limit);
+                available_shares += filled_shares;
+                order.shares -= filled_shares;
             }
-        });
-        sell_orders.retain(|order| {
+        }
+        buy_orders.retain(|order| order.shares > 0.0_f64);
+
+        // Partially fill each eligible sell order by at most one bar's configured volume.
+        for order in &mut sell_orders {
             if bar.high >= order.limit {
-                available_cash += order.shares * order.limit;
-                false
-            } else {
-                true
+                let filled_shares = order.shares.min(config.bar_volume_limit);
+                available_cash += filled_shares * order.limit;
+                order.shares -= filled_shares;
             }
-        });
+        }
+        sell_orders.retain(|order| order.shares > 0.0_f64);
 
         // Reserve available cash for the largest whole-share discounted buy order.
         let buy_limit = bar.close * (1.0_f64 - config.discount_percent / 100.0_f64);
@@ -308,6 +317,7 @@ fn market_maker_config(args: &Args) -> MarketMakerConfig {
         sell_ttl: args.sell_ttl,
         discount_percent: args.discount_percent,
         markup_percent: args.markup_percent,
+        bar_volume_limit: args.bar_volume_limit,
     }
 }
 
@@ -322,6 +332,7 @@ fn write_grid_result(result: &GridResult) -> Result<(), Box<dyn Error>> {
         "sell_ttl",
         "discount_percent",
         "markup_percent",
+        "bar_volume_limit",
     ])?;
     writer.write_record([
         result.profit.to_string(),
@@ -330,6 +341,7 @@ fn write_grid_result(result: &GridResult) -> Result<(), Box<dyn Error>> {
         result.config.sell_ttl.to_string(),
         result.config.discount_percent.to_string(),
         result.config.markup_percent.to_string(),
+        result.config.bar_volume_limit.to_string(),
     ])?;
     writer.flush()?;
 
@@ -533,6 +545,7 @@ mod tests {
         assert_eq!(args.markup_percentages.first(), Some(&0.01_f64));
         assert_eq!(args.markup_percentages.last(), Some(&10.0_f64));
         assert_eq!(args.liquidation_seconds, 900);
+        assert!((args.bar_volume_limit - 1_000.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -611,6 +624,7 @@ mod tests {
             sell_ttl: 14_400,
             discount_percent: 1.0,
             markup_percent: 1.0,
+            bar_volume_limit: 1_000.0,
         };
 
         assert!((simulate_market_maker(&bars, config).unwrap() + 90.0).abs() < f64::EPSILON);
@@ -639,6 +653,41 @@ mod tests {
         assert_eq!(result.config.sell_ttl, 5);
     }
 
+    #[test]
+    fn partially_fill_market_maker_orders() {
+        // Confirm an eligible order needs multiple bars when it exceeds the volume limit.
+        let bars = vec![
+            Bar {
+                low: 100.0,
+                high: 100.0,
+                close: 100.0,
+                liquidate: false,
+            },
+            Bar {
+                low: 99.0,
+                high: 100.0,
+                close: 100.0,
+                liquidate: false,
+            },
+            Bar {
+                low: 100.0,
+                high: 101.0,
+                close: 100.0,
+                liquidate: false,
+            },
+        ];
+        let config = MarketMakerConfig {
+            initial_cash: 1_000.0,
+            buy_ttl: 3_600,
+            sell_ttl: 14_400,
+            discount_percent: 1.0,
+            markup_percent: 1.0,
+            bar_volume_limit: 5.0,
+        };
+
+        assert!((simulate_market_maker(&bars, config).unwrap() - 10.0).abs() < f64::EPSILON);
+    }
+
     // Construct focused market-maker settings without invoking command-line parsing.
     fn market_maker_args(initial_cash: f64, buy_ttl: u64, sell_ttl: u64) -> Args {
         Args {
@@ -658,6 +707,7 @@ mod tests {
             discount_percentages: vec![0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
             markup_percentages: vec![0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
             liquidation_seconds: 900,
+            bar_volume_limit: 1_000.0,
         }
     }
 }

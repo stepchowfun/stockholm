@@ -38,7 +38,7 @@ You can evaluate a strategy over historical CSV files with the `backtest` subcom
 stockholm backtest --strategy buy-and-hold --data-paths data/validation/*.csv
 ```
 
-The `market-maker` strategy repeatedly places whole-share limit orders below and above each one-second bar's closing price. Existing orders fill when a subsequent bar trades through their limit and expire after their configured lifetime. During the final rows of each complete daily CSV selected by `--liquidation-seconds` (900 by default), the strategy cancels all buy orders, places no new buys, and liquidates all shares at the current closing price. The reported result is final marked-to-market profit:
+The `market-maker` strategy repeatedly places whole-share limit orders below and above each one-second bar's closing price. Existing orders fill when a subsequent bar trades through their limit and expire after their configured lifetime. Each eligible order fills at most `--bar-volume-limit` shares per one-second bar (1,000 by default), with the remainder staying open. During the final rows of each complete daily CSV selected by `--liquidation-seconds` (900 by default), the strategy cancels all buy orders, places no new buys, and liquidates up to the same volume limit at the current closing price each second. The reported result is final marked-to-market profit:
 
 ```sh
 stockholm backtest --strategy market-maker --data-paths data/validation/*.csv --initial-cash 1000000 --buy-ttl 3600 --sell-ttl 14400 --discount-percent 0.25 --markup-percent 0.25
