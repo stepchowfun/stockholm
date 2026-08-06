@@ -1,4 +1,6 @@
+mod backtest;
 mod historical;
+mod infer;
 mod run;
 mod train;
 
@@ -39,11 +41,17 @@ struct Cli {
 // These subcommands select the program's operating mode.
 #[derive(ClapSubcommand)]
 enum Subcommand {
+    #[command(about = "Backtest a trading strategy")]
+    Backtest(backtest::Args),
+
     #[command(about = "Run the trading bot (default)")]
     Run(run::Args),
 
     #[command(about = "Fetch historical market data as CSV")]
     Historical(historical::Args),
+
+    #[command(about = "Run one inference with a trained neural network")]
+    Infer(infer::Args),
 
     #[command(about = "Train a neural network on historical stock data")]
     Train(train::Args),
@@ -57,10 +65,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Decide what to do based on the subcommand.
     match cli.command {
+        Some(Subcommand::Backtest(args)) => backtest::run(&args),
         Some(Subcommand::Run(args)) => run::run(&cli.address, cli.client_id, &args).await,
         Some(Subcommand::Historical(args)) => {
             historical::run(&cli.address, cli.client_id, &args).await
         }
+        Some(Subcommand::Infer(args)) => infer::run(&args),
         Some(Subcommand::Train(args)) => train::run(&args),
         None => run::run(&cli.address, cli.client_id, &run::Args::default()).await,
     }

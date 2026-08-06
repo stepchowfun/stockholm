@@ -109,7 +109,7 @@ impl<B: Backend> Batcher<B, SeriesItem, SeriesBatch<B>> for SeriesBatcher<B> {
 
 // This model predicts several future returns directly from a fixed input window.
 #[derive(Module, Debug)]
-struct Model<B: Backend> {
+pub(crate) struct Model<B: Backend> {
     input: Linear<B>,
     hidden: Linear<B>,
     output: Linear<B>,
@@ -118,15 +118,28 @@ struct Model<B: Backend> {
 
 // This configuration defines the model dimensions.
 #[derive(Config, Debug)]
-struct ModelConfig {
-    inputs: usize,
+pub(crate) struct ModelConfig {
+    pub(crate) inputs: usize,
     hidden: usize,
     outputs: usize,
 }
 
+// This configuration records training and preprocessing metadata.
+#[derive(Config, Debug)]
+pub(crate) struct MetadataConfig {
+    inputs: usize,
+    outputs: usize,
+    batch_size: usize,
+    epochs: usize,
+    learning_rate: f64,
+    seed: u64,
+    pub(crate) return_mean: f32,
+    pub(crate) return_deviation: f32,
+}
+
 impl ModelConfig {
     // Initialize every model layer on the selected device.
-    fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
+    pub(crate) fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
         Model {
             input: LinearConfig::new(self.inputs, self.hidden).init(device),
             hidden: LinearConfig::new(self.hidden, self.hidden).init(device),
@@ -138,7 +151,7 @@ impl ModelConfig {
 
 impl<B: Backend> Model<B> {
     // Apply the two hidden transformations and output projection.
-    fn forward(&self, inputs: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub(crate) fn forward(&self, inputs: Tensor<B, 2>) -> Tensor<B, 2> {
         let values = self.activation.forward(self.input.forward(inputs));
         let values = self.activation.forward(self.hidden.forward(values));
         self.output.forward(values)
@@ -318,7 +331,7 @@ fn validation_loss<B: Backend>(
 }
 
 // Parse finite positive opening prices from a historical-data CSV file.
-fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
+pub(crate) fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
     // Locate the opening-price column by name so column order remains explicit.
     let mut reader = csv::Reader::from_reader(contents.as_bytes());
     let headers = reader.headers()?;
@@ -370,7 +383,7 @@ fn parse_positive_f64(value: &str) -> Result<f64, String> {
 }
 
 // Convert raw prices into stationary relative changes.
-fn log_returns(prices: &[f32]) -> Vec<f32> {
+pub(crate) fn log_returns(prices: &[f32]) -> Vec<f32> {
     prices
         .windows(2)
         .map(|pair| (pair[1] / pair[0]).ln())
@@ -473,12 +486,8 @@ fn usize_to_f32(value: usize) -> f32 {
 
 // Persist preprocessing values required to convert predicted returns back to prices.
 fn save_metadata(args: &Args, data: &PreparedData) -> Result<(), Box<dyn Error>> {
-    // Use a simple text format that remains readable without model tooling.
-    let metadata = format!(
-        concat!(
-            "inputs={}\noutputs={}\nbatch_size={}\nepochs={}\n",
-            "learning_rate={}\nseed={}\nreturn_mean={}\nreturn_deviation={}\n",
-        ),
+    // Serialize one shared configuration type for reliable inference-time parsing.
+    let metadata = MetadataConfig::new(
         args.inputs,
         args.outputs,
         args.batch_size,
@@ -488,7 +497,7 @@ fn save_metadata(args: &Args, data: &PreparedData) -> Result<(), Box<dyn Error>>
         data.mean,
         data.deviation,
     );
-    fs::write(args.model_directory.join("metadata.txt"), metadata)?;
+    metadata.save(args.model_directory.join("metadata.json"))?;
 
     Ok(())
 }
