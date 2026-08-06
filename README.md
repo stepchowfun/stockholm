@@ -18,8 +18,10 @@ Here are the supported command-line options:
 Usage: stockholm [OPTIONS] [COMMAND]
 
 Commands:
+  backtest    Backtest a trading strategy
   run         Run the trading bot (default)
   historical  Fetch historical market data as CSV
+  infer       Run one inference with a trained neural network
   train       Train a neural network on historical stock data
   help        Print this message or the help of the given subcommand(s)
 
@@ -28,6 +30,12 @@ Options:
       --client-id <CLIENT_ID>  Client ID to use for the API connection [default: 100]
   -v, --version                Print version
   -h, --help                   Print help
+```
+
+You can evaluate a strategy over historical CSV files with the `backtest` subcommand. Files are ordered lexicographically by filename; the buy-and-hold strategy prints the final closing price minus the initial opening price:
+
+```sh
+stockholm backtest --strategy buy-and-hold --data-paths data/validation/*.csv
 ```
 
 You can select the symbol whose live market data and five-second bars should be streamed with the `run` subcommand:
@@ -49,6 +57,12 @@ stockholm train --training-paths monday.csv tuesday.csv --validation-paths wedne
 ```
 
 Training uses log returns and every available overlapping window. Normalization is fitted exclusively from the training files. By default, the model uses 20 inputs to predict 5 outputs, a batch size of 64, 50 epochs, a learning rate of 0.001, and a seed of 42, and writes the trained Burn model and its preprocessing metadata to `model`; these settings can be changed with `--inputs`, `--outputs`, `--batch-size`, `--epochs`, `--learning-rate`, `--seed`, and `--model-directory`.
+
+The `infer` subcommand loads those artifacts and forecasts opening prices from one CSV input window. Because prices are converted to log returns, the CSV must contain one more raw price than the model's input count; the default 20-input model therefore consumes 21 prices:
+
+```sh
+stockholm infer
+```
 
 You'll also need to start an Interactive Brokers Gateway that Stockholm can talk to. You can run that in a Docker container via the provided `run-ib-gateway.sh` script:
 

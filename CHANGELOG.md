@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.14] - 2026-08-06
+
+### Added
+- Backtest a buy-and-hold strategy over filename-ordered historical CSV files.
+- Bundle example market data with training and validation splits.
+- Run a single trained-model inference from a CSV price window with the `infer` subcommand.
+
 ## [0.2.13] - 2026-08-05
 
 ### Changed
