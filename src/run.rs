@@ -224,7 +224,7 @@ async fn account_summary(client: &Client) -> Result<(), Box<dyn Error>> {
     let subscription = client
         .account_summary(&AccountGroup("All".to_string()), AccountSummaryTags::ALL)
         .await?;
-    let mut summaries = subscription.filter_data();
+    let mut summaries = subscription.clone().filter_data();
 
     // Print summary values until the complete initial snapshot arrives.
     while let Some(update) = summaries.next().await {
@@ -245,6 +245,9 @@ async fn account_summary(client: &Client) -> Result<(), Box<dyn Error>> {
             AccountSummaryResult::End => break,
         }
     }
+
+    // Release IBKR's limited account-summary subscription slot before the next step.
+    subscription.cancel().await;
 
     println!("[account summary] Finished listing account summary.");
 
