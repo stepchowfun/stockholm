@@ -1,6 +1,6 @@
 [package]
 name = "stockholm"
-version = "0.2.20"
+version = "0.2.21"
 authors = ["Stephan Boyer <stephan@stephanboyer.com>"]
 edition = "2024"
 description = "An algorithmic trading bot."
@@ -26,4 +26,5 @@ serde = { version = "1.0.229", features = ["derive"] }
 tempfile = "3.27.0"
 time = { version = "0.3.55", features = ["parsing"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+uuid = { version = "1.24.0", features = ["v4"] }
 yaml_serde = "0.10.4"

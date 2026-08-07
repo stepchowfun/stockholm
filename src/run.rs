@@ -5,14 +5,16 @@ use ibapi::{
     accounts::{AccountSummaryResult, AccountSummaryTags, PositionUpdate, types::AccountGroup},
     contracts::{Contract, tick_types::TickType},
     market_data::{MarketDataType, TradingHours, realtime::TickTypes},
-    orders::Orders,
+    orders::{OrderUpdate, Orders},
     prelude::{StreamExt, SubscriptionItemStreamExt},
 };
 use std::{error::Error, io, sync::RwLock};
+use uuid::Uuid;
 
 // These constants configure the instrument and failure recovery.
 const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+const ORDER_REF_PREFIX: &str = "stockholm:";
 const SMART_EXCHANGE: &str = "SMART";
 const OVERNIGHT_EXCHANGE: &str = "OVERNIGHT";
 
@@ -83,12 +85,73 @@ async fn run_with_connection(client: &Client, symbol: &str) -> Result<(), Box<dy
 
     // Keep every operating loop alive until any one of them requires a reconnect.
     tokio::try_join!(
+        order_updates(client),
         run_steps(client, &volatile_state),
         account_summary(client),
         stream_live_data(client, symbol, &volatile_state),
         stream_realtime_bars(client, symbol, SMART_EXCHANGE),
         stream_realtime_bars(client, symbol, OVERNIGHT_EXCHANGE),
     )?;
+
+    Ok(())
+}
+
+// Place a limit order to buy the requested number of shares.
+#[allow(dead_code)]
+async fn place_limit_buy(
+    client: &Client,
+    symbol: &str,
+    shares: i32,
+    limit: f64,
+) -> Result<(), Box<dyn Error>> {
+    // Build the order with a stable Stockholm-generated correlation reference.
+    let contract = Contract::stock(symbol).build();
+    let order_ref = format!("{ORDER_REF_PREFIX}{}", Uuid::new_v4().simple());
+    let mut order = client
+        .order(&contract)
+        .buy(shares)
+        .limit(limit)
+        .outside_rth()
+        .build()?;
+    order.order_ref.clone_from(&order_ref);
+    order.include_overnight = true;
+
+    // Allocate the connection-local order ID and submit the completed order.
+    let order_id = client.next_order_id();
+    client.submit_order(order_id, &contract, &order).await?;
+    println!(
+        "[orders] Submitted limit buy {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}",
+    );
+
+    Ok(())
+}
+
+// Place a limit order to sell the requested number of shares.
+#[allow(dead_code)]
+async fn place_limit_sell(
+    client: &Client,
+    symbol: &str,
+    shares: i32,
+    limit: f64,
+) -> Result<(), Box<dyn Error>> {
+    // Build the order with a stable Stockholm-generated correlation reference.
+    let contract = Contract::stock(symbol).build();
+    let order_ref = format!("{ORDER_REF_PREFIX}{}", Uuid::new_v4().simple());
+    let mut order = client
+        .order(&contract)
+        .sell(shares)
+        .limit(limit)
+        .outside_rth()
+        .build()?;
+    order.order_ref.clone_from(&order_ref);
+    order.include_overnight = true;
+
+    // Allocate the connection-local order ID and submit the completed order.
+    let order_id = client.next_order_id();
+    client.submit_order(order_id, &contract, &order).await?;
+    println!(
+        "[orders] Submitted limit sell {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}",
+    );
 
     Ok(())
 }
@@ -253,34 +316,50 @@ async fn account_summary(client: &Client) -> Result<(), Box<dyn Error>> {
     Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
-// Print all current open orders.
+// Stream order updates for the life of the connection.
+async fn order_updates(client: &Client) -> Result<(), Box<dyn Error>> {
+    // Subscribe before any trading operations can submit orders.
+    let subscription = client.order_update_stream().await?;
+    let mut updates = subscription.filter_data();
+    println!("[order updates] Streaming order updates…");
+
+    // Print every order-related event while propagating stream failures.
+    while let Some(update) = updates.next().await {
+        let update: OrderUpdate = update?;
+        println!("[order updates] {update:?}");
+    }
+
+    Err(ibapi::Error::UnexpectedEndOfStream.into())
+}
+
+// Print current open orders placed by Stockholm.
 async fn list_orders(client: &Client) -> Result<(), Box<dyn Error>> {
     // Mark the start of the request before collecting its results.
-    println!("[orders] Requesting all open orders…");
+    println!("[orders] Requesting Stockholm open orders…");
 
     // Request every current open order across associated accounts and API clients.
     let subscription = client.all_open_orders().await?;
     let mut orders = subscription.filter_data();
     let mut order_count: usize = 0;
 
-    // Print order details and statuses while propagating request failures.
+    // Print only orders carrying Stockholm's reference prefix.
     while let Some(order) = orders.next().await {
         match order? {
-            Orders::OrderData(data) => {
+            Orders::OrderData(data) if data.order.order_ref.starts_with(ORDER_REF_PREFIX) => {
                 order_count += 1;
                 println!("[orders] - {data:?}");
             }
-            Orders::OrderStatus(status) => println!("{status:?}"),
+            Orders::OrderData(_) | Orders::OrderStatus(_) => {}
         }
     }
 
     // Confirm that the complete response arrived even when it contained no orders.
     if order_count == 0 {
-        println!("[orders] No open orders found.");
+        println!("[orders] No Stockholm open orders found.");
     } else if order_count == 1 {
-        println!("[orders] Finished listing 1 open order.");
+        println!("[orders] Finished listing 1 Stockholm open order.");
     } else {
-        println!("[orders] Finished listing {order_count} open orders.");
+        println!("[orders] Finished listing {order_count} Stockholm open orders.");
     }
 
     Ok(())
