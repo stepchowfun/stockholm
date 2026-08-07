@@ -128,10 +128,23 @@ struct MarketMakerConfig {
     bar_volume_limit: f64,
 }
 
-// This result identifies the grid candidate with the highest final account value.
-struct GridResult {
-    config: MarketMakerConfig,
+// These statistics summarize one market-maker simulation across all trading days.
+#[derive(Clone, Copy)]
+struct MarketMakerResult {
     final_value: f64,
+    sharpe: f64,
+}
+
+// This result pairs one grid configuration with its simulation statistics.
+struct GridCandidate {
+    config: MarketMakerConfig,
+    result: MarketMakerResult,
+}
+
+// These results identify the configurations favored by return and risk-adjusted return.
+struct GridResult {
+    highest_return: GridCandidate,
+    highest_sharpe: GridCandidate,
 }
 
 // Backtest a trading strategy.
@@ -157,8 +170,8 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
             println!("{final_value}");
         }
         Strategy::MarketMaker => {
-            let final_value = market_maker(&files, args)?;
-            println!("{final_value}");
+            let result = market_maker(&files, args)?;
+            write_market_maker_result(&result, market_maker_config(args))?;
         }
         Strategy::MarketMakerGrid => {
             let result = market_maker_grid(&files, args)?;
@@ -170,19 +183,22 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
 }
 
 // Simulate repeatedly buying below and selling above the current market price.
-fn market_maker(files: &[(PathBuf, String)], args: &Args) -> Result<f64, Box<dyn Error>> {
-    // Parse every chronological bar before changing the simulated portfolio.
-    let bars = parse_bars(files, args.liquidation_seconds)?;
-    simulate_market_maker(&bars, market_maker_config(args))
+fn market_maker(
+    files: &[(PathBuf, String)],
+    args: &Args,
+) -> Result<MarketMakerResult, Box<dyn Error>> {
+    // Parse each chronological trading day before changing the simulated portfolio.
+    let days = parse_days(files, args.liquidation_seconds)?;
+    simulate_market_maker(&days, market_maker_config(args))
 }
 
-// Evaluate nearby parameter combinations and return the one with the highest final value.
+// Evaluate nearby parameter combinations and return the winners by return and Sharpe ratio.
 fn market_maker_grid(
     files: &[(PathBuf, String)],
     args: &Args,
 ) -> Result<GridResult, Box<dyn Error>> {
-    // Parse the historical bars once because every candidate uses identical market data.
-    let bars = parse_bars(files, args.liquidation_seconds)?;
+    // Parse the historical days once because every candidate uses identical market data.
+    let days = parse_days(files, args.liquidation_seconds)?;
 
     // Track completed candidates while keeping progress messages separate from CSV output.
     let candidates_per_ttl_pair =
@@ -192,7 +208,8 @@ fn market_maker_grid(
     eprintln!("Searching {total_candidates} market-maker configurations...");
 
     // Search the Cartesian product while retaining the first candidate in a tie.
-    let mut best = None::<GridResult>;
+    let mut highest_return = None::<GridCandidate>;
+    let mut highest_sharpe = None::<GridCandidate>;
     for &buy_ttl in &args.buy_ttls {
         for &sell_ttl in &args.sell_ttls {
             for &discount_percent in &args.discount_percentages {
@@ -207,15 +224,17 @@ fn market_maker_grid(
                             bet_size,
                             bar_volume_limit: args.bar_volume_limit,
                         };
-                        let final_value = simulate_market_maker(&bars, config)?;
-                        if best
+                        let result = simulate_market_maker(&days, config)?;
+                        if highest_return.as_ref().is_none_or(|candidate| {
+                            result.final_value > candidate.result.final_value
+                        }) {
+                            highest_return = Some(GridCandidate { config, result });
+                        }
+                        if highest_sharpe
                             .as_ref()
-                            .is_none_or(|result| final_value > result.final_value)
+                            .is_none_or(|candidate| result.sharpe > candidate.result.sharpe)
                         {
-                            best = Some(GridResult {
-                                config,
-                                final_value,
-                            });
+                            highest_sharpe = Some(GridCandidate { config, result });
                         }
                     }
                 }
@@ -230,13 +249,41 @@ fn market_maker_grid(
         }
     }
 
-    best.ok_or_else(|| "the parameter grid contains no valid candidates".into())
+    // Both winners exist whenever the parameter grid contains at least one candidate.
+    Ok(GridResult {
+        highest_return: highest_return.ok_or("the parameter grid contains no valid candidates")?,
+        highest_sharpe: highest_sharpe.ok_or("the parameter grid contains no valid candidates")?,
+    })
 }
 
-// Simulate one market-maker configuration over already parsed bars.
-fn simulate_market_maker(bars: &[Bar], config: MarketMakerConfig) -> Result<f64, Box<dyn Error>> {
-    // Start each independent candidate with the same entirely liquid portfolio.
-    let mut available_cash = config.initial_cash;
+// Simulate one market-maker configuration over each parsed trading day.
+fn simulate_market_maker(
+    days: &[Vec<Bar>],
+    config: MarketMakerConfig,
+) -> Result<MarketMakerResult, Box<dyn Error>> {
+    // Compound account value across days while retaining each daily return for risk measurement.
+    let mut final_value = config.initial_cash;
+    let mut daily_returns = Vec::with_capacity(days.len());
+    for bars in days {
+        let initial_value = final_value;
+        final_value = simulate_market_maker_day(bars, initial_value, config)?;
+        daily_returns.push(final_value / initial_value - 1.0_f64);
+    }
+
+    Ok(MarketMakerResult {
+        final_value,
+        sharpe: sharpe_ratio(&daily_returns)?,
+    })
+}
+
+// Simulate one market-maker configuration over one trading day.
+fn simulate_market_maker_day(
+    bars: &[Bar],
+    initial_value: f64,
+    config: MarketMakerConfig,
+) -> Result<f64, Box<dyn Error>> {
+    // Start the day with the entire incoming account value available as cash.
+    let mut available_cash = initial_value;
     let mut available_shares = 0.0_f64;
     let mut buy_orders = Vec::<LimitOrder>::new();
     let mut sell_orders = Vec::<LimitOrder>::new();
@@ -344,6 +391,32 @@ fn simulate_market_maker(bars: &[Bar], config: MarketMakerConfig) -> Result<f64,
     Ok(final_value)
 }
 
+// Calculate unannualized risk-adjusted return from daily return rates.
+fn sharpe_ratio(returns: &[f64]) -> Result<f64, Box<dyn Error>> {
+    // Use the population moments because the supplied days are the full backtest period.
+    let count = f64::from(u32::try_from(returns.len())?);
+    let mean = returns.iter().sum::<f64>() / count;
+    let variance = returns
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / count;
+    let standard_deviation = variance.sqrt();
+
+    // Give constant-return strategies an ordered result without producing `NaN` for zero returns.
+    let sharpe = if standard_deviation == 0.0_f64 {
+        match mean.total_cmp(&0.0_f64) {
+            std::cmp::Ordering::Greater => f64::INFINITY,
+            std::cmp::Ordering::Less => f64::NEG_INFINITY,
+            std::cmp::Ordering::Equal => 0.0_f64,
+        }
+    } else {
+        mean / standard_deviation
+    };
+
+    Ok(sharpe)
+}
+
 // Copy market-maker command-line values into one simulation configuration.
 fn market_maker_config(args: &Args) -> MarketMakerConfig {
     // Keep simulation code independent from unrelated backtest arguments.
@@ -358,12 +431,16 @@ fn market_maker_config(args: &Args) -> MarketMakerConfig {
     }
 }
 
-// Print the winning grid candidate as one machine-readable CSV record.
-fn write_grid_result(result: &GridResult) -> Result<(), Box<dyn Error>> {
-    // Include every fixed and searched value needed to reproduce the result.
+// Print one market-maker result as machine-readable CSV.
+fn write_market_maker_result(
+    result: &MarketMakerResult,
+    config: MarketMakerConfig,
+) -> Result<(), Box<dyn Error>> {
+    // Emit the statistics and complete effective configuration.
     let mut writer = csv::Writer::from_writer(std::io::stdout().lock());
     writer.write_record([
         "final_value",
+        "sharpe",
         "initial_cash",
         "buy_ttl",
         "sell_ttl",
@@ -374,26 +451,65 @@ fn write_grid_result(result: &GridResult) -> Result<(), Box<dyn Error>> {
     ])?;
     writer.write_record([
         result.final_value.to_string(),
-        result.config.initial_cash.to_string(),
-        result.config.buy_ttl.to_string(),
-        result.config.sell_ttl.to_string(),
-        result.config.discount_percent.to_string(),
-        result.config.markup_percent.to_string(),
-        result.config.bet_size.to_string(),
-        result.config.bar_volume_limit.to_string(),
+        result.sharpe.to_string(),
+        config.initial_cash.to_string(),
+        config.buy_ttl.to_string(),
+        config.sell_ttl.to_string(),
+        config.discount_percent.to_string(),
+        config.markup_percent.to_string(),
+        config.bet_size.to_string(),
+        config.bar_volume_limit.to_string(),
     ])?;
     writer.flush()?;
 
     Ok(())
 }
 
-// Parse the low, high, and closing prices from every input row.
-fn parse_bars(
+// Print both winning grid candidates as machine-readable CSV records.
+fn write_grid_result(result: &GridResult) -> Result<(), Box<dyn Error>> {
+    // Include every statistic and parameter needed to distinguish and reproduce both winners.
+    let mut writer = csv::Writer::from_writer(std::io::stdout().lock());
+    writer.write_record([
+        "criterion",
+        "final_value",
+        "sharpe",
+        "initial_cash",
+        "buy_ttl",
+        "sell_ttl",
+        "discount_percent",
+        "markup_percent",
+        "bet_size",
+        "bar_volume_limit",
+    ])?;
+    for (criterion, candidate) in [
+        ("highest_return", &result.highest_return),
+        ("highest_sharpe", &result.highest_sharpe),
+    ] {
+        writer.write_record([
+            criterion.to_string(),
+            candidate.result.final_value.to_string(),
+            candidate.result.sharpe.to_string(),
+            candidate.config.initial_cash.to_string(),
+            candidate.config.buy_ttl.to_string(),
+            candidate.config.sell_ttl.to_string(),
+            candidate.config.discount_percent.to_string(),
+            candidate.config.markup_percent.to_string(),
+            candidate.config.bet_size.to_string(),
+            candidate.config.bar_volume_limit.to_string(),
+        ])?;
+    }
+    writer.flush()?;
+
+    Ok(())
+}
+
+// Parse the low, high, and closing prices from every input file as one trading day.
+fn parse_days(
     files: &[(PathBuf, String)],
     liquidation_seconds: usize,
-) -> Result<Vec<Bar>, Box<dyn Error>> {
-    // Preserve the already sorted file and record order while validating each price.
-    let mut bars = Vec::new();
+) -> Result<Vec<Vec<Bar>>, Box<dyn Error>> {
+    // Preserve sorted day and record order while validating each price.
+    let mut days = Vec::with_capacity(files.len());
     for (path, contents) in files {
         let mut reader = csv::Reader::from_reader(contents.as_bytes());
         let headers = reader.headers()?;
@@ -405,6 +521,7 @@ fn parse_bars(
             return Err(format!("{} must contain at least one data row", path.display()).into());
         }
         let liquidation_start = records.len().saturating_sub(liquidation_seconds);
+        let mut bars = Vec::with_capacity(records.len());
         for (index, record) in records.iter().enumerate() {
             let line = index + 2;
             bars.push(Bar {
@@ -424,12 +541,13 @@ fn parse_bars(
                     && index >= liquidation_start,
             });
         }
+        days.push(bars);
     }
-    if bars.is_empty() {
+    if days.is_empty() {
         return Err("at least one data file is required".into());
     }
 
-    Ok(bars)
+    Ok(days)
 }
 
 // Locate one required CSV price column.
@@ -550,7 +668,7 @@ fn parse_percent(value: &str) -> Result<f64, String> {
 mod tests {
     use super::{
         Args, Bar, MarketMakerConfig, Strategy, buy_and_hold, market_maker, market_maker_grid,
-        simulate_market_maker,
+        sharpe_ratio, simulate_market_maker,
     };
     use crate::{Cli, Subcommand};
     use clap::Parser;
@@ -633,7 +751,9 @@ mod tests {
         )];
         let args = market_maker_args(1_000.0, 3_600, 14_400);
 
-        assert!((market_maker(&files, &args).unwrap() - 1_020.0).abs() < f64::EPSILON);
+        let result = market_maker(&files, &args).unwrap();
+        assert!((result.final_value - 1_020.0).abs() < f64::EPSILON);
+        assert!(result.sharpe.is_infinite() && result.sharpe.is_sign_positive());
     }
 
     #[test]
@@ -652,7 +772,28 @@ mod tests {
         let mut args = market_maker_args(1_000.0, 3_600, 14_400);
         args.bet_size = 80.0_f64;
 
-        assert!((market_maker(&files, &args).unwrap() - 1_016.0).abs() < f64::EPSILON);
+        let result = market_maker(&files, &args).unwrap();
+        assert!((result.final_value - 1_016.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compound_market_maker_days() {
+        // Confirm each file produces one daily return and passes its final value to the next day.
+        let files = vec![
+            (
+                PathBuf::from("monday.csv"),
+                "low,high,close\n100,100,100\n99,100,100\n100,101,100\n".to_string(),
+            ),
+            (
+                PathBuf::from("tuesday.csv"),
+                "low,high,close\n100,100,100\n99,100,100\n100,101,100\n".to_string(),
+            ),
+        ];
+        let args = market_maker_args(1_000.0, 3_600, 14_400);
+
+        let result = market_maker(&files, &args).unwrap();
+        assert!((result.final_value - 1_040.0).abs() < f64::EPSILON);
+        assert!(result.sharpe.is_finite() && result.sharpe > 0.0_f64);
     }
 
     #[test]
@@ -664,7 +805,9 @@ mod tests {
         )];
         let args = market_maker_args(1_000.0, 0, 14_400);
 
-        assert!((market_maker(&files, &args).unwrap() - 1_000.0).abs() < f64::EPSILON);
+        let result = market_maker(&files, &args).unwrap();
+        assert!((result.final_value - 1_000.0).abs() < f64::EPSILON);
+        assert!(result.sharpe.abs() < f64::EPSILON);
     }
 
     #[test]
@@ -700,7 +843,8 @@ mod tests {
             bar_volume_limit: 1_000.0,
         };
 
-        assert!((simulate_market_maker(&bars, config).unwrap() - 910.0).abs() < f64::EPSILON);
+        let result = simulate_market_maker(&[bars], config).unwrap();
+        assert!((result.final_value - 910.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -719,11 +863,12 @@ mod tests {
         let args = market_maker_args(1_000.0, 10, 10);
         let result = market_maker_grid(&files, &args).unwrap();
 
-        assert!((result.final_value - 1_020.0).abs() < f64::EPSILON);
-        assert!((result.config.discount_percent - 1.0).abs() < f64::EPSILON);
-        assert!((result.config.markup_percent - 1.0).abs() < f64::EPSILON);
-        assert_eq!(result.config.buy_ttl, 5);
-        assert_eq!(result.config.sell_ttl, 5);
+        assert!((result.highest_return.result.final_value - 1_020.0).abs() < f64::EPSILON);
+        assert!((result.highest_return.config.discount_percent - 1.0).abs() < f64::EPSILON);
+        assert!((result.highest_return.config.markup_percent - 1.0).abs() < f64::EPSILON);
+        assert_eq!(result.highest_return.config.buy_ttl, 5);
+        assert_eq!(result.highest_return.config.sell_ttl, 5);
+        assert!(result.highest_sharpe.result.sharpe.is_infinite());
     }
 
     #[test]
@@ -759,7 +904,16 @@ mod tests {
             bar_volume_limit: 5.0,
         };
 
-        assert!((simulate_market_maker(&bars, config).unwrap() - 1_010.0).abs() < f64::EPSILON);
+        let result = simulate_market_maker(&[bars], config).unwrap();
+        assert!((result.final_value - 1_010.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn calculate_sharpe_from_daily_returns() {
+        // Confirm Sharpe uses the mean and population standard deviation of daily returns.
+        let sharpe = sharpe_ratio(&[0.1_f64, 0.2_f64]).unwrap();
+
+        assert!((sharpe - 3.0_f64).abs() < 1e-12_f64);
     }
 
     // Construct focused market-maker settings without invoking command-line parsing.
