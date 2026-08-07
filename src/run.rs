@@ -46,6 +46,14 @@ impl Default for Args {
 
 // Run the main trading loop.
 pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<dyn Error>> {
+    // Load persisted state once, falling back to a fresh state when no usable file exists.
+    let _state = state::load().unwrap_or_else(|error| {
+        eprintln!(
+            "Unable to load state from disk. Proceeding with initial state. Details: {error}",
+        );
+        state::initial()
+    });
+
     // Restart the application after a delay whenever a top-level operation completes.
     loop {
         // Connect to the configured TWS or IB Gateway instance for this attempt.
@@ -64,14 +72,6 @@ pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<d
 
 // Run the order loop and both market data streams concurrently on one connection.
 async fn run_with_connection(client: &Client, symbol: &str) -> Result<(), Box<dyn Error>> {
-    // Load persisted state, falling back to a fresh state when no usable file exists.
-    let _state = state::load().unwrap_or_else(|error| {
-        eprintln!(
-            "Unable to load state from disk. Proceeding with initial state. Details: {error}",
-        );
-        state::initial()
-    });
-
     // Start connection-local market state without any observed prices.
     let volatile_state = RwLock::new(VolatileState {
         bid_price: None,
