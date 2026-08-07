@@ -1,6 +1,6 @@
 [package]
 name = "stockholm"
-version = "0.2.18"
+version = "0.2.19"
 authors = ["Stephan Boyer <stephan@stephanboyer.com>"]
 edition = "2024"
 description = "An algorithmic trading bot."
