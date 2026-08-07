@@ -85,12 +85,12 @@ async fn run_with_connection(client: &Client, symbol: &str) -> Result<(), Box<dy
 
     // Keep every operating loop alive until any one of them requires a reconnect.
     tokio::try_join!(
-        order_updates(client),
-        run_steps(client, &volatile_state),
-        account_summary(client),
+        control_loop(client, &volatile_state),
+        stream_account_summary(client),
         stream_live_data(client, symbol, &volatile_state),
-        stream_realtime_bars(client, symbol, SMART_EXCHANGE),
+        stream_order_updates(client),
         stream_realtime_bars(client, symbol, OVERNIGHT_EXCHANGE),
+        stream_realtime_bars(client, symbol, SMART_EXCHANGE),
     )?;
 
     Ok(())
@@ -157,11 +157,55 @@ async fn place_limit_sell(
 }
 
 // Repeat order-processing steps until one fails.
-async fn run_steps(client: &Client, state: &RwLock<VolatileState>) -> Result<(), Box<dyn Error>> {
+async fn control_loop(
+    client: &Client,
+    state: &RwLock<VolatileState>,
+) -> Result<(), Box<dyn Error>> {
     loop {
         run_step(client, state).await?;
         tokio::time::sleep(RUN_DELAY).await;
     }
+}
+
+// Stream account summary updates across all accessible accounts.
+async fn stream_account_summary(client: &Client) -> Result<(), Box<dyn Error>> {
+    // Mark the start of the request before collecting its results.
+    println!("[account summary] Requesting account summary…");
+
+    // Request every supported summary field across all accessible accounts.
+    let subscription = client
+        .account_summary(&AccountGroup("All".to_string()), AccountSummaryTags::ALL)
+        .await?;
+    let mut summaries = subscription.filter_data();
+
+    // Print the initial summary and subsequent updates for the life of the connection.
+    while let Some(update) = summaries.next().await {
+        match update? {
+            AccountSummaryResult::Summary(summary) => {
+                if summary.currency.is_empty() {
+                    println!(
+                        "[account summary] {}: {} = {}",
+                        summary.account,
+                        summary.tag,
+                        summary.value,
+                    );
+                } else {
+                    println!(
+                        "[account summary] {}: {} = {} {}",
+                        summary.account,
+                        summary.tag,
+                        summary.value,
+                        summary.currency,
+                    );
+                }
+            }
+            AccountSummaryResult::End => {
+                println!("[account summary] Finished listing initial account summary.");
+            }
+        }
+    }
+
+    Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
 // Stream live market data for the configured symbol.
@@ -202,31 +246,20 @@ async fn stream_live_data(
     Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
-// Update one quote while holding the connection-local state lock briefly.
-fn update_locked_price(
-    state: &RwLock<VolatileState>,
-    tick_type: &TickType,
-    price: f64,
-) -> io::Result<()> {
-    // Fail the connection attempt if another task poisoned the shared state.
-    let mut state = state
-        .write()
-        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
-    update_price(&mut state, tick_type, price);
+// Stream order updates for the life of the connection.
+async fn stream_order_updates(client: &Client) -> Result<(), Box<dyn Error>> {
+    // Subscribe before any trading operations can submit orders.
+    let subscription = client.order_update_stream().await?;
+    let mut updates = subscription.filter_data();
+    println!("[order updates] Streaming order updates…");
 
-    Ok(())
-}
-
-// Update one side of the market when a usable price arrives.
-fn update_price(state: &mut VolatileState, tick_type: &TickType, price: f64) {
-    // Ignore sentinel and otherwise invalid prices reported by the data source.
-    if price > 0.0_f64 {
-        match tick_type {
-            TickType::Bid => state.bid_price = Some(price),
-            TickType::Ask => state.ask_price = Some(price),
-            _ => {}
-        }
+    // Print every order-related event while propagating stream failures.
+    while let Some(update) = updates.next().await {
+        let update: OrderUpdate = update?;
+        println!("[order updates] {update:?}");
     }
+
+    Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
 // Stream real-time five-second bars for the configured symbol and exchange.
@@ -275,61 +308,31 @@ async fn run_step(client: &Client, state: &RwLock<VolatileState>) -> Result<(), 
     Ok(())
 }
 
-// Stream account summary updates across all accessible accounts.
-async fn account_summary(client: &Client) -> Result<(), Box<dyn Error>> {
-    // Mark the start of the request before collecting its results.
-    println!("[account summary] Requesting account summary…");
+// Update one quote while holding the connection-local state lock briefly.
+fn update_locked_price(
+    state: &RwLock<VolatileState>,
+    tick_type: &TickType,
+    price: f64,
+) -> io::Result<()> {
+    // Fail the connection attempt if another task poisoned the shared state.
+    let mut state = state
+        .write()
+        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
+    update_price(&mut state, tick_type, price);
 
-    // Request every supported summary field across all accessible accounts.
-    let subscription = client
-        .account_summary(&AccountGroup("All".to_string()), AccountSummaryTags::ALL)
-        .await?;
-    let mut summaries = subscription.filter_data();
-
-    // Print the initial summary and subsequent updates for the life of the connection.
-    while let Some(update) = summaries.next().await {
-        match update? {
-            AccountSummaryResult::Summary(summary) => {
-                if summary.currency.is_empty() {
-                    println!(
-                        "[account summary] {}: {} = {}",
-                        summary.account,
-                        summary.tag,
-                        summary.value,
-                    );
-                } else {
-                    println!(
-                        "[account summary] {}: {} = {} {}",
-                        summary.account,
-                        summary.tag,
-                        summary.value,
-                        summary.currency,
-                    );
-                }
-            }
-            AccountSummaryResult::End => {
-                println!("[account summary] Finished listing initial account summary.");
-            }
-        }
-    }
-
-    Err(ibapi::Error::UnexpectedEndOfStream.into())
+    Ok(())
 }
 
-// Stream order updates for the life of the connection.
-async fn order_updates(client: &Client) -> Result<(), Box<dyn Error>> {
-    // Subscribe before any trading operations can submit orders.
-    let subscription = client.order_update_stream().await?;
-    let mut updates = subscription.filter_data();
-    println!("[order updates] Streaming order updates…");
-
-    // Print every order-related event while propagating stream failures.
-    while let Some(update) = updates.next().await {
-        let update: OrderUpdate = update?;
-        println!("[order updates] {update:?}");
+// Update one side of the market when a usable price arrives.
+fn update_price(state: &mut VolatileState, tick_type: &TickType, price: f64) {
+    // Ignore sentinel and otherwise invalid prices reported by the data source.
+    if price > 0.0_f64 {
+        match tick_type {
+            TickType::Bid => state.bid_price = Some(price),
+            TickType::Ask => state.ask_price = Some(price),
+            _ => {}
+        }
     }
-
-    Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
 // Print current open orders placed by Stockholm.
