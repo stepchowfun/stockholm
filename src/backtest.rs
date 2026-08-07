@@ -24,6 +24,14 @@ pub struct Args {
     #[arg(long, default_value_t = 1_000_000.0, value_parser = parse_positive_f64)]
     initial_cash: f64,
 
+    /// Number of final rows liquidated in each file. Used by both market-maker strategies.
+    #[arg(long, default_value_t = 900)]
+    liquidation_seconds: usize,
+
+    /// Maximum shares of each eligible order filled per bar. Used by both market-maker strategies.
+    #[arg(long, default_value_t = 1_000.0, value_parser = parse_positive_f64)]
+    bar_volume_limit: f64,
+
     /// Buy-order lifetime used by market-maker. Ignored by other strategies.
     #[arg(long, default_value_t = 3_600)]
     buy_ttl: u64,
@@ -91,14 +99,6 @@ pub struct Args {
         value_parser = parse_percent
     )]
     bet_sizes: Vec<f64>,
-
-    /// Number of final rows liquidated in each file. Used by both market-maker strategies.
-    #[arg(long, default_value_t = 900)]
-    liquidation_seconds: usize,
-
-    /// Maximum shares of each eligible order filled per bar. Used by both market-maker strategies.
-    #[arg(long, default_value_t = 1_000.0, value_parser = parse_positive_f64)]
-    bar_volume_limit: f64,
 }
 
 // This bar contains the prices needed to simulate limit-order fills.
@@ -120,19 +120,21 @@ struct LimitOrder {
 #[derive(Clone, Copy)]
 struct MarketMakerConfig {
     initial_cash: f64,
+    liquidation_seconds: usize,
+    bar_volume_limit: f64,
     buy_ttl: u64,
     sell_ttl: u64,
     discount_percent: f64,
     markup_percent: f64,
     bet_size: f64,
-    bar_volume_limit: f64,
 }
 
 // These statistics summarize one market-maker simulation across all trading days.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MarketMakerResult {
     final_value: f64,
     sharpe: f64,
+    daily_returns: Vec<f64>,
 }
 
 // This result pairs one grid configuration with its simulation statistics.
@@ -171,11 +173,11 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
         }
         Strategy::MarketMaker => {
             let result = market_maker(&files, args)?;
-            write_market_maker_result(&result, market_maker_config(args))?;
+            print_market_maker_result(&result, market_maker_config(args));
         }
         Strategy::MarketMakerGrid => {
             let result = market_maker_grid(&files, args)?;
-            write_grid_result(&result)?;
+            print_grid_result(&result);
         }
     }
 
@@ -217,18 +219,22 @@ fn market_maker_grid(
                     for &bet_size in &args.bet_sizes {
                         let config = MarketMakerConfig {
                             initial_cash: args.initial_cash,
+                            liquidation_seconds: args.liquidation_seconds,
+                            bar_volume_limit: args.bar_volume_limit,
                             buy_ttl,
                             sell_ttl,
                             discount_percent,
                             markup_percent,
                             bet_size,
-                            bar_volume_limit: args.bar_volume_limit,
                         };
                         let result = simulate_market_maker(&days, config)?;
                         if highest_return.as_ref().is_none_or(|candidate| {
                             result.final_value > candidate.result.final_value
                         }) {
-                            highest_return = Some(GridCandidate { config, result });
+                            highest_return = Some(GridCandidate {
+                                config,
+                                result: result.clone(),
+                            });
                         }
                         if highest_sharpe
                             .as_ref()
@@ -273,6 +279,7 @@ fn simulate_market_maker(
     Ok(MarketMakerResult {
         final_value,
         sharpe: sharpe_ratio(&daily_returns)?,
+        daily_returns,
     })
 }
 
@@ -422,85 +429,65 @@ fn market_maker_config(args: &Args) -> MarketMakerConfig {
     // Keep simulation code independent from unrelated backtest arguments.
     MarketMakerConfig {
         initial_cash: args.initial_cash,
+        liquidation_seconds: args.liquidation_seconds,
+        bar_volume_limit: args.bar_volume_limit,
         buy_ttl: args.buy_ttl,
         sell_ttl: args.sell_ttl,
         discount_percent: args.discount_percent,
         markup_percent: args.markup_percent,
         bet_size: args.bet_size,
-        bar_volume_limit: args.bar_volume_limit,
     }
 }
 
-// Print one market-maker result as machine-readable CSV.
-fn write_market_maker_result(
-    result: &MarketMakerResult,
-    config: MarketMakerConfig,
-) -> Result<(), Box<dyn Error>> {
-    // Emit the statistics and complete effective configuration.
-    let mut writer = csv::Writer::from_writer(std::io::stdout().lock());
-    writer.write_record([
-        "final_value",
-        "sharpe",
-        "initial_cash",
-        "buy_ttl",
-        "sell_ttl",
-        "discount_percent",
-        "markup_percent",
-        "bet_size",
-        "bar_volume_limit",
-    ])?;
-    writer.write_record([
-        result.final_value.to_string(),
-        result.sharpe.to_string(),
-        config.initial_cash.to_string(),
-        config.buy_ttl.to_string(),
-        config.sell_ttl.to_string(),
-        config.discount_percent.to_string(),
-        config.markup_percent.to_string(),
-        config.bet_size.to_string(),
-        config.bar_volume_limit.to_string(),
-    ])?;
-    writer.flush()?;
-
-    Ok(())
+// Print one market-maker result as a human-readable report.
+fn print_market_maker_result(result: &MarketMakerResult, config: MarketMakerConfig) {
+    // Present the summary before the effective simulation parameters.
+    println!("Final account value: {:.2}", result.final_value);
+    println!("Sharpe ratio: {:.4}", result.sharpe);
+    println!();
+    print_config(config);
 }
 
-// Print both winning grid candidates as machine-readable CSV records.
-fn write_grid_result(result: &GridResult) -> Result<(), Box<dyn Error>> {
-    // Include every statistic and parameter needed to distinguish and reproduce both winners.
-    let mut writer = csv::Writer::from_writer(std::io::stdout().lock());
-    writer.write_record([
-        "criterion",
-        "final_value",
-        "sharpe",
-        "initial_cash",
-        "buy_ttl",
-        "sell_ttl",
-        "discount_percent",
-        "markup_percent",
-        "bet_size",
-        "bar_volume_limit",
-    ])?;
-    for (criterion, candidate) in [
-        ("highest_return", &result.highest_return),
-        ("highest_sharpe", &result.highest_sharpe),
-    ] {
-        writer.write_record([
-            criterion.to_string(),
-            candidate.result.final_value.to_string(),
-            candidate.result.sharpe.to_string(),
-            candidate.config.initial_cash.to_string(),
-            candidate.config.buy_ttl.to_string(),
-            candidate.config.sell_ttl.to_string(),
-            candidate.config.discount_percent.to_string(),
-            candidate.config.markup_percent.to_string(),
-            candidate.config.bet_size.to_string(),
-            candidate.config.bar_volume_limit.to_string(),
-        ])?;
-    }
-    writer.flush()?;
+// Print both winning grid candidates as a human-readable report.
+fn print_grid_result(result: &GridResult) {
+    // Give each optimization criterion its own complete section.
+    print_grid_candidate("Highest return", &result.highest_return);
+    println!();
+    print_grid_candidate("Highest Sharpe ratio", &result.highest_sharpe);
+}
 
-    Ok(())
+// Print one winning grid candidate and its daily return series.
+fn print_grid_candidate(label: &str, candidate: &GridCandidate) {
+    // Present summary statistics before the detailed daily returns and configuration.
+    println!("{label}");
+    println!("Final account value: {:.2}", candidate.result.final_value);
+    println!("Sharpe ratio: {:.4}", candidate.result.sharpe);
+    println!("Daily returns:");
+    for (index, daily_return) in candidate.result.daily_returns.iter().enumerate() {
+        println!("  Day {}: {:.2}%", index + 1, 100.0_f64 * daily_return);
+    }
+    println!("Configuration:");
+    print_config_fields(candidate.config);
+}
+
+// Print a labeled market-maker configuration.
+fn print_config(config: MarketMakerConfig) {
+    // Keep the label separate so the fields can also be reused by grid reports.
+    println!("Configuration:");
+    print_config_fields(config);
+}
+
+// Print the fields of one market-maker configuration.
+fn print_config_fields(config: MarketMakerConfig) {
+    // Follow command-line argument order to make reproducing the run straightforward.
+    println!("  Initial cash: {:.2}", config.initial_cash);
+    println!("  Liquidation seconds: {}", config.liquidation_seconds);
+    println!("  Bar volume limit: {}", config.bar_volume_limit);
+    println!("  Buy TTL: {}", config.buy_ttl);
+    println!("  Sell TTL: {}", config.sell_ttl);
+    println!("  Discount: {}%", config.discount_percent);
+    println!("  Markup: {}%", config.markup_percent);
+    println!("  Bet size: {}%", config.bet_size);
 }
 
 // Parse the low, high, and closing prices from every input file as one trading day.
@@ -835,12 +822,13 @@ mod tests {
         ];
         let config = MarketMakerConfig {
             initial_cash: 1_000.0,
+            liquidation_seconds: 900,
+            bar_volume_limit: 1_000.0,
             buy_ttl: 3_600,
             sell_ttl: 14_400,
             discount_percent: 1.0,
             markup_percent: 1.0,
             bet_size: 100.0,
-            bar_volume_limit: 1_000.0,
         };
 
         let result = simulate_market_maker(&[bars], config).unwrap();
@@ -896,12 +884,13 @@ mod tests {
         ];
         let config = MarketMakerConfig {
             initial_cash: 1_000.0,
+            liquidation_seconds: 900,
+            bar_volume_limit: 5.0,
             buy_ttl: 3_600,
             sell_ttl: 14_400,
             discount_percent: 1.0,
             markup_percent: 1.0,
             bet_size: 100.0,
-            bar_volume_limit: 5.0,
         };
 
         let result = simulate_market_maker(&[bars], config).unwrap();
