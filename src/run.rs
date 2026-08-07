@@ -104,96 +104,6 @@ async fn run_with_connection(
     Ok(())
 }
 
-// Place a limit order to buy the requested number of shares.
-#[allow(dead_code)]
-async fn place_limit_buy(
-    client: &Client,
-    symbol: &str,
-    shares: i32,
-    limit: f64,
-    state: &RwLock<state::State>,
-) -> Result<(), Box<dyn Error>> {
-    // Build the order with a stable Stockholm-generated correlation reference.
-    let contract = Contract::stock(symbol).build();
-    let order_ref = format!("{ORDER_REF_PREFIX}{}", Uuid::new_v4().simple());
-    let mut order = client
-        .order(&contract)
-        .buy(shares)
-        .limit(limit)
-        .outside_rth()
-        .build()?;
-    order.order_ref.clone_from(&order_ref);
-    order.include_overnight = true;
-
-    // Persist the pending order before submitting it to Interactive Brokers.
-    let order_id = client.next_order_id();
-    {
-        let mut state = state
-            .write()
-            .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
-        state.open_orders.push(state::OpenOrder {
-            order_id,
-            order_ref: order_ref.clone(),
-            perm_id: None,
-            created_at: OffsetDateTime::now_utc(),
-        });
-        state::save(&state)?;
-    }
-
-    // Submit the order only after its state has been safely persisted.
-    client.submit_order(order_id, &contract, &order).await?;
-    println!(
-        "[orders] Submitted limit buy {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}",
-    );
-
-    Ok(())
-}
-
-// Place a limit order to sell the requested number of shares.
-#[allow(dead_code)]
-async fn place_limit_sell(
-    client: &Client,
-    symbol: &str,
-    shares: i32,
-    limit: f64,
-    state: &RwLock<state::State>,
-) -> Result<(), Box<dyn Error>> {
-    // Build the order with a stable Stockholm-generated correlation reference.
-    let contract = Contract::stock(symbol).build();
-    let order_ref = format!("{ORDER_REF_PREFIX}{}", Uuid::new_v4().simple());
-    let mut order = client
-        .order(&contract)
-        .sell(shares)
-        .limit(limit)
-        .outside_rth()
-        .build()?;
-    order.order_ref.clone_from(&order_ref);
-    order.include_overnight = true;
-
-    // Persist the pending order before submitting it to Interactive Brokers.
-    let order_id = client.next_order_id();
-    {
-        let mut state = state
-            .write()
-            .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
-        state.open_orders.push(state::OpenOrder {
-            order_id,
-            order_ref: order_ref.clone(),
-            perm_id: None,
-            created_at: OffsetDateTime::now_utc(),
-        });
-        state::save(&state)?;
-    }
-
-    // Submit the order only after its state has been safely persisted.
-    client.submit_order(order_id, &contract, &order).await?;
-    println!(
-        "[orders] Submitted limit sell {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}",
-    );
-
-    Ok(())
-}
-
 // Repeat order-processing steps until one fails.
 async fn control_loop(
     client: &Client,
@@ -376,6 +286,96 @@ async fn run_step(
         state
             .ask_price
             .map_or_else(|| "unavailable".to_string(), |price| price.to_string()),
+    );
+
+    Ok(())
+}
+
+// Place a limit order to buy the requested number of shares.
+#[allow(dead_code)]
+async fn place_limit_buy(
+    client: &Client,
+    symbol: &str,
+    shares: i32,
+    limit: f64,
+    state: &RwLock<state::State>,
+) -> Result<(), Box<dyn Error>> {
+    // Build the order with a stable Stockholm-generated correlation reference.
+    let contract = Contract::stock(symbol).build();
+    let order_ref = format!("{ORDER_REF_PREFIX}{}", Uuid::new_v4().simple());
+    let mut order = client
+        .order(&contract)
+        .buy(shares)
+        .limit(limit)
+        .outside_rth()
+        .build()?;
+    order.order_ref.clone_from(&order_ref);
+    order.include_overnight = true;
+
+    // Persist the pending order before submitting it to Interactive Brokers.
+    let order_id = client.next_order_id();
+    {
+        let mut state = state
+            .write()
+            .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
+        state.open_orders.push(state::OpenOrder {
+            order_id,
+            order_ref: order_ref.clone(),
+            perm_id: None,
+            created_at: OffsetDateTime::now_utc(),
+        });
+        state::save(&state)?;
+    }
+
+    // Submit the order only after its state has been safely persisted.
+    client.submit_order(order_id, &contract, &order).await?;
+    println!(
+        "[orders] Submitted limit buy {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}",
+    );
+
+    Ok(())
+}
+
+// Place a limit order to sell the requested number of shares.
+#[allow(dead_code)]
+async fn place_limit_sell(
+    client: &Client,
+    symbol: &str,
+    shares: i32,
+    limit: f64,
+    state: &RwLock<state::State>,
+) -> Result<(), Box<dyn Error>> {
+    // Build the order with a stable Stockholm-generated correlation reference.
+    let contract = Contract::stock(symbol).build();
+    let order_ref = format!("{ORDER_REF_PREFIX}{}", Uuid::new_v4().simple());
+    let mut order = client
+        .order(&contract)
+        .sell(shares)
+        .limit(limit)
+        .outside_rth()
+        .build()?;
+    order.order_ref.clone_from(&order_ref);
+    order.include_overnight = true;
+
+    // Persist the pending order before submitting it to Interactive Brokers.
+    let order_id = client.next_order_id();
+    {
+        let mut state = state
+            .write()
+            .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
+        state.open_orders.push(state::OpenOrder {
+            order_id,
+            order_ref: order_ref.clone(),
+            perm_id: None,
+            created_at: OffsetDateTime::now_utc(),
+        });
+        state::save(&state)?;
+    }
+
+    // Submit the order only after its state has been safely persisted.
+    client.submit_order(order_id, &contract, &order).await?;
+    println!(
+        "[orders] Submitted limit sell {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}",
     );
 
     Ok(())
