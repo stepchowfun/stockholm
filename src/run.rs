@@ -84,6 +84,7 @@ async fn run_with_connection(client: &Client, symbol: &str) -> Result<(), Box<dy
     // Keep every operating loop alive until any one of them requires a reconnect.
     tokio::try_join!(
         run_steps(client, &volatile_state),
+        account_summary(client),
         stream_live_data(client, symbol, &volatile_state),
         stream_realtime_bars(client, symbol, SMART_EXCHANGE),
         stream_realtime_bars(client, symbol, OVERNIGHT_EXCHANGE),
@@ -191,12 +192,8 @@ async fn stream_realtime_bars(
 
 // Run one set of independent account checks.
 async fn run_step(client: &Client, state: &RwLock<VolatileState>) -> Result<(), Box<dyn Error>> {
-    // Fetch the current account information concurrently for this step.
-    tokio::try_join!(
-        list_orders(client),
-        list_positions(client),
-        account_summary(client),
-    )?;
+    // Fetch the current orders and positions concurrently for this step.
+    tokio::try_join!(list_orders(client), list_positions(client))?;
 
     // Print the latest quote snapshot after the account checks finish.
     let state = state
@@ -215,7 +212,7 @@ async fn run_step(client: &Client, state: &RwLock<VolatileState>) -> Result<(), 
     Ok(())
 }
 
-// Print the current account summary across all accessible accounts.
+// Stream account summary updates across all accessible accounts.
 async fn account_summary(client: &Client) -> Result<(), Box<dyn Error>> {
     // Mark the start of the request before collecting its results.
     println!("[account summary] Requesting account summary…");
@@ -224,9 +221,9 @@ async fn account_summary(client: &Client) -> Result<(), Box<dyn Error>> {
     let subscription = client
         .account_summary(&AccountGroup("All".to_string()), AccountSummaryTags::ALL)
         .await?;
-    let mut summaries = subscription.clone().filter_data();
+    let mut summaries = subscription.filter_data();
 
-    // Print summary values until the complete initial snapshot arrives.
+    // Print the initial summary and subsequent updates for the life of the connection.
     while let Some(update) = summaries.next().await {
         match update? {
             AccountSummaryResult::Summary(summary) => {
@@ -242,16 +239,13 @@ async fn account_summary(client: &Client) -> Result<(), Box<dyn Error>> {
                     );
                 }
             }
-            AccountSummaryResult::End => break,
+            AccountSummaryResult::End => {
+                println!("[account summary] Finished listing initial account summary.");
+            }
         }
     }
 
-    // Release IBKR's limited account-summary subscription slot before the next step.
-    subscription.cancel().await;
-
-    println!("[account summary] Finished listing account summary.");
-
-    Ok(())
+    Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
 // Print all current open orders.
