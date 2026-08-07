@@ -56,7 +56,7 @@ async fn run_with_connection(client: &Client, symbol: &str) -> Result<(), Box<dy
     // Load persisted state, falling back to a fresh state when no usable file exists.
     let _state = state::load().unwrap_or_else(|error| {
         eprintln!(
-            "Unable to load state from disk. Proceeding with initial state. Details: {error}"
+            "Unable to load state from disk. Proceeding with initial state. Details: {error}",
         );
         state::initial()
     });
