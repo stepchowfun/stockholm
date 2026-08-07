@@ -230,12 +230,17 @@ async fn account_summary(client: &Client) -> Result<(), Box<dyn Error>> {
                 if summary.currency.is_empty() {
                     println!(
                         "[account summary] {}: {} = {}",
-                        summary.account, summary.tag, summary.value,
+                        summary.account,
+                        summary.tag,
+                        summary.value,
                     );
                 } else {
                     println!(
                         "[account summary] {}: {} = {} {}",
-                        summary.account, summary.tag, summary.value, summary.currency,
+                        summary.account,
+                        summary.tag,
+                        summary.value,
+                        summary.currency,
                     );
                 }
             }
