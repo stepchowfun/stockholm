@@ -6,11 +6,33 @@ use std::{
     path::PathBuf,
 };
 use tempfile::NamedTempFile;
+use time::OffsetDateTime;
+
+// An open order managed by Stockholm.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenOrder {
+    // The connection-specific order identifier assigned by TWS.
+    pub order_id: i32,
+
+    // The stable Stockholm-generated reference attached to the order.
+    pub order_ref: String,
+
+    // The permanent order identifier, once assigned by Interactive Brokers.
+    pub perm_id: Option<i64>,
+
+    // The moment the order was created, persisted as a Unix timestamp.
+    #[serde(with = "time::serde::timestamp")]
+    pub created_at: OffsetDateTime,
+}
 
 // The program state persisted by the run subcommand.
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct State {}
+pub struct State {
+    // The open orders currently managed by Stockholm.
+    pub open_orders: Vec<OpenOrder>,
+}
 
 // Locate the platform-specific file where the program state is persisted.
 fn path() -> Option<PathBuf> {
@@ -25,7 +47,9 @@ fn path() -> Option<PathBuf> {
 
 // Return the state in which the program starts if no state was loaded from disk.
 pub fn initial() -> State {
-    State {}
+    State {
+        open_orders: Vec::new(),
+    }
 }
 
 // Load the program state from disk.
