@@ -1,4 +1,4 @@
-use crate::DEFAULT_SYMBOL;
+use crate::{DEFAULT_SYMBOL, state};
 use clap::Args as ClapArgs;
 use ibapi::{
     Client,
@@ -53,6 +53,14 @@ pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<d
 
 // Run the order loop and both market data streams concurrently on one connection.
 async fn run_with_connection(client: &Client, symbol: &str) -> Result<(), Box<dyn Error>> {
+    // Load persisted state, falling back to a fresh state when no usable file exists.
+    let _state = state::load().unwrap_or_else(|error| {
+        eprintln!(
+            "Unable to load state from disk. Proceeding with initial state. Details: {error}"
+        );
+        state::initial()
+    });
+
     // Configure subsequent requests to use subscribed real-time market data.
     client
         .switch_market_data_type(MarketDataType::Realtime)

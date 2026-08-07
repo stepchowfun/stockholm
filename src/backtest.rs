@@ -40,6 +40,10 @@ pub struct Args {
     #[arg(long, default_value_t = 0.25, value_parser = parse_nonnegative_f64)]
     markup_percent: f64,
 
+    /// Share of liquidation value available for buying. Used by market-maker.
+    #[arg(long, default_value_t = 80.0, value_parser = parse_percent)]
+    bet_size: f64,
+
     /// Buy-order lifetimes searched by market-maker-grid. Ignored by other strategies.
     #[arg(
         long,
@@ -78,6 +82,16 @@ pub struct Args {
     )]
     markup_percentages: Vec<f64>,
 
+    /// Bet sizes searched by market-maker-grid. Ignored by other strategies.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        num_args = 1..,
+        default_value = "80,90,100",
+        value_parser = parse_percent
+    )]
+    bet_sizes: Vec<f64>,
+
     /// Number of final rows liquidated in each file. Used by both market-maker strategies.
     #[arg(long, default_value_t = 900)]
     liquidation_seconds: usize,
@@ -110,13 +124,14 @@ struct MarketMakerConfig {
     sell_ttl: u64,
     discount_percent: f64,
     markup_percent: f64,
+    bet_size: f64,
     bar_volume_limit: f64,
 }
 
-// This result identifies the most profitable grid candidate.
+// This result identifies the grid candidate with the highest final account value.
 struct GridResult {
     config: MarketMakerConfig,
-    profit: f64,
+    final_value: f64,
 }
 
 // Backtest a trading strategy.
@@ -138,12 +153,12 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     // Evaluate the selected strategy and print its result to standard output.
     match args.strategy {
         Strategy::BuyAndHold => {
-            let change = buy_and_hold(&files)?;
-            println!("{change}");
+            let final_value = buy_and_hold(&files, args.initial_cash)?;
+            println!("{final_value}");
         }
         Strategy::MarketMaker => {
-            let profit = market_maker(&files, args)?;
-            println!("{profit}");
+            let final_value = market_maker(&files, args)?;
+            println!("{final_value}");
         }
         Strategy::MarketMakerGrid => {
             let result = market_maker_grid(&files, args)?;
@@ -161,7 +176,7 @@ fn market_maker(files: &[(PathBuf, String)], args: &Args) -> Result<f64, Box<dyn
     simulate_market_maker(&bars, market_maker_config(args))
 }
 
-// Evaluate nearby parameter combinations and return the most profitable one.
+// Evaluate nearby parameter combinations and return the one with the highest final value.
 fn market_maker_grid(
     files: &[(PathBuf, String)],
     args: &Args,
@@ -170,7 +185,8 @@ fn market_maker_grid(
     let bars = parse_bars(files, args.liquidation_seconds)?;
 
     // Track completed candidates while keeping progress messages separate from CSV output.
-    let candidates_per_ttl_pair = args.discount_percentages.len() * args.markup_percentages.len();
+    let candidates_per_ttl_pair =
+        args.discount_percentages.len() * args.markup_percentages.len() * args.bet_sizes.len();
     let total_candidates = args.buy_ttls.len() * args.sell_ttls.len() * candidates_per_ttl_pair;
     let mut completed_candidates = 0_usize;
     eprintln!("Searching {total_candidates} market-maker configurations...");
@@ -181,17 +197,26 @@ fn market_maker_grid(
         for &sell_ttl in &args.sell_ttls {
             for &discount_percent in &args.discount_percentages {
                 for &markup_percent in &args.markup_percentages {
-                    let config = MarketMakerConfig {
-                        initial_cash: args.initial_cash,
-                        buy_ttl,
-                        sell_ttl,
-                        discount_percent,
-                        markup_percent,
-                        bar_volume_limit: args.bar_volume_limit,
-                    };
-                    let profit = simulate_market_maker(&bars, config)?;
-                    if best.as_ref().is_none_or(|result| profit > result.profit) {
-                        best = Some(GridResult { config, profit });
+                    for &bet_size in &args.bet_sizes {
+                        let config = MarketMakerConfig {
+                            initial_cash: args.initial_cash,
+                            buy_ttl,
+                            sell_ttl,
+                            discount_percent,
+                            markup_percent,
+                            bet_size,
+                            bar_volume_limit: args.bar_volume_limit,
+                        };
+                        let final_value = simulate_market_maker(&bars, config)?;
+                        if best
+                            .as_ref()
+                            .is_none_or(|result| final_value > result.final_value)
+                        {
+                            best = Some(GridResult {
+                                config,
+                                final_value,
+                            });
+                        }
                     }
                 }
             }
@@ -271,9 +296,20 @@ fn simulate_market_maker(bars: &[Bar], config: MarketMakerConfig) -> Result<f64,
         }
         sell_orders.retain(|order| order.shares > 0.0_f64);
 
-        // Reserve available cash for the largest whole-share discounted buy order.
+        // Keep the configured share of liquidation value available for buying.
+        let reserved_cash = buy_orders
+            .iter()
+            .map(|order| order.shares * order.limit)
+            .sum::<f64>();
+        let reserved_shares = sell_orders.iter().map(|order| order.shares).sum::<f64>();
+        let liquidation_value =
+            available_cash + reserved_cash + (available_shares + reserved_shares) * bar.close;
+        let cash_floor = liquidation_value * (1.0_f64 - config.bet_size / 100.0_f64);
+        let cash_available_to_bet = (available_cash - cash_floor).max(0.0_f64);
+
+        // Reserve usable cash for the largest whole-share discounted buy order.
         let buy_limit = bar.close * (1.0_f64 - config.discount_percent / 100.0_f64);
-        let buy_shares = (available_cash / buy_limit).floor();
+        let buy_shares = (cash_available_to_bet / buy_limit).floor();
         if buy_shares >= 1.0_f64 {
             available_cash -= buy_shares * buy_limit;
             buy_orders.push(LimitOrder {
@@ -295,7 +331,7 @@ fn simulate_market_maker(bars: &[Bar], config: MarketMakerConfig) -> Result<f64,
         }
     }
 
-    // Mark reserved cash and all held shares to the final close before reporting profit.
+    // Mark reserved cash and all held shares to the final close.
     let final_price = bars.last().unwrap().close;
     let reserved_cash = buy_orders
         .iter()
@@ -305,7 +341,7 @@ fn simulate_market_maker(bars: &[Bar], config: MarketMakerConfig) -> Result<f64,
     let final_value =
         available_cash + reserved_cash + (available_shares + reserved_shares) * final_price;
 
-    Ok(final_value - config.initial_cash)
+    Ok(final_value)
 }
 
 // Copy market-maker command-line values into one simulation configuration.
@@ -317,6 +353,7 @@ fn market_maker_config(args: &Args) -> MarketMakerConfig {
         sell_ttl: args.sell_ttl,
         discount_percent: args.discount_percent,
         markup_percent: args.markup_percent,
+        bet_size: args.bet_size,
         bar_volume_limit: args.bar_volume_limit,
     }
 }
@@ -326,21 +363,23 @@ fn write_grid_result(result: &GridResult) -> Result<(), Box<dyn Error>> {
     // Include every fixed and searched value needed to reproduce the result.
     let mut writer = csv::Writer::from_writer(std::io::stdout().lock());
     writer.write_record([
-        "profit",
+        "final_value",
         "initial_cash",
         "buy_ttl",
         "sell_ttl",
         "discount_percent",
         "markup_percent",
+        "bet_size",
         "bar_volume_limit",
     ])?;
     writer.write_record([
-        result.profit.to_string(),
+        result.final_value.to_string(),
         result.config.initial_cash.to_string(),
         result.config.buy_ttl.to_string(),
         result.config.sell_ttl.to_string(),
         result.config.discount_percent.to_string(),
         result.config.markup_percent.to_string(),
+        result.config.bet_size.to_string(),
         result.config.bar_volume_limit.to_string(),
     ])?;
     writer.flush()?;
@@ -406,8 +445,8 @@ fn column_index(
         .ok_or_else(|| format!("{} must contain a {name} column", path.display()).into())
 }
 
-// Calculate the absolute price change produced by buying first and selling last.
-fn buy_and_hold(files: &[(PathBuf, String)]) -> Result<f64, Box<dyn Error>> {
+// Calculate the final value produced by buying first and marking to the final close.
+fn buy_and_hold(files: &[(PathBuf, String)], initial_cash: f64) -> Result<f64, Box<dyn Error>> {
     // Read the first open and final close while requiring data in every input file.
     let mut first_open = None;
     let mut last_close = None;
@@ -436,7 +475,8 @@ fn buy_and_hold(files: &[(PathBuf, String)]) -> Result<f64, Box<dyn Error>> {
     }
 
     let first_open = first_open.ok_or("at least one data file is required")?;
-    Ok(last_close.unwrap() - first_open)
+    let shares = initial_cash / first_open;
+    Ok(shares * last_close.unwrap())
 }
 
 // Parse one required boundary price with a contextual error.
@@ -495,6 +535,17 @@ fn parse_discount_percent(value: &str) -> Result<f64, String> {
     Ok(value)
 }
 
+// Parse a percentage that may span the entire inclusive range from zero to one hundred.
+fn parse_percent(value: &str) -> Result<f64, String> {
+    // Reject percentages outside the range needed to represent a portfolio fraction.
+    let value = parse_nonnegative_f64(value)?;
+    if value > 100.0_f64 {
+        return Err("value must be at most 100".to_string());
+    }
+
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -532,6 +583,7 @@ mod tests {
         assert_eq!(args.sell_ttl, 14_400);
         assert!((args.discount_percent - 0.25).abs() < f64::EPSILON);
         assert!((args.markup_percent - 0.25).abs() < f64::EPSILON);
+        assert!((args.bet_size - 80.0).abs() < f64::EPSILON);
         assert_eq!(args.buy_ttls.len(), 12);
         assert_eq!(args.buy_ttls.first(), Some(&5));
         assert_eq!(args.buy_ttls.last(), Some(&86_400));
@@ -544,6 +596,7 @@ mod tests {
         assert_eq!(args.markup_percentages.len(), 7);
         assert_eq!(args.markup_percentages.first(), Some(&0.01_f64));
         assert_eq!(args.markup_percentages.last(), Some(&10.0_f64));
+        assert_eq!(args.bet_sizes, vec![80.0_f64, 90.0_f64, 100.0_f64]);
         assert_eq!(args.liquidation_seconds, 900);
         assert!((args.bar_volume_limit - 1_000.0).abs() < f64::EPSILON);
     }
@@ -562,7 +615,7 @@ mod tests {
             ),
         ];
 
-        assert!((buy_and_hold(&files).unwrap() - 130.0).abs() < f64::EPSILON);
+        assert!((buy_and_hold(&files, 1_000.0).unwrap() - 2_300.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -580,7 +633,26 @@ mod tests {
         )];
         let args = market_maker_args(1_000.0, 3_600, 14_400);
 
-        assert!((market_maker(&files, &args).unwrap() - 20.0).abs() < f64::EPSILON);
+        assert!((market_maker(&files, &args).unwrap() - 1_020.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn limit_market_maker_bet_size() {
+        // Confirm the configured cash floor limits the size of new buy orders.
+        let files = vec![(
+            PathBuf::from("prices.csv"),
+            concat!(
+                "low,high,close\n",
+                "100,100,100\n",
+                "99,100,100\n",
+                "100,101,100\n",
+            )
+            .to_string(),
+        )];
+        let mut args = market_maker_args(1_000.0, 3_600, 14_400);
+        args.bet_size = 80.0_f64;
+
+        assert!((market_maker(&files, &args).unwrap() - 1_016.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -592,7 +664,7 @@ mod tests {
         )];
         let args = market_maker_args(1_000.0, 0, 14_400);
 
-        assert!(market_maker(&files, &args).unwrap().abs() < f64::EPSILON);
+        assert!((market_maker(&files, &args).unwrap() - 1_000.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -624,15 +696,16 @@ mod tests {
             sell_ttl: 14_400,
             discount_percent: 1.0,
             markup_percent: 1.0,
+            bet_size: 100.0,
             bar_volume_limit: 1_000.0,
         };
 
-        assert!((simulate_market_maker(&bars, config).unwrap() + 90.0).abs() < f64::EPSILON);
+        assert!((simulate_market_maker(&bars, config).unwrap() - 910.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn select_best_market_maker_grid_candidate() {
-        // Confirm the grid chooses the most profitable reproducible parameters.
+        // Confirm the grid chooses the reproducible parameters with the highest final value.
         let files = vec![(
             PathBuf::from("prices.csv"),
             concat!(
@@ -646,7 +719,7 @@ mod tests {
         let args = market_maker_args(1_000.0, 10, 10);
         let result = market_maker_grid(&files, &args).unwrap();
 
-        assert!((result.profit - 20.0).abs() < f64::EPSILON);
+        assert!((result.final_value - 1_020.0).abs() < f64::EPSILON);
         assert!((result.config.discount_percent - 1.0).abs() < f64::EPSILON);
         assert!((result.config.markup_percent - 1.0).abs() < f64::EPSILON);
         assert_eq!(result.config.buy_ttl, 5);
@@ -682,10 +755,11 @@ mod tests {
             sell_ttl: 14_400,
             discount_percent: 1.0,
             markup_percent: 1.0,
+            bet_size: 100.0,
             bar_volume_limit: 5.0,
         };
 
-        assert!((simulate_market_maker(&bars, config).unwrap() - 10.0).abs() < f64::EPSILON);
+        assert!((simulate_market_maker(&bars, config).unwrap() - 1_010.0).abs() < f64::EPSILON);
     }
 
     // Construct focused market-maker settings without invoking command-line parsing.
@@ -698,6 +772,7 @@ mod tests {
             sell_ttl,
             discount_percent: 1.0,
             markup_percent: 1.0,
+            bet_size: 100.0,
             buy_ttls: vec![
                 5, 15, 30, 60, 120, 300, 900, 3_600, 7_200, 14_400, 43_200, 86_400,
             ],
@@ -706,6 +781,7 @@ mod tests {
             ],
             discount_percentages: vec![0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
             markup_percentages: vec![0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
+            bet_sizes: vec![100.0],
             liquidation_seconds: 900,
             bar_volume_limit: 1_000.0,
         }
