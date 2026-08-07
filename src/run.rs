@@ -3,12 +3,12 @@ use clap::Args as ClapArgs;
 use ibapi::{
     Client,
     accounts::PositionUpdate,
-    contracts::Contract,
-    market_data::{MarketDataType, TradingHours},
+    contracts::{Contract, tick_types::TickType},
+    market_data::{MarketDataType, TradingHours, realtime::TickTypes},
     orders::Orders,
     prelude::{StreamExt, SubscriptionItemStreamExt},
 };
-use std::error::Error;
+use std::{error::Error, io, sync::RwLock};
 
 // These constants configure the instrument and failure recovery.
 const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
@@ -22,6 +22,15 @@ pub struct Args {
     /// Symbol whose live market data should be streamed.
     #[arg(long, default_value = DEFAULT_SYMBOL)]
     symbol: String,
+}
+
+// This connection-local state tracks values that do not need to survive a restart.
+struct VolatileState {
+    // The most recently observed bid price, if one is available.
+    bid_price: Option<f64>,
+
+    // The most recently observed ask price, if one is available.
+    ask_price: Option<f64>,
 }
 
 // Supply the same defaults when the run subcommand is omitted.
@@ -61,6 +70,12 @@ async fn run_with_connection(client: &Client, symbol: &str) -> Result<(), Box<dy
         state::initial()
     });
 
+    // Start connection-local market state without any observed prices.
+    let volatile_state = RwLock::new(VolatileState {
+        bid_price: None,
+        ask_price: None,
+    });
+
     // Configure subsequent requests to use subscribed real-time market data.
     client
         .switch_market_data_type(MarketDataType::Realtime)
@@ -68,8 +83,8 @@ async fn run_with_connection(client: &Client, symbol: &str) -> Result<(), Box<dy
 
     // Keep every operating loop alive until any one of them requires a reconnect.
     tokio::try_join!(
-        run_steps(client),
-        stream_live_data(client, symbol),
+        run_steps(client, &volatile_state),
+        stream_live_data(client, symbol, &volatile_state),
         stream_realtime_bars(client, symbol, SMART_EXCHANGE),
         stream_realtime_bars(client, symbol, OVERNIGHT_EXCHANGE),
     )?;
@@ -78,30 +93,76 @@ async fn run_with_connection(client: &Client, symbol: &str) -> Result<(), Box<dy
 }
 
 // Repeat order-processing steps until one fails.
-async fn run_steps(client: &Client) -> Result<(), Box<dyn Error>> {
+async fn run_steps(client: &Client, state: &RwLock<VolatileState>) -> Result<(), Box<dyn Error>> {
     loop {
-        run_step(client).await?;
+        run_step(client, state).await?;
         tokio::time::sleep(RUN_DELAY).await;
     }
 }
 
 // Stream live market data for the configured symbol.
-async fn stream_live_data(client: &Client, symbol: &str) -> Result<(), Box<dyn Error>> {
+async fn stream_live_data(
+    client: &Client,
+    symbol: &str,
+    state: &RwLock<VolatileState>,
+) -> Result<(), Box<dyn Error>> {
     // Subscribe to the default SMART-routed contract for consolidated data.
     let contract = Contract::stock(symbol).build();
-    let mut subscription = client
+    let subscription = client
         .market_data(&contract)
         .streaming()
         .subscribe()
         .await?;
+    let mut ticks = subscription.filter_data();
     println!("[market data] Streaming {symbol} market data…");
 
     // Print every tick and propagate stream failures to the connection loop.
-    while let Some(tick) = subscription.next().await {
-        println!("[market data] {symbol}: {:?}", tick?);
+    while let Some(tick) = ticks.next().await {
+        let tick = tick?;
+
+        // Retain positive bid and ask prices from either form of price update.
+        match &tick {
+            TickTypes::Price(tick) => {
+                update_locked_price(state, &tick.tick_type, tick.price)?;
+            }
+            TickTypes::PriceSize(tick) => {
+                update_locked_price(state, &tick.price_tick_type, tick.price)?;
+            }
+            _ => {}
+        }
+
+        // Keep logging the complete market-data stream for visibility.
+        println!("[market data] {symbol}: {tick:?}");
     }
 
     Err(ibapi::Error::UnexpectedEndOfStream.into())
+}
+
+// Update one quote while holding the connection-local state lock briefly.
+fn update_locked_price(
+    state: &RwLock<VolatileState>,
+    tick_type: &TickType,
+    price: f64,
+) -> io::Result<()> {
+    // Fail the connection attempt if another task poisoned the shared state.
+    let mut state = state
+        .write()
+        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
+    update_price(&mut state, tick_type, price);
+
+    Ok(())
+}
+
+// Update one side of the market when a usable price arrives.
+fn update_price(state: &mut VolatileState, tick_type: &TickType, price: f64) {
+    // Ignore sentinel and otherwise invalid prices reported by the data source.
+    if price > 0.0_f64 {
+        match tick_type {
+            TickType::Bid => state.bid_price = Some(price),
+            TickType::Ask => state.ask_price = Some(price),
+            _ => {}
+        }
+    }
 }
 
 // Stream real-time five-second bars for the configured symbol and exchange.
@@ -128,11 +189,24 @@ async fn stream_realtime_bars(
     Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
-// Print all current open orders.
-async fn run_step(client: &Client) -> Result<(), Box<dyn Error>> {
-    // List the current orders and positions for this step.
-    list_orders(client).await?;
-    list_positions(client).await?;
+// Run one set of independent account checks.
+async fn run_step(client: &Client, state: &RwLock<VolatileState>) -> Result<(), Box<dyn Error>> {
+    // List the current orders and positions concurrently for this step.
+    tokio::try_join!(list_orders(client), list_positions(client))?;
+
+    // Print the latest quote snapshot after the account checks finish.
+    let state = state
+        .read()
+        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
+    println!(
+        "[market data] Current bid: {}; current ask: {}",
+        state
+            .bid_price
+            .map_or_else(|| "unavailable".to_string(), |price| price.to_string()),
+        state
+            .ask_price
+            .map_or_else(|| "unavailable".to_string(), |price| price.to_string()),
+    );
 
     Ok(())
 }
@@ -205,8 +279,9 @@ async fn list_positions(client: &Client) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
+    use super::{Args, VolatileState, update_price};
     use clap::Parser;
+    use ibapi::contracts::tick_types::TickType;
 
     // This parser exposes the run arguments for focused tests.
     #[derive(Parser)]
@@ -229,5 +304,21 @@ mod tests {
         let cli = TestCli::try_parse_from(["run", "--symbol", "AAPL"]).unwrap();
 
         assert_eq!(cli.args.symbol, "AAPL");
+    }
+
+    #[test]
+    fn retain_only_positive_bid_and_ask_prices() {
+        // Confirm valid quote updates replace their side without accepting invalid prices.
+        let mut state = VolatileState {
+            bid_price: None,
+            ask_price: None,
+        };
+        update_price(&mut state, &TickType::Bid, 100.0);
+        update_price(&mut state, &TickType::Ask, 101.0);
+        update_price(&mut state, &TickType::Bid, 0.0);
+        update_price(&mut state, &TickType::Ask, f64::NAN);
+
+        assert_eq!(state.bid_price, Some(100.0_f64));
+        assert_eq!(state.ask_price, Some(101.0_f64));
     }
 }

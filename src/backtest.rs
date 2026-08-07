@@ -255,6 +255,9 @@ fn market_maker_grid(
         }
     }
 
+    // Separate the completed progress display from the winning configurations.
+    eprintln!();
+
     // Both winners exist whenever the parameter grid contains at least one candidate.
     Ok(GridResult {
         highest_return: highest_return.ok_or("the parameter grid contains no valid candidates")?,
