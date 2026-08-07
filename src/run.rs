@@ -8,12 +8,14 @@ use ibapi::{
     orders::{OrderUpdate, Orders},
     prelude::{StreamExt, SubscriptionItemStreamExt},
 };
-use std::{error::Error, io, sync::RwLock};
+use std::{collections::HashSet, error::Error, io, sync::RwLock};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 // These constants configure the instrument and failure recovery.
 const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+const MISSING_ORDER_GRACE_PERIOD: time::Duration = time::Duration::minutes(1);
 const ORDER_REF_PREFIX: &str = "stockholm:";
 const SMART_EXCHANGE: &str = "SMART";
 const OVERNIGHT_EXCHANGE: &str = "OVERNIGHT";
@@ -46,12 +48,22 @@ impl Default for Args {
 
 // Run the main trading loop.
 pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<dyn Error>> {
+    // Load persisted state once, falling back to a fresh state when no usable file exists.
+    let persistent_state = RwLock::new(state::load().unwrap_or_else(|error| {
+        eprintln!(
+            "Unable to load state from disk. Proceeding with initial state. Details: {error}",
+        );
+        state::initial()
+    }));
+
     // Restart the application after a delay whenever a top-level operation completes.
     loop {
         // Connect to the configured TWS or IB Gateway instance for this attempt.
         match Client::connect(address, client_id).await {
             Ok(client) => {
-                if let Err(error) = run_with_connection(&client, &args.symbol).await {
+                if let Err(error) =
+                    run_with_connection(&client, &args.symbol, &persistent_state).await
+                {
                     eprintln!("Error: {error}");
                 }
             }
@@ -63,15 +75,11 @@ pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<d
 }
 
 // Run the order loop and both market data streams concurrently on one connection.
-async fn run_with_connection(client: &Client, symbol: &str) -> Result<(), Box<dyn Error>> {
-    // Load persisted state, falling back to a fresh state when no usable file exists.
-    let _state = state::load().unwrap_or_else(|error| {
-        eprintln!(
-            "Unable to load state from disk. Proceeding with initial state. Details: {error}",
-        );
-        state::initial()
-    });
-
+async fn run_with_connection(
+    client: &Client,
+    symbol: &str,
+    persistent_state: &RwLock<state::State>,
+) -> Result<(), Box<dyn Error>> {
     // Start connection-local market state without any observed prices.
     let volatile_state = RwLock::new(VolatileState {
         bid_price: None,
@@ -85,12 +93,12 @@ async fn run_with_connection(client: &Client, symbol: &str) -> Result<(), Box<dy
 
     // Keep every operating loop alive until any one of them requires a reconnect.
     tokio::try_join!(
-        order_updates(client),
-        run_steps(client, &volatile_state),
-        account_summary(client),
+        control_loop(client, &volatile_state, persistent_state),
+        stream_account_summary(client),
         stream_live_data(client, symbol, &volatile_state),
-        stream_realtime_bars(client, symbol, SMART_EXCHANGE),
+        stream_order_updates(client, persistent_state),
         stream_realtime_bars(client, symbol, OVERNIGHT_EXCHANGE),
+        stream_realtime_bars(client, symbol, SMART_EXCHANGE),
     )?;
 
     Ok(())
@@ -103,6 +111,7 @@ async fn place_limit_buy(
     symbol: &str,
     shares: i32,
     limit: f64,
+    state: &RwLock<state::State>,
 ) -> Result<(), Box<dyn Error>> {
     // Build the order with a stable Stockholm-generated correlation reference.
     let contract = Contract::stock(symbol).build();
@@ -116,8 +125,22 @@ async fn place_limit_buy(
     order.order_ref.clone_from(&order_ref);
     order.include_overnight = true;
 
-    // Allocate the connection-local order ID and submit the completed order.
+    // Persist the pending order before submitting it to Interactive Brokers.
     let order_id = client.next_order_id();
+    {
+        let mut state = state
+            .write()
+            .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
+        state.open_orders.push(state::OpenOrder {
+            order_id,
+            order_ref: order_ref.clone(),
+            perm_id: None,
+            created_at: OffsetDateTime::now_utc(),
+        });
+        state::save(&state)?;
+    }
+
+    // Submit the order only after its state has been safely persisted.
     client.submit_order(order_id, &contract, &order).await?;
     println!(
         "[orders] Submitted limit buy {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}",
@@ -133,6 +156,7 @@ async fn place_limit_sell(
     symbol: &str,
     shares: i32,
     limit: f64,
+    state: &RwLock<state::State>,
 ) -> Result<(), Box<dyn Error>> {
     // Build the order with a stable Stockholm-generated correlation reference.
     let contract = Contract::stock(symbol).build();
@@ -146,8 +170,22 @@ async fn place_limit_sell(
     order.order_ref.clone_from(&order_ref);
     order.include_overnight = true;
 
-    // Allocate the connection-local order ID and submit the completed order.
+    // Persist the pending order before submitting it to Interactive Brokers.
     let order_id = client.next_order_id();
+    {
+        let mut state = state
+            .write()
+            .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
+        state.open_orders.push(state::OpenOrder {
+            order_id,
+            order_ref: order_ref.clone(),
+            perm_id: None,
+            created_at: OffsetDateTime::now_utc(),
+        });
+        state::save(&state)?;
+    }
+
+    // Submit the order only after its state has been safely persisted.
     client.submit_order(order_id, &contract, &order).await?;
     println!(
         "[orders] Submitted limit sell {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}",
@@ -157,11 +195,56 @@ async fn place_limit_sell(
 }
 
 // Repeat order-processing steps until one fails.
-async fn run_steps(client: &Client, state: &RwLock<VolatileState>) -> Result<(), Box<dyn Error>> {
+async fn control_loop(
+    client: &Client,
+    volatile_state: &RwLock<VolatileState>,
+    persistent_state: &RwLock<state::State>,
+) -> Result<(), Box<dyn Error>> {
     loop {
-        run_step(client, state).await?;
+        run_step(client, volatile_state, persistent_state).await?;
         tokio::time::sleep(RUN_DELAY).await;
     }
+}
+
+// Stream account summary updates across all accessible accounts.
+async fn stream_account_summary(client: &Client) -> Result<(), Box<dyn Error>> {
+    // Mark the start of the request before collecting its results.
+    println!("[account summary] Requesting account summary…");
+
+    // Request every supported summary field across all accessible accounts.
+    let subscription = client
+        .account_summary(&AccountGroup("All".to_string()), AccountSummaryTags::ALL)
+        .await?;
+    let mut summaries = subscription.filter_data();
+
+    // Print the initial summary and subsequent updates for the life of the connection.
+    while let Some(update) = summaries.next().await {
+        match update? {
+            AccountSummaryResult::Summary(summary) => {
+                if summary.currency.is_empty() {
+                    println!(
+                        "[account summary] {}: {} = {}",
+                        summary.account,
+                        summary.tag,
+                        summary.value,
+                    );
+                } else {
+                    println!(
+                        "[account summary] {}: {} = {} {}",
+                        summary.account,
+                        summary.tag,
+                        summary.value,
+                        summary.currency,
+                    );
+                }
+            }
+            AccountSummaryResult::End => {
+                println!("[account summary] Finished listing initial account summary.");
+            }
+        }
+    }
+
+    Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
 // Stream live market data for the configured symbol.
@@ -202,31 +285,47 @@ async fn stream_live_data(
     Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
-// Update one quote while holding the connection-local state lock briefly.
-fn update_locked_price(
-    state: &RwLock<VolatileState>,
-    tick_type: &TickType,
-    price: f64,
-) -> io::Result<()> {
-    // Fail the connection attempt if another task poisoned the shared state.
-    let mut state = state
-        .write()
-        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
-    update_price(&mut state, tick_type, price);
+// Stream order updates for the life of the connection.
+async fn stream_order_updates(
+    client: &Client,
+    state: &RwLock<state::State>,
+) -> Result<(), Box<dyn Error>> {
+    // Subscribe before any trading operations can submit orders.
+    let subscription = client.order_update_stream().await?;
+    let mut updates = subscription.filter_data();
+    println!("[order updates] Streaming order updates…");
 
-    Ok(())
-}
+    // Print every order-related event while propagating stream failures.
+    while let Some(update) = updates.next().await {
+        let update: OrderUpdate = update?;
 
-// Update one side of the market when a usable price arrives.
-fn update_price(state: &mut VolatileState, tick_type: &TickType, price: f64) {
-    // Ignore sentinel and otherwise invalid prices reported by the data source.
-    if price > 0.0_f64 {
-        match tick_type {
-            TickType::Bid => state.bid_price = Some(price),
-            TickType::Ask => state.ask_price = Some(price),
-            _ => {}
+        // Apply open-order details and terminal statuses to the persisted order set.
+        match &update {
+            OrderUpdate::OpenOrder(data) if data.order.order_ref.starts_with(ORDER_REF_PREFIX) => {
+                update_open_order(
+                    state,
+                    data.order_id,
+                    &data.order.order_ref,
+                    data.order.perm_id,
+                )?;
+            }
+            OrderUpdate::OrderStatus(status) => {
+                update_order_status(
+                    state,
+                    status.order_id,
+                    status.perm_id,
+                    status.status.is_terminal(),
+                )?;
+            }
+            OrderUpdate::OpenOrder(_)
+            | OrderUpdate::ExecutionData(_)
+            | OrderUpdate::CommissionReport(_) => {}
         }
+
+        println!("[order updates] {update:?}");
     }
+
+    Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
 // Stream real-time five-second bars for the configured symbol and exchange.
@@ -254,12 +353,19 @@ async fn stream_realtime_bars(
 }
 
 // Run one set of independent account checks.
-async fn run_step(client: &Client, state: &RwLock<VolatileState>) -> Result<(), Box<dyn Error>> {
+async fn run_step(
+    client: &Client,
+    volatile_state: &RwLock<VolatileState>,
+    persistent_state: &RwLock<state::State>,
+) -> Result<(), Box<dyn Error>> {
     // Fetch the current orders and positions concurrently for this step.
-    tokio::try_join!(list_orders(client), list_positions(client))?;
+    tokio::try_join!(
+        list_orders(client, persistent_state),
+        list_positions(client),
+    )?;
 
     // Print the latest quote snapshot after the account checks finish.
-    let state = state
+    let state = volatile_state
         .read()
         .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
     println!(
@@ -275,65 +381,114 @@ async fn run_step(client: &Client, state: &RwLock<VolatileState>) -> Result<(), 
     Ok(())
 }
 
-// Stream account summary updates across all accessible accounts.
-async fn account_summary(client: &Client) -> Result<(), Box<dyn Error>> {
-    // Mark the start of the request before collecting its results.
-    println!("[account summary] Requesting account summary…");
+// Record the latest identifiers for an open Stockholm order.
+fn update_open_order(
+    state: &RwLock<state::State>,
+    order_id: i32,
+    order_ref: &str,
+    perm_id: i64,
+) -> io::Result<()> {
+    // Update an existing record by its stable reference or add a newly discovered order.
+    let mut state = state
+        .write()
+        .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
+    let perm_id = (perm_id != 0).then_some(perm_id);
+    let changed = if let Some(order) = state
+        .open_orders
+        .iter_mut()
+        .find(|order| order.order_ref == order_ref)
+    {
+        let changed = order.order_id != order_id || order.perm_id != perm_id;
+        order.order_id = order_id;
+        order.perm_id = perm_id;
+        changed
+    } else {
+        state.open_orders.push(state::OpenOrder {
+            order_id,
+            order_ref: order_ref.to_string(),
+            perm_id,
+            created_at: OffsetDateTime::now_utc(),
+        });
+        true
+    };
 
-    // Request every supported summary field across all accessible accounts.
-    let subscription = client
-        .account_summary(&AccountGroup("All".to_string()), AccountSummaryTags::ALL)
-        .await?;
-    let mut summaries = subscription.filter_data();
-
-    // Print the initial summary and subsequent updates for the life of the connection.
-    while let Some(update) = summaries.next().await {
-        match update? {
-            AccountSummaryResult::Summary(summary) => {
-                if summary.currency.is_empty() {
-                    println!(
-                        "[account summary] {}: {} = {}",
-                        summary.account,
-                        summary.tag,
-                        summary.value,
-                    );
-                } else {
-                    println!(
-                        "[account summary] {}: {} = {} {}",
-                        summary.account,
-                        summary.tag,
-                        summary.value,
-                        summary.currency,
-                    );
-                }
-            }
-            AccountSummaryResult::End => {
-                println!("[account summary] Finished listing initial account summary.");
-            }
-        }
+    // Persist every mutation before releasing the state lock.
+    if changed {
+        state::save(&state)?;
     }
 
-    Err(ibapi::Error::UnexpectedEndOfStream.into())
+    Ok(())
 }
 
-// Stream order updates for the life of the connection.
-async fn order_updates(client: &Client) -> Result<(), Box<dyn Error>> {
-    // Subscribe before any trading operations can submit orders.
-    let subscription = client.order_update_stream().await?;
-    let mut updates = subscription.filter_data();
-    println!("[order updates] Streaming order updates…");
+// Apply an order status when it identifies an order already managed by Stockholm.
+fn update_order_status(
+    state: &RwLock<state::State>,
+    order_id: i32,
+    perm_id: i64,
+    is_terminal: bool,
+) -> io::Result<()> {
+    // Find the order by either identifier because connection-local IDs may change.
+    let mut state = state
+        .write()
+        .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
+    let index = state.open_orders.iter().position(|order| {
+        order.order_id == order_id || (perm_id != 0 && order.perm_id == Some(perm_id))
+    });
+    let changed = if let Some(index) = index {
+        if is_terminal {
+            state.open_orders.remove(index);
+            true
+        } else {
+            let order = &mut state.open_orders[index];
+            let changed =
+                order.order_id != order_id || (perm_id != 0 && order.perm_id != Some(perm_id));
+            order.order_id = order_id;
+            if perm_id != 0 {
+                order.perm_id = Some(perm_id);
+            }
+            changed
+        }
+    } else {
+        false
+    };
 
-    // Print every order-related event while propagating stream failures.
-    while let Some(update) = updates.next().await {
-        let update: OrderUpdate = update?;
-        println!("[order updates] {update:?}");
+    // Persist every mutation before releasing the state lock.
+    if changed {
+        state::save(&state)?;
     }
 
-    Err(ibapi::Error::UnexpectedEndOfStream.into())
+    Ok(())
+}
+
+// Update one quote while holding the connection-local state lock briefly.
+fn update_locked_price(
+    state: &RwLock<VolatileState>,
+    tick_type: &TickType,
+    price: f64,
+) -> io::Result<()> {
+    // Fail the connection attempt if another task poisoned the shared state.
+    let mut state = state
+        .write()
+        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
+    update_price(&mut state, tick_type, price);
+
+    Ok(())
+}
+
+// Update one side of the market when a usable price arrives.
+fn update_price(state: &mut VolatileState, tick_type: &TickType, price: f64) {
+    // Ignore sentinel and otherwise invalid prices reported by the data source.
+    if price > 0.0_f64 {
+        match tick_type {
+            TickType::Bid => state.bid_price = Some(price),
+            TickType::Ask => state.ask_price = Some(price),
+            _ => {}
+        }
+    }
 }
 
 // Print current open orders placed by Stockholm.
-async fn list_orders(client: &Client) -> Result<(), Box<dyn Error>> {
+async fn list_orders(client: &Client, state: &RwLock<state::State>) -> Result<(), Box<dyn Error>> {
     // Mark the start of the request before collecting its results.
     println!("[orders] Requesting Stockholm open orders…");
 
@@ -341,16 +496,46 @@ async fn list_orders(client: &Client) -> Result<(), Box<dyn Error>> {
     let subscription = client.all_open_orders().await?;
     let mut orders = subscription.filter_data();
     let mut order_count: usize = 0;
+    let mut open_order_refs = HashSet::new();
 
     // Print only orders carrying Stockholm's reference prefix.
     while let Some(order) = orders.next().await {
         match order? {
             Orders::OrderData(data) if data.order.order_ref.starts_with(ORDER_REF_PREFIX) => {
                 order_count += 1;
+                open_order_refs.insert(data.order.order_ref.clone());
+                update_open_order(
+                    state,
+                    data.order_id,
+                    &data.order.order_ref,
+                    data.order.perm_id,
+                )?;
                 println!("[orders] - {data:?}");
             }
-            Orders::OrderData(_) | Orders::OrderStatus(_) => {}
+            Orders::OrderStatus(status) => {
+                update_order_status(
+                    state,
+                    status.order_id,
+                    status.perm_id,
+                    status.status.is_terminal(),
+                )?;
+            }
+            Orders::OrderData(_) => {}
         }
+    }
+
+    // Remove old local records absent from IB's complete open-order snapshot.
+    let now = OffsetDateTime::now_utc();
+    let mut state = state
+        .write()
+        .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
+    let previous_len = state.open_orders.len();
+    state.open_orders.retain(|order| {
+        open_order_refs.contains(&order.order_ref)
+            || now - order.created_at <= MISSING_ORDER_GRACE_PERIOD
+    });
+    if state.open_orders.len() != previous_len {
+        state::save(&state)?;
     }
 
     // Confirm that the complete response arrived even when it contained no orders.
