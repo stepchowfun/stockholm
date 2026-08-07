@@ -2,7 +2,7 @@ use crate::{DEFAULT_SYMBOL, state};
 use clap::Args as ClapArgs;
 use ibapi::{
     Client,
-    accounts::PositionUpdate,
+    accounts::{AccountSummaryResult, AccountSummaryTags, PositionUpdate, types::AccountGroup},
     contracts::{Contract, tick_types::TickType},
     market_data::{MarketDataType, TradingHours, realtime::TickTypes},
     orders::Orders,
@@ -191,8 +191,12 @@ async fn stream_realtime_bars(
 
 // Run one set of independent account checks.
 async fn run_step(client: &Client, state: &RwLock<VolatileState>) -> Result<(), Box<dyn Error>> {
-    // List the current orders and positions concurrently for this step.
-    tokio::try_join!(list_orders(client), list_positions(client))?;
+    // Fetch the current account information concurrently for this step.
+    tokio::try_join!(
+        list_orders(client),
+        list_positions(client),
+        account_summary(client),
+    )?;
 
     // Print the latest quote snapshot after the account checks finish.
     let state = state
@@ -207,6 +211,42 @@ async fn run_step(client: &Client, state: &RwLock<VolatileState>) -> Result<(), 
             .ask_price
             .map_or_else(|| "unavailable".to_string(), |price| price.to_string()),
     );
+
+    Ok(())
+}
+
+// Print the current account summary across all accessible accounts.
+async fn account_summary(client: &Client) -> Result<(), Box<dyn Error>> {
+    // Mark the start of the request before collecting its results.
+    println!("[account summary] Requesting account summary…");
+
+    // Request every supported summary field across all accessible accounts.
+    let subscription = client
+        .account_summary(&AccountGroup("All".to_string()), AccountSummaryTags::ALL)
+        .await?;
+    let mut summaries = subscription.filter_data();
+
+    // Print summary values until the complete initial snapshot arrives.
+    while let Some(update) = summaries.next().await {
+        match update? {
+            AccountSummaryResult::Summary(summary) => {
+                if summary.currency.is_empty() {
+                    println!(
+                        "[account summary] {}: {} = {}",
+                        summary.account, summary.tag, summary.value,
+                    );
+                } else {
+                    println!(
+                        "[account summary] {}: {} = {} {}",
+                        summary.account, summary.tag, summary.value, summary.currency,
+                    );
+                }
+            }
+            AccountSummaryResult::End => break,
+        }
+    }
+
+    println!("[account summary] Finished listing account summary.");
 
     Ok(())
 }
