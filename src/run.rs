@@ -6,7 +6,7 @@ use ibapi::{
     contracts::{Contract, tick_types::TickType},
     market_data::{MarketDataType, TradingHours, realtime::TickTypes},
     orders::{OrderUpdate, Orders},
-    prelude::{StreamExt, SubscriptionItemStreamExt},
+    prelude::{StreamExt, Subscription, SubscriptionItemStreamExt},
 };
 use std::{collections::HashSet, error::Error, io, sync::RwLock};
 use time::OffsetDateTime;
@@ -91,12 +91,16 @@ async fn run_with_connection(
         .switch_market_data_type(MarketDataType::Realtime)
         .await?;
 
+    // Subscribe before reconciling the initial snapshot so intervening updates are buffered.
+    let order_updates = client.order_update_stream().await?;
+    list_orders(client, persistent_state).await?;
+
     // Keep every operating loop alive until any one of them requires a reconnect.
     tokio::try_join!(
-        control_loop(client, &volatile_state, persistent_state),
+        control_loop(client, &volatile_state),
         stream_account_summary(client),
         stream_live_data(client, symbol, &volatile_state),
-        stream_order_updates(client, persistent_state),
+        stream_order_updates(order_updates, persistent_state),
         stream_realtime_bars(client, symbol, OVERNIGHT_EXCHANGE),
         stream_realtime_bars(client, symbol, SMART_EXCHANGE),
     )?;
@@ -108,10 +112,9 @@ async fn run_with_connection(
 async fn control_loop(
     client: &Client,
     volatile_state: &RwLock<VolatileState>,
-    persistent_state: &RwLock<state::State>,
 ) -> Result<(), Box<dyn Error>> {
     loop {
-        run_step(client, volatile_state, persistent_state).await?;
+        run_step(client, volatile_state).await?;
         tokio::time::sleep(RUN_DELAY).await;
     }
 }
@@ -197,11 +200,10 @@ async fn stream_live_data(
 
 // Stream order updates for the life of the connection.
 async fn stream_order_updates(
-    client: &Client,
+    subscription: Subscription<OrderUpdate>,
     state: &RwLock<state::State>,
 ) -> Result<(), Box<dyn Error>> {
-    // Subscribe before any trading operations can submit orders.
-    let subscription = client.order_update_stream().await?;
+    // Consume the subscription established before the initial order reconciliation.
     let mut updates = subscription.filter_data();
     println!("[order updates] Streaming order updates…");
 
@@ -266,13 +268,9 @@ async fn stream_realtime_bars(
 async fn run_step(
     client: &Client,
     volatile_state: &RwLock<VolatileState>,
-    persistent_state: &RwLock<state::State>,
 ) -> Result<(), Box<dyn Error>> {
-    // Fetch the current orders and positions concurrently for this step.
-    tokio::try_join!(
-        list_orders(client, persistent_state),
-        list_positions(client),
-    )?;
+    // Fetch the current positions for this step.
+    list_positions(client).await?;
 
     // Print the latest quote snapshot after the account checks finish.
     let state = volatile_state
