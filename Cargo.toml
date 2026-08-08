@@ -1,9 +1,9 @@
 [package]
 name = "stockholm"
-version = "0.2.26"
+version = "0.2.27"
 authors = ["Stephan Boyer <stephan@stephanboyer.com>"]
 edition = "2024"
-description = "An algorithmic trading bot."
+description = "A laboratory for algorithmic trading."
 license = "MIT"
 documentation = "https://github.com/stepchowfun/stockholm"
 homepage = "https://github.com/stepchowfun/stockholm"

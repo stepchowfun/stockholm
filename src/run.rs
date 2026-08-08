@@ -15,7 +15,6 @@ use uuid::Uuid;
 // These constants configure the instrument and failure recovery.
 const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
-const MISSING_ORDER_GRACE_PERIOD: time::Duration = time::Duration::minutes(1);
 const ORDER_REF_PREFIX: &str = "stockholm:";
 const SMART_EXCHANGE: &str = "SMART";
 const OVERNIGHT_EXCHANGE: &str = "OVERNIGHT";
@@ -548,16 +547,14 @@ async fn list_orders(client: &Client, state: &RwLock<state::State>) -> Result<()
         }
     }
 
-    // Remove old local records absent from IB's complete open-order snapshot.
-    let now = OffsetDateTime::now_utc();
+    // Remove every local record absent from IB's complete open-order snapshot.
     let mut state = state
         .write()
         .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
     let previous_len = state.open_orders.len();
-    state.open_orders.retain(|order| {
-        open_order_refs.contains(&order.order_ref)
-            || now - order.created_at <= MISSING_ORDER_GRACE_PERIOD
-    });
+    state
+        .open_orders
+        .retain(|order| open_order_refs.contains(&order.order_ref));
     if state.open_orders.len() != previous_len {
         state::save(&state)?;
     }
