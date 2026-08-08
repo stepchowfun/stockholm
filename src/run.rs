@@ -454,36 +454,22 @@ fn update_order_status(
     perm_id: i64,
     is_terminal: bool,
 ) -> io::Result<()> {
-    // Prefer the stable permanent ID before falling back to the connection-local ID.
+    // Match only the stable permanent ID so unrelated connection-local IDs are ignored.
     let mut state = state
         .write()
         .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
-    let index = (perm_id != 0)
-        .then(|| {
-            state
-                .open_orders
-                .iter()
-                .position(|order| order.perm_id == Some(perm_id))
-        })
-        .flatten()
-        .or_else(|| {
-            state
-                .open_orders
-                .iter()
-                .position(|order| order.order_id == order_id)
-        });
+    let index = state
+        .open_orders
+        .iter()
+        .position(|order| order.perm_id == Some(perm_id));
     let changed = if let Some(index) = index {
         if is_terminal {
             state.open_orders.remove(index);
             true
         } else {
             let order = &mut state.open_orders[index];
-            let changed =
-                order.order_id != order_id || (perm_id != 0 && order.perm_id != Some(perm_id));
+            let changed = order.order_id != order_id;
             order.order_id = order_id;
-            if perm_id != 0 {
-                order.perm_id = Some(perm_id);
-            }
             changed
         }
     } else {
