@@ -52,9 +52,7 @@ impl Default for Args {
 pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<dyn Error>> {
     // Load persisted state once, falling back to a fresh state when no usable file exists.
     let persistent_state = RwLock::new(state::load().unwrap_or_else(|error| {
-        eprintln!(
-            "Unable to load state from disk. Proceeding with initial state. Details: {error}",
-        );
+        warn!("Unable to load state from disk. Proceeding with initial state. Details: {error}");
         state::initial()
     }));
 
@@ -66,10 +64,10 @@ pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<d
                 if let Err(error) =
                     run_with_connection(&client, &args.symbol, &persistent_state).await
                 {
-                    eprintln!("Error: {error}");
+                    error!("{error}");
                 }
             }
-            Err(error) => eprintln!("Connection to Interactive Brokers Gateway failed: {error}"),
+            Err(error) => error!("Connection to Interactive Brokers Gateway failed: {error}"),
         }
 
         tokio::time::sleep(RETRY_DELAY).await;
@@ -128,7 +126,7 @@ async fn stream_account_summary(
     state: &RwLock<VolatileState>,
 ) -> Result<(), Box<dyn Error>> {
     // Mark the start of the request before collecting its results.
-    println!("[account summary] Requesting account summary…");
+    info!("Requesting account summary…");
 
     // Request every supported summary field across all accessible accounts.
     let subscription = client
@@ -144,15 +142,15 @@ async fn stream_account_summary(
                 update_available_funds(state, &summary.tag, &summary.value)?;
 
                 if summary.currency.is_empty() {
-                    println!(
-                        "[account summary] {}: {} = {}",
+                    debug!(
+                        "Account summary for {}: {} = {}",
                         summary.account,
                         summary.tag,
                         summary.value,
                     );
                 } else {
-                    println!(
-                        "[account summary] {}: {} = {} {}",
+                    debug!(
+                        "Account summary for {}: {} = {} {}",
                         summary.account,
                         summary.tag,
                         summary.value,
@@ -161,7 +159,7 @@ async fn stream_account_summary(
                 }
             }
             AccountSummaryResult::End => {
-                println!("[account summary] Finished listing initial account summary.");
+                info!("Finished listing initial account summary.");
             }
         }
     }
@@ -199,7 +197,7 @@ async fn stream_live_data(
         .subscribe()
         .await?;
     let mut ticks = subscription.filter_data();
-    println!("[market data] Streaming {symbol} market data…");
+    info!("Streaming {symbol} market data…");
 
     // Print every tick and propagate stream failures to the connection loop.
     while let Some(tick) = ticks.next().await {
@@ -217,7 +215,7 @@ async fn stream_live_data(
         }
 
         // Keep logging the complete market-data stream for visibility.
-        println!("[market data] {symbol}: {tick:?}");
+        debug!("Market data for {symbol}: {tick:?}");
     }
 
     Err(ibapi::Error::UnexpectedEndOfStream.into())
@@ -230,7 +228,7 @@ async fn stream_order_updates(
 ) -> Result<(), Box<dyn Error>> {
     // Consume the subscription established before the initial order reconciliation.
     let mut updates = subscription.filter_data();
-    println!("[order updates] Streaming order updates…");
+    info!("Streaming order updates…");
 
     // Print every order-related event while propagating stream failures.
     while let Some(update) = updates.next().await {
@@ -259,7 +257,7 @@ async fn stream_order_updates(
             | OrderUpdate::CommissionReport(_) => {}
         }
 
-        println!("[order updates] {update:?}");
+        debug!("Order update: {update:?}");
     }
 
     Err(ibapi::Error::UnexpectedEndOfStream.into())
@@ -279,11 +277,11 @@ async fn stream_realtime_bars(
         .subscribe()
         .await?;
     let mut bars = subscription.filter_data();
-    println!("[bars] Streaming {symbol} five-second bars from {exchange}…");
+    info!("Streaming {symbol} five-second bars from {exchange}…");
 
     // Print every completed bar and propagate stream failures to the connection loop.
     while let Some(bar) = bars.next().await {
-        println!("[bars] {symbol} ({exchange}): {:?}", bar?);
+        debug!("Five-second bar for {symbol} ({exchange}): {:?}", bar?);
     }
 
     Err(ibapi::Error::UnexpectedEndOfStream.into())
@@ -301,8 +299,8 @@ async fn run_step(
     let state = volatile_state
         .read()
         .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
-    println!(
-        "[step] Available funds: {}; current bid: {}; current ask: {}",
+    info!(
+        "Available funds: {}; current bid: {}; current ask: {}",
         state
             .available_funds
             .map_or_else(|| "unavailable".to_string(), |funds| funds.to_string()),
@@ -355,9 +353,7 @@ async fn place_limit_buy(
 
     // Submit the order only after its state has been safely persisted.
     client.submit_order(order_id, &contract, &order).await?;
-    println!(
-        "[orders] Submitted limit buy {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}",
-    );
+    info!("Submitted limit buy {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}");
 
     Ok(())
 }
@@ -400,9 +396,7 @@ async fn place_limit_sell(
 
     // Submit the order only after its state has been safely persisted.
     client.submit_order(order_id, &contract, &order).await?;
-    println!(
-        "[orders] Submitted limit sell {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}",
-    );
+    info!("Submitted limit sell {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}");
 
     Ok(())
 }
@@ -513,7 +507,7 @@ fn update_price(state: &mut VolatileState, tick_type: &TickType, price: f64) {
 // Print current open orders placed by Stockholm.
 async fn list_orders(client: &Client, state: &RwLock<state::State>) -> Result<(), Box<dyn Error>> {
     // Mark the start of the request before collecting its results.
-    println!("[orders] Requesting Stockholm open orders…");
+    info!("Requesting Stockholm open orders…");
 
     // Request every current open order across associated accounts and API clients.
     let subscription = client.all_open_orders().await?;
@@ -533,7 +527,7 @@ async fn list_orders(client: &Client, state: &RwLock<state::State>) -> Result<()
                     &data.order.order_ref,
                     data.order.perm_id,
                 )?;
-                println!("[orders] - {data:?}");
+                debug!("Stockholm open order: {data:?}");
             }
             Orders::OrderStatus(status) => {
                 update_order_status(
@@ -561,11 +555,11 @@ async fn list_orders(client: &Client, state: &RwLock<state::State>) -> Result<()
 
     // Confirm that the complete response arrived even when it contained no orders.
     if order_count == 0 {
-        println!("[orders] No Stockholm open orders found.");
+        info!("No Stockholm open orders found.");
     } else if order_count == 1 {
-        println!("[orders] Finished listing 1 Stockholm open order.");
+        info!("Finished listing 1 Stockholm open order.");
     } else {
-        println!("[orders] Finished listing {order_count} Stockholm open orders.");
+        info!("Finished listing {order_count} Stockholm open orders.");
     }
 
     Ok(())
@@ -574,7 +568,7 @@ async fn list_orders(client: &Client, state: &RwLock<state::State>) -> Result<()
 // Print all current positions.
 async fn list_positions(client: &Client) -> Result<(), Box<dyn Error>> {
     // Mark the start of the request before collecting its results.
-    println!("[positions] Requesting all positions…");
+    info!("Requesting all positions…");
 
     // Request every current position across accessible accounts.
     let subscription = client.positions().await?;
@@ -586,7 +580,7 @@ async fn list_positions(client: &Client) -> Result<(), Box<dyn Error>> {
         match update? {
             PositionUpdate::Position(position) => {
                 position_count += 1;
-                println!("[positions] - {position:?}");
+                debug!("Position: {position:?}");
             }
             PositionUpdate::PositionEnd => break,
         }
@@ -594,11 +588,11 @@ async fn list_positions(client: &Client) -> Result<(), Box<dyn Error>> {
 
     // Confirm that the complete response arrived even when it contained no positions.
     if position_count == 0 {
-        println!("[positions] No positions found.");
+        info!("No positions found.");
     } else if position_count == 1 {
-        println!("[positions] Finished listing 1 position.");
+        info!("Finished listing 1 position.");
     } else {
-        println!("[positions] Finished listing {position_count} positions.");
+        info!("Finished listing {position_count} positions.");
     }
 
     Ok(())
