@@ -7,11 +7,44 @@ mod run;
 mod state;
 mod train;
 
+#[macro_use]
+extern crate log;
+
+use chrono::Local;
 use clap::{ArgAction, Parser, Subcommand as ClapSubcommand};
-use std::error::Error;
+use env_logger::{Builder, fmt::style::Effects};
+use log::LevelFilter;
+use std::{env, error::Error, io::Write, str::FromStr};
 
 // This symbol is used when the user does not select an instrument.
 const DEFAULT_SYMBOL: &str = "SOXL";
+const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Debug;
+
+// Set up timestamped, leveled logging for operational output.
+fn set_up_logging() {
+    Builder::new()
+        .filter_module(
+            module_path!(),
+            LevelFilter::from_str(
+                &env::var("LOG_LEVEL").unwrap_or_else(|_| DEFAULT_LOG_LEVEL.to_string()),
+            )
+            .unwrap_or(DEFAULT_LOG_LEVEL),
+        )
+        .format(|buf, record| {
+            let style = buf
+                .default_level_style(record.level())
+                .effects(Effects::BOLD);
+
+            writeln!(
+                buf,
+                "{style}[{} {}]{style:#} {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S %:z"),
+                record.level(),
+                record.args(),
+            )
+        })
+        .init();
+}
 
 // This struct represents the command-line arguments.
 #[derive(Parser)]
@@ -63,6 +96,9 @@ enum Subcommand {
 // Parse the configuration and run the selected operating mode.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // Set up logging before performing any fallible application work.
+    set_up_logging();
+
     // Parse the command-line arguments.
     let cli = Cli::parse();
 
