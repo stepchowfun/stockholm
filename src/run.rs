@@ -30,6 +30,9 @@ pub struct Args {
 
 // This connection-local state tracks values that do not need to survive a restart.
 struct VolatileState {
+    // The most recently reported funds available for opening new positions.
+    available_funds: Option<f64>,
+
     // The most recently observed bid price, if one is available.
     bid_price: Option<f64>,
 
@@ -82,6 +85,7 @@ async fn run_with_connection(
 ) -> Result<(), Box<dyn Error>> {
     // Start connection-local market state without any observed prices.
     let volatile_state = RwLock::new(VolatileState {
+        available_funds: None,
         bid_price: None,
         ask_price: None,
     });
@@ -98,7 +102,7 @@ async fn run_with_connection(
     // Keep every operating loop alive until any one of them requires a reconnect.
     tokio::try_join!(
         control_loop(client, &volatile_state),
-        stream_account_summary(client),
+        stream_account_summary(client, &volatile_state),
         stream_live_data(client, symbol, &volatile_state),
         stream_order_updates(order_updates, persistent_state),
         stream_realtime_bars(client, symbol, OVERNIGHT_EXCHANGE),
@@ -120,7 +124,10 @@ async fn control_loop(
 }
 
 // Stream account summary updates across all accessible accounts.
-async fn stream_account_summary(client: &Client) -> Result<(), Box<dyn Error>> {
+async fn stream_account_summary(
+    client: &Client,
+    state: &RwLock<VolatileState>,
+) -> Result<(), Box<dyn Error>> {
     // Mark the start of the request before collecting its results.
     println!("[account summary] Requesting account summary…");
 
@@ -134,6 +141,9 @@ async fn stream_account_summary(client: &Client) -> Result<(), Box<dyn Error>> {
     while let Some(update) = summaries.next().await {
         match update? {
             AccountSummaryResult::Summary(summary) => {
+                // Retain valid available-funds updates for use by the control loop.
+                update_available_funds(state, &summary.tag, &summary.value)?;
+
                 if summary.currency.is_empty() {
                     println!(
                         "[account summary] {}: {} = {}",
@@ -158,6 +168,22 @@ async fn stream_account_summary(client: &Client) -> Result<(), Box<dyn Error>> {
     }
 
     Err(ibapi::Error::UnexpectedEndOfStream.into())
+}
+
+// Update available funds from the matching account-summary field.
+fn update_available_funds(state: &RwLock<VolatileState>, tag: &str, value: &str) -> io::Result<()> {
+    // Ignore unrelated, nonnumeric, and nonfinite account-summary values.
+    if tag == AccountSummaryTags::AVAILABLE_FUNDS
+        && let Ok(value) = value.parse::<f64>()
+        && value.is_finite()
+    {
+        let mut state = state
+            .write()
+            .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
+        state.available_funds = Some(value);
+    }
+
+    Ok(())
 }
 
 // Stream live market data for the configured symbol.
@@ -272,12 +298,15 @@ async fn run_step(
     // Fetch the current positions for this step.
     list_positions(client).await?;
 
-    // Print the latest quote snapshot after the account checks finish.
+    // Print the latest account and quote snapshot after the account checks finish.
     let state = volatile_state
         .read()
         .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
     println!(
-        "[market data] Current bid: {}; current ask: {}",
+        "[step] Available funds: {}; current bid: {}; current ask: {}",
+        state
+            .available_funds
+            .map_or_else(|| "unavailable".to_string(), |funds| funds.to_string()),
         state
             .bid_price
             .map_or_else(|| "unavailable".to_string(), |price| price.to_string()),
@@ -594,9 +623,11 @@ async fn list_positions(client: &Client) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, VolatileState, update_price};
+    use super::{Args, VolatileState, update_available_funds, update_price};
     use clap::Parser;
+    use ibapi::accounts::AccountSummaryTags;
     use ibapi::contracts::tick_types::TickType;
+    use std::sync::RwLock;
 
     // This parser exposes the run arguments for focused tests.
     #[derive(Parser)]
@@ -625,6 +656,7 @@ mod tests {
     fn retain_only_positive_bid_and_ask_prices() {
         // Confirm valid quote updates replace their side without accepting invalid prices.
         let mut state = VolatileState {
+            available_funds: None,
             bid_price: None,
             ask_price: None,
         };
@@ -635,5 +667,20 @@ mod tests {
 
         assert_eq!(state.bid_price, Some(100.0_f64));
         assert_eq!(state.ask_price, Some(101.0_f64));
+    }
+
+    #[test]
+    fn retain_only_valid_available_funds() {
+        // Confirm only finite numeric available-funds summaries update volatile state.
+        let state = RwLock::new(VolatileState {
+            available_funds: None,
+            bid_price: None,
+            ask_price: None,
+        });
+        update_available_funds(&state, AccountSummaryTags::AVAILABLE_FUNDS, "1234.5").unwrap();
+        update_available_funds(&state, AccountSummaryTags::AVAILABLE_FUNDS, "NaN").unwrap();
+        update_available_funds(&state, AccountSummaryTags::NET_LIQUIDATION, "9999").unwrap();
+
+        assert_eq!(state.read().unwrap().available_funds, Some(1234.5_f64));
     }
 }
