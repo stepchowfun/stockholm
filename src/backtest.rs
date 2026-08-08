@@ -435,7 +435,14 @@ impl MarketMakerLogger<'_> {
         if self.enabled {
             let filename = self.filename;
             eprintln!(
-                "[market maker] {filename} @ {timestamp}: Executed {filled_shares} shares of {side} order from timestamp {} @ ${:.2} ({} remaining)",
+                concat!(
+                    "[market maker] {} @ {}: Executed {} shares of {} order from timestamp {} ",
+                    "@ ${:.2} ({} remaining)",
+                ),
+                filename,
+                timestamp,
+                filled_shares,
+                side,
                 order.placed_timestamp,
                 order.limit,
                 order.shares,
@@ -448,7 +455,14 @@ impl MarketMakerLogger<'_> {
         if self.enabled && shares > 0.0_f64 {
             let filename = self.filename;
             eprintln!(
-                "[market maker] {filename} @ {timestamp}: Executed liquidation sell for {shares} shares @ ${price:.2}",
+                concat!(
+                    "[market maker] {} @ {}: Executed liquidation sell for {} shares ",
+                    "@ ${:.2}",
+                ),
+                filename,
+                timestamp,
+                shares,
+                price,
             );
         }
     }
