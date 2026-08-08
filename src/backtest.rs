@@ -103,17 +103,31 @@ pub struct Args {
 
 // This bar contains the prices needed to simulate limit-order fills.
 struct Bar {
+    timestamp: i64,
     low: f64,
     high: f64,
     close: f64,
     liquidate: bool,
 }
 
+// This trading day retains its source filename for market-maker event logs.
+struct Day {
+    filename: String,
+    bars: Vec<Bar>,
+}
+
 // This order reserves either cash or shares until it fills or expires.
 struct LimitOrder {
     placed_at: u64,
+    placed_timestamp: i64,
     shares: f64,
     limit: f64,
+}
+
+// This logger adds source context to events from one market-maker trading day.
+struct MarketMakerLogger<'a> {
+    enabled: bool,
+    filename: &'a str,
 }
 
 // This configuration defines one market-maker simulation candidate.
@@ -191,7 +205,7 @@ fn market_maker(
 ) -> Result<MarketMakerResult, Box<dyn Error>> {
     // Parse each chronological trading day before changing the simulated portfolio.
     let days = parse_days(files, args.liquidation_seconds)?;
-    simulate_market_maker(&days, market_maker_config(args))
+    simulate_market_maker(&days, market_maker_config(args), true)
 }
 
 // Evaluate nearby parameter combinations and return the winners by return and Sharpe ratio.
@@ -227,7 +241,7 @@ fn market_maker_grid(
                             markup_percent,
                             bet_size,
                         };
-                        let result = simulate_market_maker(&days, config)?;
+                        let result = simulate_market_maker(&days, config, false)?;
                         if highest_return.as_ref().is_none_or(|candidate| {
                             result.final_value > candidate.result.final_value
                         }) {
@@ -267,15 +281,17 @@ fn market_maker_grid(
 
 // Simulate one market-maker configuration over each parsed trading day.
 fn simulate_market_maker(
-    days: &[Vec<Bar>],
+    days: &[Day],
     config: MarketMakerConfig,
+    log_orders: bool,
 ) -> Result<MarketMakerResult, Box<dyn Error>> {
     // Compound account value across days while retaining each daily return for risk measurement.
     let mut final_value = config.initial_cash;
     let mut daily_returns = Vec::with_capacity(days.len());
-    for bars in days {
+    for day in days {
         let initial_value = final_value;
-        final_value = simulate_market_maker_day(bars, initial_value, config)?;
+        final_value =
+            simulate_market_maker_day(&day.bars, initial_value, config, &day.filename, log_orders)?;
         daily_returns.push(final_value / initial_value - 1.0_f64);
     }
 
@@ -291,8 +307,14 @@ fn simulate_market_maker_day(
     bars: &[Bar],
     initial_value: f64,
     config: MarketMakerConfig,
+    filename: &str,
+    log_orders: bool,
 ) -> Result<f64, Box<dyn Error>> {
     // Start the day with the entire incoming account value available as cash.
+    let logger = MarketMakerLogger {
+        enabled: log_orders,
+        filename,
+    };
     let mut available_cash = initial_value;
     let mut available_shares = 0.0_f64;
     let mut buy_orders = Vec::<LimitOrder>::new();
@@ -312,6 +334,7 @@ fn simulate_market_maker_day(
             let filled_shares = available_shares.min(config.bar_volume_limit);
             available_cash += filled_shares * bar.close;
             available_shares -= filled_shares;
+            logger.liquidation(bar.timestamp, filled_shares, bar.close);
             continue;
         }
 
@@ -339,6 +362,7 @@ fn simulate_market_maker_day(
                 let filled_shares = order.shares.min(config.bar_volume_limit);
                 available_shares += filled_shares;
                 order.shares -= filled_shares;
+                logger.execution(bar.timestamp, "buy", filled_shares, order);
             }
         }
         buy_orders.retain(|order| order.shares > 0.0_f64);
@@ -349,6 +373,7 @@ fn simulate_market_maker_day(
                 let filled_shares = order.shares.min(config.bar_volume_limit);
                 available_cash += filled_shares * order.limit;
                 order.shares -= filled_shares;
+                logger.execution(bar.timestamp, "sell", filled_shares, order);
             }
         }
         sell_orders.retain(|order| order.shares > 0.0_f64);
@@ -371,6 +396,7 @@ fn simulate_market_maker_day(
             available_cash -= buy_shares * buy_limit;
             buy_orders.push(LimitOrder {
                 placed_at: second,
+                placed_timestamp: bar.timestamp,
                 shares: buy_shares,
                 limit: buy_limit,
             });
@@ -381,6 +407,7 @@ fn simulate_market_maker_day(
             let sell_limit = bar.close * (1.0_f64 + config.markup_percent / 100.0_f64);
             sell_orders.push(LimitOrder {
                 placed_at: second,
+                placed_timestamp: bar.timestamp,
                 shares: available_shares,
                 limit: sell_limit,
             });
@@ -399,6 +426,32 @@ fn simulate_market_maker_day(
         available_cash + reserved_cash + (available_shares + reserved_shares) * final_price;
 
     Ok(final_value)
+}
+
+// Format market-maker events only when detailed output is enabled.
+impl MarketMakerLogger<'_> {
+    // Log a full or partial execution with enough information to correlate the order.
+    fn execution(&self, timestamp: i64, side: &str, filled_shares: f64, order: &LimitOrder) {
+        if self.enabled {
+            let filename = self.filename;
+            eprintln!(
+                "[market maker] {filename} @ {timestamp}: Executed {filled_shares} shares of {side} order from timestamp {} @ ${:.2} ({} remaining)",
+                order.placed_timestamp,
+                order.limit,
+                order.shares,
+            );
+        }
+    }
+
+    // Log shares sold directly during the end-of-day liquidation window.
+    fn liquidation(&self, timestamp: i64, shares: f64, price: f64) {
+        if self.enabled && shares > 0.0_f64 {
+            let filename = self.filename;
+            eprintln!(
+                "[market maker] {filename} @ {timestamp}: Executed liquidation sell for {shares} shares @ ${price:.2}",
+            );
+        }
+    }
 }
 
 // Calculate unannualized risk-adjusted return from daily return rates.
@@ -497,12 +550,13 @@ fn print_config_fields(config: MarketMakerConfig) {
 fn parse_days(
     files: &[(PathBuf, String)],
     liquidation_seconds: usize,
-) -> Result<Vec<Vec<Bar>>, Box<dyn Error>> {
+) -> Result<Vec<Day>, Box<dyn Error>> {
     // Preserve sorted day and record order while validating each price.
     let mut days = Vec::with_capacity(files.len());
     for (path, contents) in files {
         let mut reader = csv::Reader::from_reader(contents.as_bytes());
         let headers = reader.headers()?;
+        let timestamp_index = column_index(headers, path, "date")?;
         let low_index = column_index(headers, path, "low")?;
         let high_index = column_index(headers, path, "high")?;
         let close_index = column_index(headers, path, "close")?;
@@ -515,6 +569,11 @@ fn parse_days(
         for (index, record) in records.iter().enumerate() {
             let line = index + 2;
             bars.push(Bar {
+                timestamp: parse_timestamp(
+                    record.get(timestamp_index),
+                    path,
+                    &format!("date on line {line}"),
+                )?,
                 low: parse_price(record.get(low_index), path, &format!("low on line {line}"))?,
                 high: parse_price(
                     record.get(high_index),
@@ -531,13 +590,33 @@ fn parse_days(
                     && index >= liquidation_start,
             });
         }
-        days.push(bars);
+        days.push(Day {
+            filename: path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+            bars,
+        });
     }
     if days.is_empty() {
         return Err("at least one data file is required".into());
     }
 
     Ok(days)
+}
+
+// Parse one required Unix timestamp with a contextual error.
+fn parse_timestamp(
+    value: Option<&str>,
+    path: &std::path::Path,
+    description: &str,
+) -> Result<i64, Box<dyn Error>> {
+    // Reject missing and noninteger timestamps before they reach event logs.
+    let value = value.ok_or_else(|| format!("{} is missing its {description}", path.display()))?;
+    value
+        .parse::<i64>()
+        .map_err(|error| format!("invalid {description} in {}: {error}", path.display()).into())
 }
 
 // Locate one required CSV price column.
@@ -657,7 +736,7 @@ fn parse_percent(value: &str) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, Bar, MarketMakerConfig, Strategy, buy_and_hold, market_maker, market_maker_grid,
+        Args, Bar, Day, MarketMakerConfig, Strategy, buy_and_hold, market_maker, market_maker_grid,
         sharpe_ratio, simulate_market_maker,
     };
     use crate::{Cli, Subcommand};
@@ -732,10 +811,10 @@ mod tests {
         let files = vec![(
             PathBuf::from("prices.csv"),
             concat!(
-                "low,high,close\n",
-                "100,100,100\n",
-                "99,100,100\n",
-                "100,101,100\n",
+                "date,low,high,close\n",
+                "1000,100,100,100\n",
+                "1001,99,100,100\n",
+                "1002,100,101,100\n",
             )
             .to_string(),
         )];
@@ -752,10 +831,10 @@ mod tests {
         let files = vec![(
             PathBuf::from("prices.csv"),
             concat!(
-                "low,high,close\n",
-                "100,100,100\n",
-                "99,100,100\n",
-                "100,101,100\n",
+                "date,low,high,close\n",
+                "1000,100,100,100\n",
+                "1001,99,100,100\n",
+                "1002,100,101,100\n",
             )
             .to_string(),
         )];
@@ -772,11 +851,13 @@ mod tests {
         let files = vec![
             (
                 PathBuf::from("monday.csv"),
-                "low,high,close\n100,100,100\n99,100,100\n100,101,100\n".to_string(),
+                "date,low,high,close\n1000,100,100,100\n1001,99,100,100\n1002,100,101,100\n"
+                    .to_string(),
             ),
             (
                 PathBuf::from("tuesday.csv"),
-                "low,high,close\n100,100,100\n99,100,100\n100,101,100\n".to_string(),
+                "date,low,high,close\n2000,100,100,100\n2001,99,100,100\n2002,100,101,100\n"
+                    .to_string(),
             ),
         ];
         let args = market_maker_args(1_000.0, 3_600, 14_400);
@@ -791,7 +872,7 @@ mod tests {
         // Confirm canceling an expired buy restores its reserved cash.
         let files = vec![(
             PathBuf::from("prices.csv"),
-            "low,high,close\n100,100,100\n200,200,200\n".to_string(),
+            "date,low,high,close\n1000,100,100,100\n1001,200,200,200\n".to_string(),
         )];
         let args = market_maker_args(1_000.0, 0, 14_400);
 
@@ -805,18 +886,21 @@ mod tests {
         // Confirm the liquidation window cancels orders and sells every held share at the close.
         let bars = vec![
             Bar {
+                timestamp: 1_000,
                 low: 100.0,
                 high: 100.0,
                 close: 100.0,
                 liquidate: false,
             },
             Bar {
+                timestamp: 1_001,
                 low: 99.0,
                 high: 100.0,
                 close: 100.0,
                 liquidate: false,
             },
             Bar {
+                timestamp: 1_002,
                 low: 90.0,
                 high: 90.0,
                 close: 90.0,
@@ -834,7 +918,15 @@ mod tests {
             bet_size: 100.0,
         };
 
-        let result = simulate_market_maker(&[bars], config).unwrap();
+        let result = simulate_market_maker(
+            &[Day {
+                filename: "prices.csv".to_string(),
+                bars,
+            }],
+            config,
+            false,
+        )
+        .unwrap();
         assert!((result.final_value - 910.0).abs() < f64::EPSILON);
     }
 
@@ -844,10 +936,10 @@ mod tests {
         let files = vec![(
             PathBuf::from("prices.csv"),
             concat!(
-                "low,high,close\n",
-                "100,100,100\n",
-                "99,100,100\n",
-                "100,102,100\n",
+                "date,low,high,close\n",
+                "1000,100,100,100\n",
+                "1001,99,100,100\n",
+                "1002,100,102,100\n",
             )
             .to_string(),
         )];
@@ -867,18 +959,21 @@ mod tests {
         // Confirm an eligible order needs multiple bars when it exceeds the volume limit.
         let bars = vec![
             Bar {
+                timestamp: 1_000,
                 low: 100.0,
                 high: 100.0,
                 close: 100.0,
                 liquidate: false,
             },
             Bar {
+                timestamp: 1_001,
                 low: 99.0,
                 high: 100.0,
                 close: 100.0,
                 liquidate: false,
             },
             Bar {
+                timestamp: 1_002,
                 low: 100.0,
                 high: 101.0,
                 close: 100.0,
@@ -896,7 +991,15 @@ mod tests {
             bet_size: 100.0,
         };
 
-        let result = simulate_market_maker(&[bars], config).unwrap();
+        let result = simulate_market_maker(
+            &[Day {
+                filename: "prices.csv".to_string(),
+                bars,
+            }],
+            config,
+            false,
+        )
+        .unwrap();
         assert!((result.final_value - 1_010.0).abs() < f64::EPSILON);
     }
 
