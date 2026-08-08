@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.26] - 2026-08-08
+
+### Added
+- Track and print the funds available for opening new positions during live runs.
+
+### Changed
+- Match order status updates to managed orders exclusively by stable permanent IDs.
+
 ## [0.2.25] - 2026-08-07
 
 ### Added
