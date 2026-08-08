@@ -492,15 +492,14 @@ fn update_locked_price(
     Ok(())
 }
 
-// Update one side of the market when a usable price arrives.
+// Update one side of the market, clearing it when the latest price is unusable.
 fn update_price(state: &mut VolatileState, tick_type: &TickType, price: f64) {
-    // Ignore sentinel and otherwise invalid prices reported by the data source.
-    if price > 0.0_f64 {
-        match tick_type {
-            TickType::Bid => state.bid_price = Some(price),
-            TickType::Ask => state.ask_price = Some(price),
-            _ => {}
-        }
+    // Represent sentinel and otherwise invalid prices as unavailable.
+    let price = (price > 0.0_f64).then_some(price);
+    match tick_type {
+        TickType::Bid => state.bid_price = price,
+        TickType::Ask => state.ask_price = price,
+        _ => {}
     }
 }
 
@@ -630,8 +629,8 @@ mod tests {
     }
 
     #[test]
-    fn retain_only_positive_bid_and_ask_prices() {
-        // Confirm valid quote updates replace their side without accepting invalid prices.
+    fn clear_nonpositive_bid_and_ask_prices() {
+        // Confirm unusable quote updates clear previously valid prices on their side.
         let mut state = VolatileState {
             available_funds: None,
             bid_price: None,
@@ -642,8 +641,8 @@ mod tests {
         update_price(&mut state, &TickType::Bid, 0.0);
         update_price(&mut state, &TickType::Ask, f64::NAN);
 
-        assert_eq!(state.bid_price, Some(100.0_f64));
-        assert_eq!(state.ask_price, Some(101.0_f64));
+        assert_eq!(state.bid_price, None);
+        assert_eq!(state.ask_price, None);
     }
 
     #[test]
