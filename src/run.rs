@@ -20,6 +20,8 @@ use uuid::Uuid;
 // These constants configure the instrument and failure recovery.
 const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+const DEFAULT_BUYING_POWER_BUFFER: f64 = 90.0_f64;
+const DEFAULT_INITIAL_MARGIN_REQUIREMENT: f64 = 75.0_f64;
 const ORDER_REF_PREFIX: &str = "stockholm:";
 const SMART_EXCHANGE: &str = "SMART";
 const OVERNIGHT_EXCHANGE: &str = "OVERNIGHT";
@@ -30,6 +32,22 @@ pub struct Args {
     /// Symbol whose live market data should be streamed.
     #[arg(long, default_value = DEFAULT_SYMBOL)]
     symbol: String,
+
+    /// Percentage of equity withheld when calculating buying power.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_BUYING_POWER_BUFFER,
+        value_parser = parse_percent
+    )]
+    buying_power_buffer: f64,
+
+    /// Initial margin requirement as a percentage in the range (0, 100].
+    #[arg(
+        long,
+        default_value_t = DEFAULT_INITIAL_MARGIN_REQUIREMENT,
+        value_parser = parse_positive_percent
+    )]
+    initial_margin_requirement: f64,
 }
 
 // This connection-local state tracks values that do not need to survive a restart.
@@ -37,8 +55,11 @@ struct VolatileState {
     // Details for open orders, keyed by their connection-specific order identifier.
     open_orders: HashMap<i32, VolatileOrder>,
 
-    // The most recently reported funds available for opening new positions.
-    available_funds: Option<f64>,
+    // The most recently reported account equity including loan value.
+    equity_with_loan_value: Option<f64>,
+
+    // The most recently reported initial margin requirement.
+    init_margin_req: Option<f64>,
 
     // The most recently observed bid price, if one is available.
     bid_price: Option<f64>,
@@ -81,6 +102,8 @@ impl Default for Args {
     fn default() -> Self {
         Self {
             symbol: DEFAULT_SYMBOL.to_string(),
+            buying_power_buffer: DEFAULT_BUYING_POWER_BUFFER,
+            initial_margin_requirement: DEFAULT_INITIAL_MARGIN_REQUIREMENT,
         }
     }
 }
@@ -98,9 +121,7 @@ pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<d
         // Connect to the configured TWS or IB Gateway instance for this attempt.
         match Client::connect(address, client_id).await {
             Ok(client) => {
-                if let Err(error) =
-                    run_with_connection(&client, &args.symbol, &persistent_state).await
-                {
+                if let Err(error) = run_with_connection(&client, args, &persistent_state).await {
                     error!("{error}");
                 }
             }
@@ -114,13 +135,14 @@ pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<d
 // Run every control and streaming task concurrently on one connection.
 async fn run_with_connection(
     client: &Client,
-    symbol: &str,
+    args: &Args,
     persistent_state: &RwLock<state::State>,
 ) -> Result<(), Box<dyn Error>> {
     // Start connection-local state without account, quote, or order details.
     let volatile_state = RwLock::new(VolatileState {
         open_orders: HashMap::new(),
-        available_funds: None,
+        equity_with_loan_value: None,
+        init_margin_req: None,
         bid_price: None,
         ask_price: None,
     });
@@ -130,30 +152,40 @@ async fn run_with_connection(
         .switch_market_data_type(MarketDataType::Realtime)
         .await?;
 
-    // Subscribe before reconciling the initial snapshot so intervening updates are buffered.
+    // Subscribe before reconciling initial snapshots so intervening order updates are buffered.
     let order_updates = client.order_update_stream().await?;
     list_orders(client, persistent_state, &volatile_state).await?;
+    list_positions(client).await?;
 
     // Keep every operating loop alive until any one of them requires a reconnect.
     tokio::try_join!(
-        control_loop(client, &volatile_state),
+        control_loop(
+            &volatile_state,
+            args.buying_power_buffer,
+            args.initial_margin_requirement,
+        ),
         stream_account_summary(client, &volatile_state),
-        stream_live_data(client, symbol, &volatile_state),
+        stream_live_data(client, &args.symbol, &volatile_state),
         stream_order_updates(order_updates, persistent_state, &volatile_state),
-        stream_realtime_bars(client, symbol, OVERNIGHT_EXCHANGE),
-        stream_realtime_bars(client, symbol, SMART_EXCHANGE),
+        stream_realtime_bars(client, &args.symbol, OVERNIGHT_EXCHANGE),
+        stream_realtime_bars(client, &args.symbol, SMART_EXCHANGE),
     )?;
 
     Ok(())
 }
 
-// Repeat order-processing steps until one fails.
+// Repeat control steps until one fails.
 async fn control_loop(
-    client: &Client,
     volatile_state: &RwLock<VolatileState>,
+    buying_power_buffer: f64,
+    initial_margin_requirement: f64,
 ) -> Result<(), Box<dyn Error>> {
     loop {
-        run_step(client, volatile_state).await?;
+        run_step(
+            volatile_state,
+            buying_power_buffer,
+            initial_margin_requirement,
+        )?;
         tokio::time::sleep(RUN_DELAY).await;
     }
 }
@@ -176,8 +208,8 @@ async fn stream_account_summary(
     while let Some(update) = summaries.next().await {
         match update? {
             AccountSummaryResult::Summary(summary) => {
-                // Retain valid available-funds updates for use by the control loop.
-                update_available_funds(state, &summary.tag, &summary.value)?;
+                // Retain valid account metrics for use by the control loop.
+                update_account_metric(state, &summary.tag, &summary.value)?;
 
                 if summary.currency.is_empty() {
                     debug!(
@@ -205,20 +237,58 @@ async fn stream_account_summary(
     Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
-// Update available funds from the matching account-summary field.
-fn update_available_funds(state: &RwLock<VolatileState>, tag: &str, value: &str) -> io::Result<()> {
-    // Ignore unrelated, nonnumeric, and nonfinite account-summary values.
-    if tag == AccountSummaryTags::AVAILABLE_FUNDS
-        && let Ok(value) = value.parse::<f64>()
-        && value.is_finite()
-    {
-        let mut state = state
-            .write()
-            .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
-        state.available_funds = Some(value);
+// Update tracked metrics from matching account-summary fields.
+fn update_account_metric(state: &RwLock<VolatileState>, tag: &str, value: &str) -> io::Result<()> {
+    // Ignore nonnumeric and nonfinite account-summary values.
+    let Ok(value) = value.parse::<f64>() else {
+        return Ok(());
+    };
+    if !value.is_finite() {
+        return Ok(());
+    }
+
+    // Ignore unrelated fields and retain recognized metrics.
+    let mut state = state
+        .write()
+        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
+    match tag {
+        AccountSummaryTags::EQUITY_WITH_LOAN_VALUE => state.equity_with_loan_value = Some(value),
+        AccountSummaryTags::INIT_MARGIN_REQ => state.init_margin_req = Some(value),
+        _ => {}
     }
 
     Ok(())
+}
+
+// Parse a finite percentage that is strictly positive and at most one hundred.
+fn parse_positive_percent(value: &str) -> Result<f64, String> {
+    // Reject invalid percentages before they reach the trading control loop.
+    match value.parse::<f64>() {
+        Ok(value) if value > 0.0_f64 && value <= 100.0_f64 => Ok(value),
+        _ => Err("The percentage must be a finite number in the range (0, 100].".to_string()),
+    }
+}
+
+// Parse a finite percentage in the inclusive range from zero to one hundred.
+fn parse_percent(value: &str) -> Result<f64, String> {
+    // Reject invalid percentages before they reach the trading control loop.
+    match value.parse::<f64>() {
+        Ok(value) if (0.0_f64..=100.0_f64).contains(&value) => Ok(value),
+        _ => Err("The percentage must be a finite number in the range [0, 100].".to_string()),
+    }
+}
+
+// Calculate buffered buying power and round it down to the nearest cent.
+fn calculate_buying_power(
+    equity_with_loan_value: f64,
+    init_margin_req: f64,
+    buying_power_buffer: f64,
+    initial_margin_requirement: f64,
+) -> f64 {
+    // Reduce effective equity by the configured buffer before applying the margin ratio.
+    let effective_equity = equity_with_loan_value * (1.0_f64 - buying_power_buffer / 100.0_f64);
+    let margin_capacity = (effective_equity - init_margin_req).max(0.0_f64);
+    (margin_capacity / (initial_margin_requirement / 100.0_f64) * 100.0_f64).floor() / 100.0_f64
 }
 
 // Stream live market data for the configured symbol.
@@ -324,22 +394,33 @@ async fn stream_realtime_bars(
 }
 
 // Run one control-loop step.
-async fn run_step(
-    client: &Client,
+fn run_step(
     volatile_state: &RwLock<VolatileState>,
-) -> Result<(), Box<dyn Error>> {
-    // Fetch the current positions for this step.
-    list_positions(client).await?;
-
-    // Log the latest account and quote snapshot after the positions request finishes.
+    buying_power_buffer: f64,
+    initial_margin_requirement: f64,
+) -> io::Result<()> {
+    // Calculate buying power and log the latest account and quote snapshot.
     let state = volatile_state
         .read()
         .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
-    info!(
-        "Available funds: {}; current bid: {}; current ask: {}",
+    let buying_power =
         state
-            .available_funds
-            .map_or_else(|| "unavailable".to_string(), |funds| funds.to_string()),
+            .equity_with_loan_value
+            .zip(state.init_margin_req)
+            .map(|(equity, margin)| {
+                calculate_buying_power(
+                    equity,
+                    margin,
+                    buying_power_buffer,
+                    initial_margin_requirement,
+                )
+            });
+    info!(
+        "Equity with loan value: {}; buying power: {}; current bid: {}; current ask: {}",
+        state
+            .equity_with_loan_value
+            .map_or_else(|| "unavailable".to_string(), |equity| equity.to_string()),
+        buying_power.map_or_else(|| "unavailable".to_string(), |power| power.to_string()),
         state
             .bid_price
             .map_or_else(|| "unavailable".to_string(), |price| price.to_string()),
@@ -709,7 +790,7 @@ async fn list_positions(client: &Client) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, VolatileState, update_available_funds, update_price};
+    use super::{Args, VolatileState, calculate_buying_power, update_account_metric, update_price};
     use clap::Parser;
     use ibapi::accounts::AccountSummaryTags;
     use ibapi::contracts::tick_types::TickType;
@@ -728,6 +809,8 @@ mod tests {
         let cli = TestCli::try_parse_from(["run"]).unwrap();
 
         assert_eq!(cli.args.symbol, "SOXL");
+        assert!((cli.args.buying_power_buffer - 90.0_f64).abs() < f64::EPSILON);
+        assert!((cli.args.initial_margin_requirement - 75.0_f64).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -739,11 +822,58 @@ mod tests {
     }
 
     #[test]
+    fn validate_initial_margin_requirement() {
+        // Accept both interior and upper-bound percentages while rejecting invalid values.
+        let valid = TestCli::try_parse_from(["run", "--initial-margin-requirement", "100"]);
+        let zero = TestCli::try_parse_from(["run", "--initial-margin-requirement", "0"]);
+        let excessive = TestCli::try_parse_from(["run", "--initial-margin-requirement", "100.1"]);
+        let nonfinite = TestCli::try_parse_from(["run", "--initial-margin-requirement", "NaN"]);
+
+        assert!((valid.unwrap().args.initial_margin_requirement - 100.0_f64).abs() < f64::EPSILON);
+        assert!(zero.is_err());
+        assert!(excessive.is_err());
+        assert!(nonfinite.is_err());
+    }
+
+    #[test]
+    fn validate_buying_power_buffer() {
+        // Accept both buffer boundaries while rejecting out-of-range and nonfinite values.
+        let zero = TestCli::try_parse_from(["run", "--buying-power-buffer", "0"]);
+        let full = TestCli::try_parse_from(["run", "--buying-power-buffer", "100"]);
+        let excessive = TestCli::try_parse_from(["run", "--buying-power-buffer", "100.1"]);
+        let negative = TestCli::try_parse_from(["run", "--buying-power-buffer", "-1"]);
+        let nonfinite = TestCli::try_parse_from(["run", "--buying-power-buffer", "NaN"]);
+
+        assert!(zero.is_ok());
+        assert!(full.is_ok());
+        assert!(excessive.is_err());
+        assert!(negative.is_err());
+        assert!(nonfinite.is_err());
+    }
+
+    #[test]
+    fn buffer_and_round_down_buying_power() {
+        // Apply the equity buffer before the margin formula and floor the result to cents.
+        let buying_power = calculate_buying_power(1_000.0, 100.0, 20.0, 75.0);
+
+        assert!((buying_power - 933.33_f64).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn clamp_negative_buying_power() {
+        // Report zero once existing margin exceeds the buffered margin budget.
+        let buying_power = calculate_buying_power(1_000.0, 900.0, 20.0, 75.0);
+
+        assert!(buying_power.abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn clear_nonpositive_bid_and_ask_prices() {
         // Confirm unusable quote updates clear previously valid prices on their side.
         let mut state = VolatileState {
             open_orders: HashMap::new(),
-            available_funds: None,
+            equity_with_loan_value: None,
+            init_margin_req: None,
             bid_price: None,
             ask_price: None,
         };
@@ -757,18 +887,23 @@ mod tests {
     }
 
     #[test]
-    fn retain_only_valid_available_funds() {
-        // Confirm only finite numeric available-funds summaries update volatile state.
+    fn retain_only_valid_account_metrics() {
+        // Confirm only finite numeric tracked summaries update volatile state.
         let state = RwLock::new(VolatileState {
             open_orders: HashMap::new(),
-            available_funds: None,
+            equity_with_loan_value: None,
+            init_margin_req: None,
             bid_price: None,
             ask_price: None,
         });
-        update_available_funds(&state, AccountSummaryTags::AVAILABLE_FUNDS, "1234.5").unwrap();
-        update_available_funds(&state, AccountSummaryTags::AVAILABLE_FUNDS, "NaN").unwrap();
-        update_available_funds(&state, AccountSummaryTags::NET_LIQUIDATION, "9999").unwrap();
+        update_account_metric(&state, AccountSummaryTags::EQUITY_WITH_LOAN_VALUE, "1234.5")
+            .unwrap();
+        update_account_metric(&state, AccountSummaryTags::INIT_MARGIN_REQ, "234.5").unwrap();
+        update_account_metric(&state, AccountSummaryTags::INIT_MARGIN_REQ, "NaN").unwrap();
+        update_account_metric(&state, AccountSummaryTags::NET_LIQUIDATION, "9999").unwrap();
 
-        assert_eq!(state.read().unwrap().available_funds, Some(1234.5_f64));
+        let state = state.read().unwrap();
+        assert_eq!(state.equity_with_loan_value, Some(1234.5_f64));
+        assert_eq!(state.init_margin_req, Some(234.5_f64));
     }
 }
