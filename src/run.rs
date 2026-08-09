@@ -168,7 +168,7 @@ async fn run_with_connection(
 
     // Subscribe before reconciling the initial snapshot so intervening order updates are buffered.
     let order_updates = client.order_update_stream().await?;
-    list_orders(client, persistent_state, &volatile_state).await?;
+    fetch_orders(client, persistent_state, &volatile_state).await?;
 
     // Keep every operating loop alive until any one of them requires a reconnect.
     tokio::try_join!(
@@ -649,7 +649,7 @@ async fn place_limit_sell(
 }
 
 // Reconcile current open orders placed by Stockholm.
-async fn list_orders(
+async fn fetch_orders(
     client: &Client,
     persistent_state: &RwLock<state::State>,
     volatile_state: &RwLock<VolatileState>,
