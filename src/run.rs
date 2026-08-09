@@ -3,8 +3,8 @@ use clap::Args as ClapArgs;
 use ibapi::{
     Client,
     accounts::{AccountSummaryResult, AccountSummaryTags, PositionUpdate, types::AccountGroup},
-    contracts::{Contract, tick_types::TickType},
-    market_data::{MarketDataType, TradingHours, realtime::TickTypes},
+    contracts::Contract,
+    market_data::IgnoreSize,
     orders::{Action, OrderData, OrderUpdate, Orders},
     prelude::{StreamExt, Subscription, SubscriptionItemStreamExt},
 };
@@ -28,8 +28,6 @@ const BUY_ORDER_TTL: Duration = Duration::hours(1);
 const SELL_ORDER_TTL: Duration = Duration::hours(4);
 const CANCEL_RETRY_DELAY: Duration = Duration::seconds(10);
 const ORDER_REF_PREFIX: &str = "stockholm:";
-const SMART_EXCHANGE: &str = "SMART";
-const OVERNIGHT_EXCHANGE: &str = "OVERNIGHT";
 
 // These arguments configure the trading bot.
 #[derive(ClapArgs)]
@@ -156,11 +154,6 @@ async fn run_with_connection(
         ask_price: None,
     });
 
-    // Configure subsequent requests to use subscribed real-time market data.
-    client
-        .switch_market_data_type(MarketDataType::Realtime)
-        .await?;
-
     // Subscribe before reconciling the initial snapshot so intervening order updates are buffered.
     let order_updates = client.order_update_stream().await?;
     list_orders(client, persistent_state, &volatile_state).await?;
@@ -176,11 +169,9 @@ async fn run_with_connection(
             args.initial_margin_requirement,
         ),
         stream_account_summary(client, &volatile_state),
-        stream_live_data(client, &args.symbol, &volatile_state),
         stream_order_updates(order_updates, persistent_state, &volatile_state),
         stream_positions(client, &args.symbol, &volatile_state),
-        stream_realtime_bars(client, &args.symbol, OVERNIGHT_EXCHANGE),
-        stream_realtime_bars(client, &args.symbol, SMART_EXCHANGE),
+        stream_tick_by_tick(client, &args.symbol, &volatile_state),
     )?;
 
     Ok(())
@@ -256,44 +247,6 @@ async fn stream_account_summary(
     Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
-// Stream live market data for the configured symbol.
-async fn stream_live_data(
-    client: &Client,
-    symbol: &str,
-    state: &RwLock<VolatileState>,
-) -> Result<(), Box<dyn Error>> {
-    // Subscribe to the default SMART-routed contract for consolidated data.
-    let contract = Contract::stock(symbol).build();
-    let subscription = client
-        .market_data(&contract)
-        .streaming()
-        .subscribe()
-        .await?;
-    let mut ticks = subscription.filter_data();
-    debug!("Streaming {symbol} market data…");
-
-    // Process and log every tick while propagating stream failures to the connection loop.
-    while let Some(tick) = ticks.next().await {
-        let tick = tick?;
-
-        // Refresh bid and ask availability from either form of price update.
-        match &tick {
-            TickTypes::Price(tick) => {
-                update_locked_price(state, &tick.tick_type, tick.price)?;
-            }
-            TickTypes::PriceSize(tick) => {
-                update_locked_price(state, &tick.price_tick_type, tick.price)?;
-            }
-            _ => {}
-        }
-
-        // Keep logging the complete market-data stream for visibility.
-        debug!("Market data for {symbol}: {tick:?}");
-    }
-
-    Err(ibapi::Error::UnexpectedEndOfStream.into())
-}
-
 // Stream order updates for the life of the connection.
 async fn stream_order_updates(
     subscription: Subscription<OrderUpdate>,
@@ -364,25 +317,32 @@ async fn stream_positions(
     Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
-// Stream real-time five-second bars for the configured symbol and exchange.
-async fn stream_realtime_bars(
+// Stream tick-by-tick bid and ask prices for the configured symbol.
+async fn stream_tick_by_tick(
     client: &Client,
     symbol: &str,
-    exchange: &str,
+    volatile_state: &RwLock<VolatileState>,
 ) -> Result<(), Box<dyn Error>> {
-    // Subscribe to trade bars for the requested routing venue across all sessions.
-    let contract = Contract::stock(symbol).on_exchange(exchange).build();
+    // Subscribe to an unlimited stream of consolidated quotes without unused sizes.
+    let contract = Contract::stock(symbol).build();
     let subscription = client
-        .realtime_bars(&contract)
-        .trading_hours(TradingHours::Extended)
-        .subscribe()
+        .tick_by_tick(&contract, 0)
+        .bid_ask(IgnoreSize::Yes)
         .await?;
-    let mut bars = subscription.filter_data();
-    debug!("Streaming {symbol} five-second bars from {exchange}…");
+    let mut quotes = subscription.filter_data();
+    debug!("Streaming tick-by-tick quotes for {symbol}…");
 
-    // Log every completed bar and propagate stream failures to the connection loop.
-    while let Some(bar) = bars.next().await {
-        debug!("Five-second bar for {symbol} ({exchange}): {:?}", bar?);
+    // Update both sides atomically and propagate stream failures to the connection loop.
+    while let Some(quote) = quotes.next().await {
+        let quote = quote?;
+        {
+            let mut state = volatile_state
+                .write()
+                .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
+            state.bid_price = (quote.bid_price > 0.0_f64).then_some(quote.bid_price);
+            state.ask_price = (quote.ask_price > 0.0_f64).then_some(quote.ask_price);
+        }
+        debug!("Tick-by-tick quote for {symbol}: {quote:?}");
     }
 
     Err(ibapi::Error::UnexpectedEndOfStream.into())
@@ -850,32 +810,6 @@ fn update_order_status(
     Ok(())
 }
 
-// Update one quote while holding the connection-local state lock briefly.
-fn update_locked_price(
-    state: &RwLock<VolatileState>,
-    tick_type: &TickType,
-    price: f64,
-) -> io::Result<()> {
-    // Fail the connection attempt if another task poisoned the shared state.
-    let mut state = state
-        .write()
-        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
-    update_price(&mut state, tick_type, price);
-
-    Ok(())
-}
-
-// Update one side of the market, clearing it when the latest price is unusable.
-fn update_price(state: &mut VolatileState, tick_type: &TickType, price: f64) {
-    // Represent sentinel and otherwise invalid prices as unavailable.
-    let price = (price > 0.0_f64).then_some(price);
-    match tick_type {
-        TickType::Bid => state.bid_price = price,
-        TickType::Ask => state.ask_price = price,
-        _ => {}
-    }
-}
-
 // Parse a finite percentage that is strictly positive and at most one hundred.
 fn parse_positive_percent(value: &str) -> Result<f64, String> {
     // Reject invalid percentages before they reach the trading control loop.
@@ -958,12 +892,11 @@ mod tests {
     use super::{
         Args, Side, VolatileOrder, VolatileState, calculate_buying_power,
         calculate_open_buy_order_value, calculate_open_sell_shares, cancellation_due,
-        round_down_to_cent, round_up_to_cent, update_account_metric, update_price,
+        round_down_to_cent, round_up_to_cent, update_account_metric,
     };
     use crate::state;
     use clap::Parser;
     use ibapi::accounts::AccountSummaryTags;
-    use ibapi::contracts::tick_types::TickType;
     use std::{collections::HashMap, sync::RwLock};
     use time::{Duration, OffsetDateTime};
 
@@ -1102,26 +1035,6 @@ mod tests {
         order.last_cancelled_at = Some(now - Duration::seconds(10));
         assert!(cancellation_due(&order, Side::Buy, now));
         assert!(!cancellation_due(&order, Side::Sell, now));
-    }
-
-    #[test]
-    fn clear_nonpositive_bid_and_ask_prices() {
-        // Confirm unusable quote updates clear previously valid prices on their side.
-        let mut state = VolatileState {
-            open_orders: HashMap::new(),
-            position_shares: None,
-            equity_with_loan_value: None,
-            init_margin_req: None,
-            bid_price: None,
-            ask_price: None,
-        };
-        update_price(&mut state, &TickType::Bid, 100.0);
-        update_price(&mut state, &TickType::Ask, 101.0);
-        update_price(&mut state, &TickType::Bid, 0.0);
-        update_price(&mut state, &TickType::Ask, f64::NAN);
-
-        assert_eq!(state.bid_price, None);
-        assert_eq!(state.ask_price, None);
     }
 
     #[test]
