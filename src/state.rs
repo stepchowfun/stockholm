@@ -12,9 +12,6 @@ use time::OffsetDateTime;
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenOrder {
-    // The connection-specific order identifier assigned by TWS.
-    pub order_id: i32,
-
     // The stable Stockholm-generated reference attached to the order.
     pub order_ref: String,
 
