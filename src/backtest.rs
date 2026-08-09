@@ -341,22 +341,15 @@ fn simulate_market_maker_day(
         }
 
         // Return resources reserved by orders older than their configured lifetimes.
-        buy_orders.retain(|order| {
-            if bar.timestamp.saturating_sub(order.placed_timestamp) > buy_ttl {
-                available_cash += order.remaining_shares * order.price;
-                false
-            } else {
-                true
-            }
-        });
-        sell_orders.retain(|order| {
-            if bar.timestamp.saturating_sub(order.placed_timestamp) > sell_ttl {
-                available_shares += order.remaining_shares;
-                false
-            } else {
-                true
-            }
-        });
+        expire_market_maker_orders(
+            bar.timestamp,
+            buy_ttl,
+            sell_ttl,
+            &mut available_cash,
+            &mut available_shares,
+            &mut buy_orders,
+            &mut sell_orders,
+        );
 
         // Share one fill budget across every order eligible during this bar.
         let mut remaining_bar_volume = config.bar_volume_limit;
@@ -437,6 +430,37 @@ fn simulate_market_maker_day(
         available_cash + reserved_cash + (available_shares + reserved_shares) * final_price;
 
     Ok(final_value)
+}
+
+// Cancel expired orders and return their reserved resources to the portfolio.
+fn expire_market_maker_orders(
+    timestamp: i64,
+    buy_ttl: i64,
+    sell_ttl: i64,
+    available_cash: &mut f64,
+    available_shares: &mut f64,
+    buy_orders: &mut Vec<LimitOrder>,
+    sell_orders: &mut Vec<LimitOrder>,
+) {
+    // Refund cash reserved by buy orders that have exceeded their lifetime.
+    buy_orders.retain(|order| {
+        if timestamp.saturating_sub(order.placed_timestamp) > buy_ttl {
+            *available_cash += order.remaining_shares * order.price;
+            false
+        } else {
+            true
+        }
+    });
+
+    // Release shares reserved by sell orders that have exceeded their lifetime.
+    sell_orders.retain(|order| {
+        if timestamp.saturating_sub(order.placed_timestamp) > sell_ttl {
+            *available_shares += order.remaining_shares;
+            false
+        } else {
+            true
+        }
+    });
 }
 
 // Total the unfilled shares across a collection of limit orders.
