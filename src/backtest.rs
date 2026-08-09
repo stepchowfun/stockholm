@@ -1,5 +1,6 @@
 use clap::{Args as ClapArgs, ValueEnum};
-use std::{error::Error, fs, path::PathBuf};
+use rayon::prelude::*;
+use std::{error::Error, fs, path::PathBuf, sync::Mutex};
 
 // These strategies can be evaluated by a backtest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -151,6 +152,7 @@ struct MarketMakerResult {
 }
 
 // This result pairs one grid configuration with its simulation statistics.
+#[derive(Clone)]
 struct GridCandidate {
     config: MarketMakerConfig,
     result: MarketMakerResult,
@@ -215,22 +217,22 @@ fn market_maker_grid(
     // Parse the historical days once because every candidate uses identical market data.
     let days = parse_days(files, args.liquidation_seconds)?;
 
-    // Track completed candidates while keeping progress messages separate from CSV output.
-    let candidates_per_ttl_pair =
-        args.discount_percentages.len() * args.markup_percentages.len() * args.bet_sizes.len();
-    let total_candidates = args.buy_ttls.len() * args.sell_ttls.len() * candidates_per_ttl_pair;
-    let mut completed_candidates = 0_usize;
+    // Count the Cartesian product before allocating its configurations.
+    let total_candidates = args.buy_ttls.len()
+        * args.sell_ttls.len()
+        * args.discount_percentages.len()
+        * args.markup_percentages.len()
+        * args.bet_sizes.len();
     eprintln!("Searching {total_candidates} market-maker configurations...");
 
-    // Search the Cartesian product while retaining the first candidate in a tie.
-    let mut highest_return = None::<GridCandidate>;
-    let mut highest_sharpe = None::<GridCandidate>;
+    // Build configurations in search order so winner selection can resolve ties deterministically.
+    let mut configs = Vec::with_capacity(total_candidates);
     for &buy_ttl in &args.buy_ttls {
         for &sell_ttl in &args.sell_ttls {
             for &discount_percent in &args.discount_percentages {
                 for &markup_percent in &args.markup_percentages {
                     for &bet_size in &args.bet_sizes {
-                        let config = MarketMakerConfig {
+                        configs.push(MarketMakerConfig {
                             initial_cash: args.initial_cash,
                             liquidation_seconds: args.liquidation_seconds,
                             bar_volume_limit: args.bar_volume_limit,
@@ -239,37 +241,61 @@ fn market_maker_grid(
                             discount_percent,
                             markup_percent,
                             bet_size,
-                        };
-                        let result = simulate_market_maker(&days, config, false)?;
-                        if highest_return.as_ref().is_none_or(|candidate| {
-                            result.final_value > candidate.result.final_value
-                        }) {
-                            highest_return = Some(GridCandidate {
-                                config,
-                                result: result.clone(),
-                            });
-                        }
-                        if highest_sharpe
-                            .as_ref()
-                            .is_none_or(|candidate| result.sharpe > candidate.result.sharpe)
-                        {
-                            highest_sharpe = Some(GridCandidate { config, result });
-                        }
+                        });
                     }
                 }
             }
-            completed_candidates += candidates_per_ttl_pair;
-            let progress_tenths = 1_000 * completed_candidates / total_candidates;
-            eprintln!(
-                "Searched {completed_candidates}/{total_candidates} configurations ({}.{:01}%)",
-                progress_tenths / 10,
-                progress_tenths % 10,
-            );
         }
     }
 
+    // Evaluate independent candidates in parallel and serialize their ordered progress updates.
+    let completed_candidates = Mutex::new(0_usize);
+    let candidates = configs
+        .par_iter()
+        .map(|&config| {
+            let result =
+                simulate_market_maker(&days, config, false).map_err(|error| error.to_string())?;
+            let mut completed_candidates = completed_candidates
+                .lock()
+                .map_err(|error| format!("failed to lock grid-search progress: {error}"))?;
+            *completed_candidates += 1;
+            if *completed_candidates
+                % (args.discount_percentages.len()
+                    * args.markup_percentages.len()
+                    * args.bet_sizes.len())
+                == 0
+            {
+                let progress_tenths = 1_000 * *completed_candidates / total_candidates;
+                eprintln!(
+                    "Searched {completed_candidates}/{total_candidates} configurations ({}.{:01}%)",
+                    progress_tenths / 10,
+                    progress_tenths % 10,
+                );
+            }
+            Ok(GridCandidate { config, result })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
     // Separate the completed progress display from the winning configurations.
     eprintln!();
+
+    // Search results in configuration order while retaining the first candidate in a tie.
+    let mut highest_return = None::<GridCandidate>;
+    let mut highest_sharpe = None::<GridCandidate>;
+    for candidate in candidates {
+        if highest_return
+            .as_ref()
+            .is_none_or(|highest| candidate.result.final_value > highest.result.final_value)
+        {
+            highest_return = Some(candidate.clone());
+        }
+        if highest_sharpe
+            .as_ref()
+            .is_none_or(|highest| candidate.result.sharpe > highest.result.sharpe)
+        {
+            highest_sharpe = Some(candidate);
+        }
+    }
 
     // Both winners exist whenever the parameter grid contains at least one candidate.
     Ok(GridResult {
