@@ -27,7 +27,7 @@ const BUY_DISCOUNT_PERCENT: f64 = 3.0_f64;
 const SELL_MARKUP_PERCENT: f64 = 1.0_f64;
 const BUY_ORDER_TTL: Duration = Duration::seconds(30);
 const SELL_ORDER_TTL: Duration = Duration::seconds(300);
-const LIQUIDATION_ORDER_TTL: Duration = Duration::seconds(10);
+const LIQUIDATION_SELL_ORDER_TTL: Duration = Duration::seconds(10);
 const CANCEL_RETRY_DELAY: Duration = Duration::seconds(10);
 const ORDER_REF_PREFIX: &str = "stockholm:";
 
@@ -915,7 +915,10 @@ fn cancellation_due(
 ) -> bool {
     // Apply the liquidation lifetime or the normal side-specific lifetime.
     let time_to_live = if liquidating {
-        LIQUIDATION_ORDER_TTL
+        match side {
+            Side::Buy => Duration::ZERO,
+            Side::Sell => LIQUIDATION_SELL_ORDER_TTL,
+        }
     } else {
         match side {
             Side::Buy => BUY_ORDER_TTL,
@@ -1135,9 +1138,8 @@ mod tests {
     }
 
     #[test]
-    fn expire_all_orders_quickly_during_liquidation() {
-        // Give both sides a ten-second lifetime without changing cancellation retries.
-        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(10);
+    fn expire_orders_quickly_during_liquidation() {
+        // Expire buys immediately and sells after ten seconds during liquidation.
         let order = state::OpenOrder {
             order_ref: "stockholm:test".to_string(),
             perm_id: None,
@@ -1145,13 +1147,23 @@ mod tests {
             last_cancelled_at: None,
         };
 
-        assert!(cancellation_due(&order, Side::Buy, true, now));
-        assert!(cancellation_due(&order, Side::Sell, true, now));
+        assert!(cancellation_due(
+            &order,
+            Side::Buy,
+            true,
+            OffsetDateTime::UNIX_EPOCH,
+        ));
         assert!(!cancellation_due(
             &order,
             Side::Sell,
             true,
-            now - Duration::seconds(1),
+            OffsetDateTime::UNIX_EPOCH + Duration::seconds(9),
+        ));
+        assert!(cancellation_due(
+            &order,
+            Side::Sell,
+            true,
+            OffsetDateTime::UNIX_EPOCH + Duration::seconds(10),
         ));
     }
 
