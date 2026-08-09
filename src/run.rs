@@ -14,7 +14,7 @@ use std::{
     io,
     sync::RwLock,
 };
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 // These constants configure trading defaults, routing venues, and failure recovery.
@@ -24,6 +24,9 @@ const DEFAULT_BUYING_POWER_BUFFER: f64 = 10.0_f64;
 const DEFAULT_INITIAL_MARGIN_REQUIREMENT: f64 = 75.0_f64;
 const BUY_DISCOUNT_PERCENT: f64 = 0.25_f64;
 const SELL_MARKUP_PERCENT: f64 = 0.25_f64;
+const BUY_ORDER_TTL: Duration = Duration::hours(1);
+const SELL_ORDER_TTL: Duration = Duration::hours(4);
+const CANCEL_RETRY_DELAY: Duration = Duration::seconds(10);
 const ORDER_REF_PREFIX: &str = "stockholm:";
 const SMART_EXCHANGE: &str = "SMART";
 const OVERNIGHT_EXCHANGE: &str = "OVERNIGHT";
@@ -394,6 +397,9 @@ async fn run_step(
     buying_power_buffer: f64,
     initial_margin_requirement: f64,
 ) -> Result<(), Box<dyn Error>> {
+    // Retry cancellation requests for expired orders before allocating new resources.
+    cancel_expired_orders(client, persistent_state, volatile_state).await?;
+
     // Snapshot resources and quotes without retaining the state lock across submissions.
     let (buying_power, bid_price, ask_price, sellable_shares) = {
         let state = volatile_state
@@ -477,6 +483,52 @@ async fn run_step(
     Ok(())
 }
 
+// Cancel expired orders whose most recent cancellation attempt is old enough to retry.
+async fn cancel_expired_orders(
+    client: &Client,
+    persistent_state: &RwLock<state::State>,
+    volatile_state: &RwLock<VolatileState>,
+) -> Result<(), Box<dyn Error>> {
+    // Join stable references to the order IDs and sides meaningful on this connection.
+    let volatile_orders = volatile_state
+        .read()
+        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?
+        .open_orders
+        .iter()
+        .map(|(&order_id, order)| (order.order_ref.clone(), (order_id, order.side)))
+        .collect::<HashMap<_, _>>();
+
+    // Persist cancellation-attempt timestamps before sending any corresponding requests.
+    let now = OffsetDateTime::now_utc();
+    let cancellation_attempts = {
+        let mut state = persistent_state
+            .write()
+            .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
+        let mut attempts = Vec::new();
+        for order in &mut state.open_orders {
+            let Some(&(order_id, side)) = volatile_orders.get(&order.order_ref) else {
+                continue;
+            };
+            if cancellation_due(order, side, now) {
+                order.last_cancelled_at = Some(now);
+                attempts.push((order_id, order.order_ref.clone()));
+            }
+        }
+        if !attempts.is_empty() {
+            state::save(&state)?;
+        }
+        attempts
+    };
+
+    // Send every due cancellation and leave resources reserved until terminal updates arrive.
+    for (order_id, order_ref) in cancellation_attempts {
+        info!("Cancelling expired order {order_id} ({order_ref})…");
+        let _subscription = client.cancel_order(order_id, "").await?;
+    }
+
+    Ok(())
+}
+
 // Place a limit order to buy the requested number of shares.
 async fn place_limit_buy(
     client: &Client,
@@ -508,6 +560,7 @@ async fn place_limit_buy(
             order_ref: order_ref.clone(),
             perm_id: None,
             created_at: OffsetDateTime::now_utc(),
+            last_cancelled_at: None,
         });
         state::save(&state)?;
     }
@@ -567,6 +620,7 @@ async fn place_limit_sell(
             order_ref: order_ref.clone(),
             perm_id: None,
             created_at: OffsetDateTime::now_utc(),
+            last_cancelled_at: None,
         });
         state::save(&state)?;
     }
@@ -742,6 +796,7 @@ fn update_open_order(
                 order_ref: data.order.order_ref.clone(),
                 perm_id,
                 created_at: OffsetDateTime::now_utc(),
+                last_cancelled_at: None,
             });
             true
         };
@@ -859,6 +914,19 @@ fn calculate_open_sell_shares(open_orders: &HashMap<i32, VolatileOrder>) -> f64 
         .sum()
 }
 
+// Determine whether an open order has expired and is eligible for another cancellation attempt.
+fn cancellation_due(order: &state::OpenOrder, side: Side, now: OffsetDateTime) -> bool {
+    // Apply side-specific lifetimes while spacing repeated cancellation requests.
+    let time_to_live = match side {
+        Side::Buy => BUY_ORDER_TTL,
+        Side::Sell => SELL_ORDER_TTL,
+    };
+    now >= order.created_at + time_to_live
+        && order
+            .last_cancelled_at
+            .is_none_or(|last_cancelled_at| now >= last_cancelled_at + CANCEL_RETRY_DELAY)
+}
+
 // Calculate buffered buying power and round it down to the nearest cent.
 fn calculate_buying_power(
     equity_with_loan_value: f64,
@@ -889,13 +957,15 @@ fn round_up_to_cent(price: f64) -> f64 {
 mod tests {
     use super::{
         Args, Side, VolatileOrder, VolatileState, calculate_buying_power,
-        calculate_open_buy_order_value, calculate_open_sell_shares, round_down_to_cent,
-        round_up_to_cent, update_account_metric, update_price,
+        calculate_open_buy_order_value, calculate_open_sell_shares, cancellation_due,
+        round_down_to_cent, round_up_to_cent, update_account_metric, update_price,
     };
+    use crate::state;
     use clap::Parser;
     use ibapi::accounts::AccountSummaryTags;
     use ibapi::contracts::tick_types::TickType;
     use std::{collections::HashMap, sync::RwLock};
+    use time::{Duration, OffsetDateTime};
 
     // This parser exposes the run arguments for focused tests.
     #[derive(Parser)]
@@ -1013,6 +1083,25 @@ mod tests {
         // Keep buys below and sells above fractional-cent strategy prices.
         assert!((round_down_to_cent(10.129_f64) - 10.12_f64).abs() < f64::EPSILON);
         assert!((round_up_to_cent(10.121_f64) - 10.13_f64).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn retry_expired_order_cancellations() {
+        // Cancel only after the buy lifetime and then at ten-second retry intervals.
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::hours(2);
+        let mut order = state::OpenOrder {
+            order_ref: "stockholm:test".to_string(),
+            perm_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            last_cancelled_at: None,
+        };
+
+        assert!(cancellation_due(&order, Side::Buy, now));
+        order.last_cancelled_at = Some(now - Duration::seconds(9));
+        assert!(!cancellation_due(&order, Side::Buy, now));
+        order.last_cancelled_at = Some(now - Duration::seconds(10));
+        assert!(cancellation_due(&order, Side::Buy, now));
+        assert!(!cancellation_due(&order, Side::Sell, now));
     }
 
     #[test]

@@ -21,6 +21,10 @@ pub struct OpenOrder {
     // The moment the order was created, persisted as a Unix timestamp.
     #[serde(with = "time::serde::timestamp")]
     pub created_at: OffsetDateTime,
+
+    // The most recent cancellation attempt, persisted as a Unix timestamp when present.
+    #[serde(default, with = "time::serde::timestamp::option")]
+    pub last_cancelled_at: Option<OffsetDateTime>,
 }
 
 // The program state persisted by the run subcommand.
@@ -81,4 +85,21 @@ pub fn save(state: &State) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::State;
+
+    #[test]
+    fn load_orders_without_cancellation_timestamps() {
+        // Preserve compatibility with state files written before cancellation retries existed.
+        let state: State = yaml_serde::from_str(
+            "open_orders:\n- order_ref: stockholm:test\n  perm_id: null\n  created_at: 0\n",
+        )
+        .unwrap();
+
+        assert_eq!(state.open_orders.len(), 1);
+        assert_eq!(state.open_orders[0].last_cancelled_at, None);
+    }
 }
