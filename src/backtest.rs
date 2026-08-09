@@ -120,7 +120,7 @@ struct Day {
 struct LimitOrder {
     placed_timestamp: i64,
     price: f64,
-    remaining: f64,
+    remaining_shares: f64,
 }
 
 // This logger adds source context to events from one market-maker trading day.
@@ -327,11 +327,11 @@ fn simulate_market_maker_day(
         if bar.liquidate {
             available_cash += buy_orders
                 .drain(..)
-                .map(|order| order.remaining * order.price)
+                .map(|order| order.remaining_shares * order.price)
                 .sum::<f64>();
             available_shares += sell_orders
                 .drain(..)
-                .map(|order| order.remaining)
+                .map(|order| order.remaining_shares)
                 .sum::<f64>();
             let filled_shares = available_shares.min(config.bar_volume_limit);
             available_cash += filled_shares * bar.close;
@@ -343,7 +343,7 @@ fn simulate_market_maker_day(
         // Return resources reserved by orders older than their configured lifetimes.
         buy_orders.retain(|order| {
             if bar.timestamp.saturating_sub(order.placed_timestamp) > buy_ttl {
-                available_cash += order.remaining * order.price;
+                available_cash += order.remaining_shares * order.price;
                 false
             } else {
                 true
@@ -351,7 +351,7 @@ fn simulate_market_maker_day(
         });
         sell_orders.retain(|order| {
             if bar.timestamp.saturating_sub(order.placed_timestamp) > sell_ttl {
-                available_shares += order.remaining;
+                available_shares += order.remaining_shares;
                 false
             } else {
                 true
@@ -361,31 +361,31 @@ fn simulate_market_maker_day(
         // Partially fill each eligible buy order by at most one bar's configured volume.
         for order in &mut buy_orders {
             if bar.low <= order.price {
-                let filled_shares = order.remaining.min(config.bar_volume_limit);
+                let filled_shares = order.remaining_shares.min(config.bar_volume_limit);
                 available_shares += filled_shares;
-                order.remaining -= filled_shares;
+                order.remaining_shares -= filled_shares;
                 logger.execution(bar.timestamp, "buy", filled_shares, order);
             }
         }
-        buy_orders.retain(|order| order.remaining > 0.0_f64);
+        buy_orders.retain(|order| order.remaining_shares > 0.0_f64);
 
         // Partially fill each eligible sell order by at most one bar's configured volume.
         for order in &mut sell_orders {
             if bar.high >= order.price {
-                let filled_shares = order.remaining.min(config.bar_volume_limit);
+                let filled_shares = order.remaining_shares.min(config.bar_volume_limit);
                 available_cash += filled_shares * order.price;
-                order.remaining -= filled_shares;
+                order.remaining_shares -= filled_shares;
                 logger.execution(bar.timestamp, "sell", filled_shares, order);
             }
         }
-        sell_orders.retain(|order| order.remaining > 0.0_f64);
+        sell_orders.retain(|order| order.remaining_shares > 0.0_f64);
 
         // Keep the configured share of liquidation value available for buying.
         let reserved_cash = buy_orders
             .iter()
-            .map(|order| order.remaining * order.price)
+            .map(|order| order.remaining_shares * order.price)
             .sum::<f64>();
-        let reserved_shares = sell_orders.iter().map(|order| order.remaining).sum::<f64>();
+        let reserved_shares = sum_remaining_shares(&sell_orders);
         let liquidation_value =
             available_cash + reserved_cash + (available_shares + reserved_shares) * bar.close;
         let cash_floor = liquidation_value * (1.0_f64 - config.bet_size / 100.0_f64);
@@ -399,7 +399,7 @@ fn simulate_market_maker_day(
             buy_orders.push(LimitOrder {
                 placed_timestamp: bar.timestamp,
                 price: buy_limit,
-                remaining: buy_shares,
+                remaining_shares: buy_shares,
             });
         }
 
@@ -409,7 +409,7 @@ fn simulate_market_maker_day(
             sell_orders.push(LimitOrder {
                 placed_timestamp: bar.timestamp,
                 price: sell_limit,
-                remaining: available_shares,
+                remaining_shares: available_shares,
             });
             available_shares = 0.0_f64;
         }
@@ -419,13 +419,19 @@ fn simulate_market_maker_day(
     let final_price = bars.last().unwrap().close;
     let reserved_cash = buy_orders
         .iter()
-        .map(|order| order.remaining * order.price)
+        .map(|order| order.remaining_shares * order.price)
         .sum::<f64>();
-    let reserved_shares = sell_orders.iter().map(|order| order.remaining).sum::<f64>();
+    let reserved_shares = sum_remaining_shares(&sell_orders);
     let final_value =
         available_cash + reserved_cash + (available_shares + reserved_shares) * final_price;
 
     Ok(final_value)
+}
+
+// Total the unfilled shares across a collection of limit orders.
+fn sum_remaining_shares(orders: &[LimitOrder]) -> f64 {
+    // Count only the quantity that remains reserved by each order.
+    orders.iter().map(|order| order.remaining_shares).sum()
 }
 
 // Format market-maker events only when detailed output is enabled.
@@ -445,7 +451,7 @@ impl MarketMakerLogger<'_> {
                 side,
                 order.placed_timestamp,
                 order.price,
-                order.remaining,
+                order.remaining_shares,
             );
         }
     }

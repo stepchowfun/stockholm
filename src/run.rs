@@ -58,7 +58,7 @@ struct VolatileState {
     open_orders: HashMap<i32, VolatileOrder>,
 
     // The current position in the configured symbol after its initial snapshot arrives.
-    position: Option<f64>,
+    position_shares: Option<f64>,
 
     // The most recently reported account equity including loan value.
     equity_with_loan_value: Option<f64>,
@@ -89,10 +89,10 @@ struct VolatileOrder {
     side: Side,
 
     // The number of shares filled so far.
-    filled: f64,
+    filled_shares: f64,
 
     // The number of shares still awaiting execution.
-    remaining: f64,
+    remaining_shares: f64,
 }
 
 // This direction distinguishes buy orders from sell orders.
@@ -146,7 +146,7 @@ async fn run_with_connection(
     // Start connection-local state without account, quote, or order details.
     let volatile_state = RwLock::new(VolatileState {
         open_orders: HashMap::new(),
-        position: None,
+        position_shares: None,
         equity_with_loan_value: None,
         init_margin_req: None,
         bid_price: None,
@@ -349,11 +349,11 @@ async fn stream_positions(
             .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
         match update? {
             PositionUpdate::Position(position) if position.contract.symbol == symbol => {
-                state.position = Some(position.position);
+                state.position_shares = Some(position.position);
             }
             PositionUpdate::Position(_) => {}
             PositionUpdate::PositionEnd => {
-                state.position.get_or_insert(0.0_f64);
+                state.position_shares.get_or_insert(0.0_f64);
             }
         }
     }
@@ -415,8 +415,8 @@ async fn run_step(
                 });
         let reserved_sell_shares = calculate_open_sell_shares(&state.open_orders);
         let sellable_shares = state
-            .position
-            .map(|position| (position - reserved_sell_shares).max(0.0_f64).floor());
+            .position_shares
+            .map(|shares| (shares - reserved_sell_shares).max(0.0_f64).floor());
         info!(
             "Equity: {}; buying power: {}; open orders: {}; bid: {}; ask: {}",
             state
@@ -524,8 +524,8 @@ async fn place_limit_buy(
                 symbol: symbol.to_string(),
                 price: limit,
                 side: Side::Buy,
-                filled: 0.0_f64,
-                remaining: shares,
+                filled_shares: 0.0_f64,
+                remaining_shares: shares,
             },
         );
 
@@ -583,8 +583,8 @@ async fn place_limit_sell(
                 symbol: symbol.to_string(),
                 price: limit,
                 side: Side::Sell,
-                filled: 0.0_f64,
-                remaining: shares,
+                filled_shares: 0.0_f64,
+                remaining_shares: shares,
             },
         );
 
@@ -717,8 +717,8 @@ fn update_open_order(
                         ));
                     }
                 },
-                filled: data.order.filled_quantity,
-                remaining: data.order.total_quantity - data.order.filled_quantity,
+                filled_shares: data.order.filled_quantity,
+                remaining_shares: data.order.total_quantity - data.order.filled_quantity,
             },
         );
     }
@@ -758,8 +758,8 @@ fn update_order_status(
     persistent_state: &RwLock<state::State>,
     volatile_state: &RwLock<VolatileState>,
     order_id: i32,
-    filled: f64,
-    remaining: f64,
+    filled_shares: f64,
+    remaining_shares: f64,
     is_terminal: bool,
 ) -> io::Result<()> {
     // Refresh an active order's quantities, or remove and return a terminal order.
@@ -771,8 +771,8 @@ fn update_order_status(
             state.open_orders.remove(&order_id)
         } else {
             if let Some(order) = state.open_orders.get_mut(&order_id) {
-                order.filled = filled;
-                order.remaining = remaining;
+                order.filled_shares = filled_shares;
+                order.remaining_shares = remaining_shares;
             }
             None
         }
@@ -845,7 +845,7 @@ fn calculate_open_buy_order_value(open_orders: &HashMap<i32, VolatileOrder>) -> 
     open_orders
         .values()
         .filter(|order| order.side == Side::Buy)
-        .map(|order| order.price * order.remaining)
+        .map(|order| order.price * order.remaining_shares)
         .sum()
 }
 
@@ -855,7 +855,7 @@ fn calculate_open_sell_shares(open_orders: &HashMap<i32, VolatileOrder>) -> f64 
     open_orders
         .values()
         .filter(|order| order.side == Side::Sell)
-        .map(|order| order.remaining)
+        .map(|order| order.remaining_shares)
         .sum()
 }
 
@@ -987,8 +987,8 @@ mod tests {
                     symbol: "SOXL".to_string(),
                     price: 10.0,
                     side: Side::Buy,
-                    filled: 3.0,
-                    remaining: 2.0,
+                    filled_shares: 3.0,
+                    remaining_shares: 2.0,
                 },
             ),
             (
@@ -998,8 +998,8 @@ mod tests {
                     symbol: "SOXL".to_string(),
                     price: 20.0,
                     side: Side::Sell,
-                    filled: 0.0,
-                    remaining: 4.0,
+                    filled_shares: 0.0,
+                    remaining_shares: 4.0,
                 },
             ),
         ]);
@@ -1020,7 +1020,7 @@ mod tests {
         // Confirm unusable quote updates clear previously valid prices on their side.
         let mut state = VolatileState {
             open_orders: HashMap::new(),
-            position: None,
+            position_shares: None,
             equity_with_loan_value: None,
             init_margin_req: None,
             bid_price: None,
@@ -1040,7 +1040,7 @@ mod tests {
         // Confirm only finite numeric tracked summaries update volatile state.
         let state = RwLock::new(VolatileState {
             open_orders: HashMap::new(),
-            position: None,
+            position_shares: None,
             equity_with_loan_value: None,
             init_margin_req: None,
             bid_price: None,
