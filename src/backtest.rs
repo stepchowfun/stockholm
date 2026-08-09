@@ -24,19 +24,19 @@ pub struct Args {
     #[arg(long, default_value_t = 1_000_000.0, value_parser = parse_positive_f64)]
     initial_cash: f64,
 
-    /// Number of final rows liquidated in each file. Used by both market-maker strategies.
+    /// Seconds before each file's final timestamp when liquidation begins.
     #[arg(long, default_value_t = 900)]
-    liquidation_seconds: usize,
+    liquidation_seconds: u64,
 
     /// Maximum shares of each eligible order filled per bar. Used by both market-maker strategies.
     #[arg(long, default_value_t = 1_000.0, value_parser = parse_positive_f64)]
     bar_volume_limit: f64,
 
-    /// Buy-order lifetime used by market-maker. Ignored by other strategies.
+    /// Buy-order lifetime in elapsed timestamp seconds. Ignored by other strategies.
     #[arg(long, default_value_t = 3_600)]
     buy_ttl: u64,
 
-    /// Sell-order lifetime used by market-maker. Ignored by other strategies.
+    /// Sell-order lifetime in elapsed timestamp seconds. Ignored by other strategies.
     #[arg(long, default_value_t = 14_400)]
     sell_ttl: u64,
 
@@ -52,7 +52,7 @@ pub struct Args {
     #[arg(long, default_value_t = 80.0, value_parser = parse_percent)]
     bet_size: f64,
 
-    /// Buy-order lifetimes searched by market-maker-grid. Ignored by other strategies.
+    /// Buy-order lifetimes in elapsed timestamp seconds searched by market-maker-grid.
     #[arg(
         long,
         value_delimiter = ',',
@@ -61,7 +61,7 @@ pub struct Args {
     )]
     buy_ttls: Vec<u64>,
 
-    /// Sell-order lifetimes searched by market-maker-grid. Ignored by other strategies.
+    /// Sell-order lifetimes in elapsed timestamp seconds searched by market-maker-grid.
     #[arg(
         long,
         value_delimiter = ',',
@@ -101,7 +101,7 @@ pub struct Args {
     bet_sizes: Vec<f64>,
 }
 
-// This bar contains the prices needed to simulate limit-order fills.
+// This bar contains the timestamp and prices needed to simulate order timing and fills.
 struct Bar {
     timestamp: i64,
     low: f64,
@@ -118,7 +118,6 @@ struct Day {
 
 // This order reserves either cash or shares until it fills or expires.
 struct LimitOrder {
-    placed_at: u64,
     placed_timestamp: i64,
     price: f64,
     remaining: f64,
@@ -134,7 +133,7 @@ struct MarketMakerLogger<'a> {
 #[derive(Clone, Copy)]
 struct MarketMakerConfig {
     initial_cash: f64,
-    liquidation_seconds: usize,
+    liquidation_seconds: u64,
     bar_volume_limit: f64,
     buy_ttl: u64,
     sell_ttl: u64,
@@ -319,11 +318,11 @@ fn simulate_market_maker_day(
     let mut available_shares = 0.0_f64;
     let mut buy_orders = Vec::<LimitOrder>::new();
     let mut sell_orders = Vec::<LimitOrder>::new();
+    let buy_ttl = i64::try_from(config.buy_ttl)?;
+    let sell_ttl = i64::try_from(config.sell_ttl)?;
 
-    // Cancel, fill, and replace orders once for every one-second bar.
-    for (second, bar) in bars.iter().enumerate() {
-        let second = u64::try_from(second)?;
-
+    // Cancel, fill, and replace orders once for every chronological bar.
+    for bar in bars {
         // Cancel pending orders and sell up to one bar's volume at the current close.
         if bar.liquidate {
             available_cash += buy_orders
@@ -343,7 +342,7 @@ fn simulate_market_maker_day(
 
         // Return resources reserved by orders older than their configured lifetimes.
         buy_orders.retain(|order| {
-            if second.saturating_sub(order.placed_at) > config.buy_ttl {
+            if bar.timestamp.saturating_sub(order.placed_timestamp) > buy_ttl {
                 available_cash += order.remaining * order.price;
                 false
             } else {
@@ -351,7 +350,7 @@ fn simulate_market_maker_day(
             }
         });
         sell_orders.retain(|order| {
-            if second.saturating_sub(order.placed_at) > config.sell_ttl {
+            if bar.timestamp.saturating_sub(order.placed_timestamp) > sell_ttl {
                 available_shares += order.remaining;
                 false
             } else {
@@ -398,7 +397,6 @@ fn simulate_market_maker_day(
         if buy_shares >= 1.0_f64 {
             available_cash -= buy_shares * buy_limit;
             buy_orders.push(LimitOrder {
-                placed_at: second,
                 placed_timestamp: bar.timestamp,
                 price: buy_limit,
                 remaining: buy_shares,
@@ -409,7 +407,6 @@ fn simulate_market_maker_day(
         if available_shares > 0.0_f64 {
             let sell_limit = bar.close * (1.0_f64 + config.markup_percent / 100.0_f64);
             sell_orders.push(LimitOrder {
-                placed_at: second,
                 placed_timestamp: bar.timestamp,
                 price: sell_limit,
                 remaining: available_shares,
@@ -566,7 +563,7 @@ fn print_config_fields(config: MarketMakerConfig) {
 // Parse the low, high, and closing prices from every input file as one trading day.
 fn parse_days(
     files: &[(PathBuf, String)],
-    liquidation_seconds: usize,
+    liquidation_seconds: u64,
 ) -> Result<Vec<Day>, Box<dyn Error>> {
     // Preserve sorted day and record order while validating each price.
     let mut days = Vec::with_capacity(files.len());
@@ -581,7 +578,6 @@ fn parse_days(
         if records.is_empty() {
             return Err(format!("{} must contain at least one data row", path.display()).into());
         }
-        let liquidation_start = records.len().saturating_sub(liquidation_seconds);
         let mut bars = Vec::with_capacity(records.len());
         for (index, record) in records.iter().enumerate() {
             let line = index + 2;
@@ -602,11 +598,21 @@ fn parse_days(
                     path,
                     &format!("close on line {line}"),
                 )?,
-                liquidate: liquidation_seconds > 0
-                    && records.len() >= liquidation_seconds
-                    && index >= liquidation_start,
+                liquidate: false,
             });
         }
+
+        // Mark bars within the configured elapsed-time window before the final timestamp.
+        let liquidation_seconds = i64::try_from(liquidation_seconds)?;
+        let final_timestamp = bars
+            .last()
+            .ok_or_else(|| format!("{} must contain at least one data row", path.display()))?
+            .timestamp;
+        for bar in &mut bars {
+            bar.liquidate = liquidation_seconds > 0
+                && final_timestamp.saturating_sub(bar.timestamp) < liquidation_seconds;
+        }
+
         days.push(Day {
             filename: path
                 .file_name()
@@ -629,7 +635,7 @@ fn parse_timestamp(
     path: &std::path::Path,
     description: &str,
 ) -> Result<i64, Box<dyn Error>> {
-    // Reject missing and noninteger timestamps before they reach event logs.
+    // Reject missing and noninteger timestamps before they reach simulation timing and logs.
     let value = value.ok_or_else(|| format!("{} is missing its {description}", path.display()))?;
     value
         .parse::<i64>()
@@ -754,7 +760,7 @@ fn parse_percent(value: &str) -> Result<f64, String> {
 mod tests {
     use super::{
         Args, Bar, Day, MarketMakerConfig, Strategy, buy_and_hold, market_maker, market_maker_grid,
-        sharpe_ratio, simulate_market_maker,
+        parse_days, sharpe_ratio, simulate_market_maker,
     };
     use crate::{Cli, Subcommand};
     use clap::Parser;
@@ -803,6 +809,30 @@ mod tests {
         assert_eq!(args.bet_sizes, vec![80.0_f64, 90.0_f64, 100.0_f64]);
         assert_eq!(args.liquidation_seconds, 900);
         assert!((args.bar_volume_limit - 1_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn mark_liquidation_by_elapsed_time() {
+        // Exclude an adjacent row separated from the final bar by more than the time window.
+        let files = vec![(
+            PathBuf::from("prices.csv"),
+            concat!(
+                "date,low,high,close\n",
+                "1000,100,100,100\n",
+                "1001,100,100,100\n",
+                "2000,100,100,100\n",
+            )
+            .to_string(),
+        )];
+
+        let days = parse_days(&files, 10).unwrap();
+        let liquidation_flags = days[0]
+            .bars
+            .iter()
+            .map(|bar| bar.liquidate)
+            .collect::<Vec<_>>();
+
+        assert_eq!(liquidation_flags, vec![false, false, true]);
     }
 
     #[test]
@@ -1048,7 +1078,7 @@ mod tests {
             discount_percentages: vec![0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
             markup_percentages: vec![0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
             bet_sizes: vec![100.0],
-            liquidation_seconds: 900,
+            liquidation_seconds: 0,
             bar_volume_limit: 1_000.0,
         }
     }
