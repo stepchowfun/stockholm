@@ -14,7 +14,8 @@ use std::{
     io,
     sync::RwLock,
 };
-use time::{Duration, OffsetDateTime};
+use time::{Duration, OffsetDateTime, Time};
+use time_tz::{OffsetDateTimeExt, timezones::db::america::NEW_YORK};
 use uuid::Uuid;
 
 // These constants configure trading defaults, routing venues, and failure recovery.
@@ -26,8 +27,19 @@ const BUY_DISCOUNT_PERCENT: f64 = 3.0_f64;
 const SELL_MARKUP_PERCENT: f64 = 1.0_f64;
 const BUY_ORDER_TTL: Duration = Duration::seconds(30);
 const SELL_ORDER_TTL: Duration = Duration::seconds(300);
+const LIQUIDATION_ORDER_TTL: Duration = Duration::seconds(10);
 const CANCEL_RETRY_DELAY: Duration = Duration::seconds(10);
 const ORDER_REF_PREFIX: &str = "stockholm:";
+
+// These Eastern times bound the daily liquidation window across midnight.
+const LIQUIDATION_TIME: Time = match Time::from_hms(15, 45, 0) {
+    Ok(time) => time,
+    Err(_) => panic!("The liquidation time must be valid."),
+};
+const MARKET_OPEN_TIME: Time = match Time::from_hms(9, 30, 0) {
+    Ok(time) => time,
+    Err(_) => panic!("The market-open time must be valid."),
+};
 
 // These arguments configure the trading bot.
 #[derive(ClapArgs)]
@@ -357,8 +369,18 @@ async fn run_step(
     buying_power_buffer: f64,
     initial_margin_requirement: f64,
 ) -> Result<(), Box<dyn Error>> {
-    // Retry cancellation requests for expired orders before allocating new resources.
-    cancel_expired_orders(client, persistent_state, volatile_state).await?;
+    // Select order lifetimes and trading behavior from the current Eastern time.
+    let now = OffsetDateTime::now_utc();
+    let liquidating = is_liquidating(now);
+    cancel_expired_orders(
+        client,
+        persistent_state,
+        volatile_state,
+        symbol,
+        liquidating,
+        now,
+    )
+    .await?;
 
     // Snapshot resources and quotes without retaining the state lock across submissions.
     let (buying_power, bid_price, ask_price, sellable_shares) = {
@@ -379,7 +401,7 @@ async fn run_step(
                         open_buy_order_value,
                     )
                 });
-        let reserved_sell_shares = calculate_open_sell_shares(&state.open_orders);
+        let reserved_sell_shares = calculate_open_sell_shares(&state.open_orders, symbol);
         let sellable_shares = state
             .position_shares
             .map(|shares| (shares - reserved_sell_shares).max(0.0_f64).floor());
@@ -405,39 +427,41 @@ async fn run_step(
         )
     };
 
-    // Use all available buying power for one whole-share discounted limit order.
-    if let (Some(buying_power), Some(bid_price)) = (buying_power, bid_price) {
-        let limit = round_down_to_cent(bid_price * (1.0_f64 - BUY_DISCOUNT_PERCENT / 100.0_f64));
-        if limit > 0.0_f64 {
-            let shares = (buying_power / limit).floor();
-            if shares >= 1.0_f64 {
-                place_limit_buy(
-                    client,
-                    symbol,
-                    shares,
-                    limit,
-                    persistent_state,
-                    volatile_state,
-                )
-                .await?;
-            }
-        }
-    }
+    // Choose ordinary market-making limits or a liquidation limit at the bid.
+    let (buy_limit, sell_limit) = calculate_order_limits(bid_price, ask_price, liquidating);
 
-    // Offer shares only after the initial position snapshot establishes inventory.
-    if let (Some(ask_price), Some(sellable_shares)) = (ask_price, sellable_shares) {
-        let limit = round_up_to_cent(ask_price * (1.0_f64 + SELL_MARKUP_PERCENT / 100.0_f64));
-        if sellable_shares > 0.0_f64 {
-            place_limit_sell(
+    // Use all available buying power for one whole-share discounted limit order.
+    if let (Some(buying_power), Some(limit)) = (buying_power, buy_limit)
+        && limit > 0.0_f64
+    {
+        let shares = (buying_power / limit).floor();
+        if shares >= 1.0_f64 {
+            place_limit_buy(
                 client,
                 symbol,
-                sellable_shares,
+                shares,
                 limit,
                 persistent_state,
                 volatile_state,
             )
             .await?;
         }
+    }
+
+    // Offer shares only after the initial position snapshot establishes inventory.
+    if let (Some(limit), Some(sellable_shares)) = (sell_limit, sellable_shares)
+        && limit > 0.0_f64
+        && sellable_shares > 0.0_f64
+    {
+        place_limit_sell(
+            client,
+            symbol,
+            sellable_shares,
+            limit,
+            persistent_state,
+            volatile_state,
+        )
+        .await?;
     }
 
     Ok(())
@@ -448,30 +472,38 @@ async fn cancel_expired_orders(
     client: &Client,
     persistent_state: &RwLock<state::State>,
     volatile_state: &RwLock<VolatileState>,
+    symbol: &str,
+    liquidating: bool,
+    now: OffsetDateTime,
 ) -> Result<(), Box<dyn Error>> {
-    // Join stable references to the order IDs and sides meaningful on this connection.
+    // Join stable references to the connection-specific details used for expiration.
     let volatile_orders = volatile_state
         .read()
         .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?
         .open_orders
         .iter()
-        .map(|(&order_id, order)| (order.order_ref.clone(), (order_id, order.side)))
+        .map(|(&order_id, order)| {
+            (
+                order.order_ref.clone(),
+                (order_id, order.side, order.symbol.clone()),
+            )
+        })
         .collect::<HashMap<_, _>>();
 
     // Persist cancellation-attempt timestamps before sending any corresponding requests.
-    let now = OffsetDateTime::now_utc();
     let cancellation_attempts = {
         let mut state = persistent_state
             .write()
             .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
         let mut attempts = Vec::new();
         for order in &mut state.open_orders {
-            let Some(&(order_id, side)) = volatile_orders.get(&order.order_ref) else {
+            let Some((order_id, side, order_symbol)) = volatile_orders.get(&order.order_ref) else {
                 continue;
             };
-            if cancellation_due(order, side, now) {
+            let liquidation_order = liquidating && order_symbol == symbol;
+            if cancellation_due(order, *side, liquidation_order, now) {
                 order.last_cancelled_at = Some(now);
-                attempts.push((order_id, order.order_ref.clone()));
+                attempts.push((*order_id, order.order_ref.clone()));
             }
         }
         if !attempts.is_empty() {
@@ -487,6 +519,13 @@ async fn cancel_expired_orders(
     }
 
     Ok(())
+}
+
+// Determine whether the Eastern clock is inside the overnight liquidation window.
+fn is_liquidating(now: OffsetDateTime) -> bool {
+    let eastern_time = now.to_timezone(NEW_YORK).time();
+
+    eastern_time >= LIQUIDATION_TIME || eastern_time < MARKET_OPEN_TIME
 }
 
 // Place a limit order to buy the requested number of shares.
@@ -839,22 +878,52 @@ fn calculate_open_buy_order_value(open_orders: &HashMap<i32, VolatileOrder>) -> 
 }
 
 // Total the shares still reserved by active sell orders.
-fn calculate_open_sell_shares(open_orders: &HashMap<i32, VolatileOrder>) -> f64 {
-    // Exclude filled quantities because current positions already reflect their execution.
+fn calculate_open_sell_shares(open_orders: &HashMap<i32, VolatileOrder>, symbol: &str) -> f64 {
+    // Reserve only matching unfilled sells because positions are tracked per symbol.
     open_orders
         .values()
-        .filter(|order| order.side == Side::Sell)
+        .filter(|order| order.symbol == symbol && order.side == Side::Sell)
         .map(|order| order.remaining_shares)
         .sum()
 }
 
+// Calculate the limits used by the current normal or liquidation behavior.
+fn calculate_order_limits(
+    bid_price: Option<f64>,
+    ask_price: Option<f64>,
+    liquidating: bool,
+) -> (Option<f64>, Option<f64>) {
+    if liquidating {
+        (None, bid_price.map(round_down_to_cent))
+    } else {
+        (
+            bid_price.map(|price| {
+                round_down_to_cent(price * (1.0_f64 - BUY_DISCOUNT_PERCENT / 100.0_f64))
+            }),
+            ask_price
+                .map(|price| round_up_to_cent(price * (1.0_f64 + SELL_MARKUP_PERCENT / 100.0_f64))),
+        )
+    }
+}
+
 // Determine whether an open order has expired and is eligible for another cancellation attempt.
-fn cancellation_due(order: &state::OpenOrder, side: Side, now: OffsetDateTime) -> bool {
-    // Apply side-specific lifetimes while spacing repeated cancellation requests.
-    let time_to_live = match side {
-        Side::Buy => BUY_ORDER_TTL,
-        Side::Sell => SELL_ORDER_TTL,
+fn cancellation_due(
+    order: &state::OpenOrder,
+    side: Side,
+    liquidating: bool,
+    now: OffsetDateTime,
+) -> bool {
+    // Apply the liquidation lifetime or the normal side-specific lifetime.
+    let time_to_live = if liquidating {
+        LIQUIDATION_ORDER_TTL
+    } else {
+        match side {
+            Side::Buy => BUY_ORDER_TTL,
+            Side::Sell => SELL_ORDER_TTL,
+        }
     };
+
+    // Space repeated cancellation requests even after the order has expired.
     now >= order.created_at + time_to_live
         && order
             .last_cancelled_at
@@ -891,20 +960,30 @@ fn round_up_to_cent(price: f64) -> f64 {
 mod tests {
     use super::{
         Args, Side, VolatileOrder, VolatileState, calculate_buying_power,
-        calculate_open_buy_order_value, calculate_open_sell_shares, cancellation_due,
-        round_down_to_cent, round_up_to_cent, update_account_metric,
+        calculate_open_buy_order_value, calculate_open_sell_shares, calculate_order_limits,
+        cancellation_due, is_liquidating, round_down_to_cent, round_up_to_cent,
+        update_account_metric,
     };
     use crate::state;
     use clap::Parser;
     use ibapi::accounts::AccountSummaryTags;
     use std::{collections::HashMap, sync::RwLock};
-    use time::{Duration, OffsetDateTime};
+    use time::{Date, Duration, Month, OffsetDateTime};
 
     // This parser exposes the run arguments for focused tests.
     #[derive(Parser)]
     struct TestCli {
         #[command(flatten)]
         args: Args,
+    }
+
+    // Construct UTC test instants without relying on formatter-sensitive macros.
+    fn utc_datetime(month: Month, day: u8, hour: u8, minute: u8, second: u8) -> OffsetDateTime {
+        Date::from_calendar_date(2026, month, day)
+            .unwrap()
+            .with_hms(hour, minute, second)
+            .unwrap()
+            .assume_utc()
     }
 
     #[test]
@@ -1008,7 +1087,25 @@ mod tests {
         ]);
 
         assert!((calculate_open_buy_order_value(&open_orders) - 20.0_f64).abs() < f64::EPSILON);
-        assert!((calculate_open_sell_shares(&open_orders) - 4.0_f64).abs() < f64::EPSILON);
+        assert!((calculate_open_sell_shares(&open_orders, "SOXL") - 4.0_f64).abs() < f64::EPSILON);
+        assert!(calculate_open_sell_shares(&open_orders, "AAPL").abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn select_limits_for_current_trading_behavior() {
+        // Suppress buys and cross the spread only while liquidating.
+        assert_eq!(
+            calculate_order_limits(Some(10.129_f64), Some(10.231_f64), false),
+            (Some(9.82_f64), Some(10.34_f64)),
+        );
+        assert_eq!(
+            calculate_order_limits(Some(10.129_f64), Some(10.231_f64), true),
+            (None, Some(10.12_f64)),
+        );
+        assert_eq!(
+            calculate_order_limits(None, Some(10.231_f64), true),
+            (None, None),
+        );
     }
 
     #[test]
@@ -1029,12 +1126,44 @@ mod tests {
             last_cancelled_at: None,
         };
 
-        assert!(cancellation_due(&order, Side::Buy, now));
+        assert!(cancellation_due(&order, Side::Buy, false, now));
         order.last_cancelled_at = Some(now - Duration::seconds(9));
-        assert!(!cancellation_due(&order, Side::Buy, now));
+        assert!(!cancellation_due(&order, Side::Buy, false, now));
         order.last_cancelled_at = Some(now - Duration::seconds(10));
-        assert!(cancellation_due(&order, Side::Buy, now));
-        assert!(!cancellation_due(&order, Side::Sell, now));
+        assert!(cancellation_due(&order, Side::Buy, false, now));
+        assert!(!cancellation_due(&order, Side::Sell, false, now));
+    }
+
+    #[test]
+    fn expire_all_orders_quickly_during_liquidation() {
+        // Give both sides a ten-second lifetime without changing cancellation retries.
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(10);
+        let order = state::OpenOrder {
+            order_ref: "stockholm:test".to_string(),
+            perm_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            last_cancelled_at: None,
+        };
+
+        assert!(cancellation_due(&order, Side::Buy, true, now));
+        assert!(cancellation_due(&order, Side::Sell, true, now));
+        assert!(!cancellation_due(
+            &order,
+            Side::Sell,
+            true,
+            now - Duration::seconds(1),
+        ));
+    }
+
+    #[test]
+    fn liquidate_between_afternoon_cutoff_and_market_open() {
+        // Compare Eastern wall-clock boundaries in both daylight and standard time.
+        assert!(!is_liquidating(utc_datetime(Month::August, 10, 19, 44, 59)));
+        assert!(is_liquidating(utc_datetime(Month::August, 10, 19, 45, 0)));
+        assert!(is_liquidating(utc_datetime(Month::August, 11, 13, 29, 59)));
+        assert!(!is_liquidating(utc_datetime(Month::August, 11, 13, 30, 0)));
+        assert!(!is_liquidating(utc_datetime(Month::January, 9, 20, 44, 59)));
+        assert!(is_liquidating(utc_datetime(Month::January, 9, 20, 45, 0)));
     }
 
     #[test]
