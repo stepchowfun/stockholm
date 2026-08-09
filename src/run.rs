@@ -2,7 +2,7 @@ use crate::{DEFAULT_SYMBOL, state};
 use clap::Args as ClapArgs;
 use ibapi::{
     Client,
-    accounts::{AccountSummaryResult, AccountSummaryTags, types::AccountGroup},
+    accounts::{AccountSummaryResult, AccountSummaryTags, PositionUpdate, types::AccountGroup},
     contracts::{Contract, tick_types::TickType},
     market_data::{MarketDataType, TradingHours, realtime::TickTypes},
     orders::{Action, OrderData, OrderUpdate, Orders},
@@ -22,6 +22,8 @@ const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 const DEFAULT_BUYING_POWER_BUFFER: f64 = 10.0_f64;
 const DEFAULT_INITIAL_MARGIN_REQUIREMENT: f64 = 75.0_f64;
+const BUY_DISCOUNT_PERCENT: f64 = 0.25_f64;
+const SELL_MARKUP_PERCENT: f64 = 0.25_f64;
 const ORDER_REF_PREFIX: &str = "stockholm:";
 const SMART_EXCHANGE: &str = "SMART";
 const OVERNIGHT_EXCHANGE: &str = "OVERNIGHT";
@@ -54,6 +56,9 @@ pub struct Args {
 struct VolatileState {
     // Details for open orders, keyed by their connection-specific order identifier.
     open_orders: HashMap<i32, VolatileOrder>,
+
+    // The current position in the configured symbol after its initial snapshot arrives.
+    position: Option<f64>,
 
     // The most recently reported account equity including loan value.
     equity_with_loan_value: Option<f64>,
@@ -141,6 +146,7 @@ async fn run_with_connection(
     // Start connection-local state without account, quote, or order details.
     let volatile_state = RwLock::new(VolatileState {
         open_orders: HashMap::new(),
+        position: None,
         equity_with_loan_value: None,
         init_margin_req: None,
         bid_price: None,
@@ -159,13 +165,17 @@ async fn run_with_connection(
     // Keep every operating loop alive until any one of them requires a reconnect.
     tokio::try_join!(
         control_loop(
+            client,
+            persistent_state,
             &volatile_state,
+            &args.symbol,
             args.buying_power_buffer,
             args.initial_margin_requirement,
         ),
         stream_account_summary(client, &volatile_state),
         stream_live_data(client, &args.symbol, &volatile_state),
         stream_order_updates(order_updates, persistent_state, &volatile_state),
+        stream_positions(client, &args.symbol, &volatile_state),
         stream_realtime_bars(client, &args.symbol, OVERNIGHT_EXCHANGE),
         stream_realtime_bars(client, &args.symbol, SMART_EXCHANGE),
     )?;
@@ -175,16 +185,23 @@ async fn run_with_connection(
 
 // Repeat control steps until one fails.
 async fn control_loop(
+    client: &Client,
+    persistent_state: &RwLock<state::State>,
     volatile_state: &RwLock<VolatileState>,
+    symbol: &str,
     buying_power_buffer: f64,
     initial_margin_requirement: f64,
 ) -> Result<(), Box<dyn Error>> {
     loop {
         run_step(
+            client,
+            persistent_state,
             volatile_state,
+            symbol,
             buying_power_buffer,
             initial_margin_requirement,
-        )?;
+        )
+        .await?;
         tokio::time::sleep(RUN_DELAY).await;
     }
 }
@@ -314,6 +331,36 @@ async fn stream_order_updates(
     Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
+// Stream positions for the configured symbol for the life of the connection.
+async fn stream_positions(
+    client: &Client,
+    symbol: &str,
+    volatile_state: &RwLock<VolatileState>,
+) -> Result<(), Box<dyn Error>> {
+    // Subscribe to an initial snapshot followed by incremental position updates.
+    let subscription = client.positions().await?;
+    let mut updates = subscription.filter_data();
+    debug!("Streaming positions for {symbol}…");
+
+    // Retain the matching position and use zero when the initial snapshot omits the symbol.
+    while let Some(update) = updates.next().await {
+        let mut state = volatile_state
+            .write()
+            .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
+        match update? {
+            PositionUpdate::Position(position) if position.contract.symbol == symbol => {
+                state.position = Some(position.position);
+            }
+            PositionUpdate::Position(_) => {}
+            PositionUpdate::PositionEnd => {
+                state.position.get_or_insert(0.0_f64);
+            }
+        }
+    }
+
+    Err(ibapi::Error::UnexpectedEndOfStream.into())
+}
+
 // Stream real-time five-second bars for the configured symbol and exchange.
 async fn stream_realtime_bars(
     client: &Client,
@@ -338,54 +385,103 @@ async fn stream_realtime_bars(
     Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
-// Run one control-loop step.
-fn run_step(
+// Run one control-loop step and submit orders for currently available resources.
+async fn run_step(
+    client: &Client,
+    persistent_state: &RwLock<state::State>,
     volatile_state: &RwLock<VolatileState>,
+    symbol: &str,
     buying_power_buffer: f64,
     initial_margin_requirement: f64,
-) -> io::Result<()> {
-    // Calculate buying power and log the latest account, order, and quote snapshot.
-    let state = volatile_state
-        .read()
-        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
-    let open_buy_order_value = calculate_open_buy_order_value(&state.open_orders);
-    let buying_power =
-        state
-            .equity_with_loan_value
-            .zip(state.init_margin_req)
-            .map(|(equity, margin)| {
-                calculate_buying_power(
-                    equity,
-                    margin,
-                    buying_power_buffer,
-                    initial_margin_requirement,
-                    open_buy_order_value,
+) -> Result<(), Box<dyn Error>> {
+    // Snapshot resources and quotes without retaining the state lock across submissions.
+    let (buying_power, bid_price, ask_price, sellable_shares) = {
+        let state = volatile_state
+            .read()
+            .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
+        let open_buy_order_value = calculate_open_buy_order_value(&state.open_orders);
+        let buying_power =
+            state
+                .equity_with_loan_value
+                .zip(state.init_margin_req)
+                .map(|(equity, margin)| {
+                    calculate_buying_power(
+                        equity,
+                        margin,
+                        buying_power_buffer,
+                        initial_margin_requirement,
+                        open_buy_order_value,
+                    )
+                });
+        let reserved_sell_shares = calculate_open_sell_shares(&state.open_orders);
+        let sellable_shares = state
+            .position
+            .map(|position| (position - reserved_sell_shares).max(0.0_f64).floor());
+        info!(
+            "Equity: {}; buying power: {}; open orders: {}; bid: {}; ask: {}",
+            state
+                .equity_with_loan_value
+                .map_or_else(|| "unavailable".to_string(), |equity| equity.to_string()),
+            buying_power.map_or_else(|| "unavailable".to_string(), |power| power.to_string()),
+            state.open_orders.len(),
+            state
+                .bid_price
+                .map_or_else(|| "unavailable".to_string(), |price| price.to_string()),
+            state
+                .ask_price
+                .map_or_else(|| "unavailable".to_string(), |price| price.to_string()),
+        );
+        (
+            buying_power,
+            state.bid_price,
+            state.ask_price,
+            sellable_shares,
+        )
+    };
+
+    // Use all available buying power for one whole-share discounted limit order.
+    if let (Some(buying_power), Some(bid_price)) = (buying_power, bid_price) {
+        let limit = round_down_to_cent(bid_price * (1.0_f64 - BUY_DISCOUNT_PERCENT / 100.0_f64));
+        if limit > 0.0_f64 {
+            let shares = (buying_power / limit).floor();
+            if shares >= 1.0_f64 {
+                place_limit_buy(
+                    client,
+                    symbol,
+                    shares,
+                    limit,
+                    persistent_state,
+                    volatile_state,
                 )
-            });
-    info!(
-        "Equity: {}; buying power: {}; open orders: {}; bid: {}; ask: {}",
-        state
-            .equity_with_loan_value
-            .map_or_else(|| "unavailable".to_string(), |equity| equity.to_string()),
-        buying_power.map_or_else(|| "unavailable".to_string(), |power| power.to_string()),
-        state.open_orders.len(),
-        state
-            .bid_price
-            .map_or_else(|| "unavailable".to_string(), |price| price.to_string()),
-        state
-            .ask_price
-            .map_or_else(|| "unavailable".to_string(), |price| price.to_string()),
-    );
+                .await?;
+            }
+        }
+    }
+
+    // Offer shares only after the initial position snapshot establishes inventory.
+    if let (Some(ask_price), Some(sellable_shares)) = (ask_price, sellable_shares) {
+        let limit = round_up_to_cent(ask_price * (1.0_f64 + SELL_MARKUP_PERCENT / 100.0_f64));
+        if sellable_shares > 0.0_f64 {
+            place_limit_sell(
+                client,
+                symbol,
+                sellable_shares,
+                limit,
+                persistent_state,
+                volatile_state,
+            )
+            .await?;
+        }
+    }
 
     Ok(())
 }
 
 // Place a limit order to buy the requested number of shares.
-#[allow(dead_code)]
 async fn place_limit_buy(
     client: &Client,
     symbol: &str,
-    shares: i32,
+    shares: f64,
     limit: f64,
     persistent_state: &RwLock<state::State>,
     volatile_state: &RwLock<VolatileState>,
@@ -429,7 +525,7 @@ async fn place_limit_buy(
                 price: limit,
                 side: Side::Buy,
                 filled: 0.0_f64,
-                remaining: f64::from(shares),
+                remaining: shares,
             },
         );
 
@@ -441,11 +537,10 @@ async fn place_limit_buy(
 }
 
 // Place a limit order to sell the requested number of shares.
-#[allow(dead_code)]
 async fn place_limit_sell(
     client: &Client,
     symbol: &str,
-    shares: i32,
+    shares: f64,
     limit: f64,
     persistent_state: &RwLock<state::State>,
     volatile_state: &RwLock<VolatileState>,
@@ -489,7 +584,7 @@ async fn place_limit_sell(
                 price: limit,
                 side: Side::Sell,
                 filled: 0.0_f64,
-                remaining: f64::from(shares),
+                remaining: shares,
             },
         );
 
@@ -754,6 +849,16 @@ fn calculate_open_buy_order_value(open_orders: &HashMap<i32, VolatileOrder>) -> 
         .sum()
 }
 
+// Total the shares still reserved by active sell orders.
+fn calculate_open_sell_shares(open_orders: &HashMap<i32, VolatileOrder>) -> f64 {
+    // Exclude filled quantities because current positions already reflect their execution.
+    open_orders
+        .values()
+        .filter(|order| order.side == Side::Sell)
+        .map(|order| order.remaining)
+        .sum()
+}
+
 // Calculate buffered buying power and round it down to the nearest cent.
 fn calculate_buying_power(
     equity_with_loan_value: f64,
@@ -767,14 +872,25 @@ fn calculate_buying_power(
     let effective_equity = equity_with_loan_value * (1.0_f64 - buying_power_buffer / 100.0_f64);
     let open_buy_order_margin = open_buy_order_value * margin_ratio;
     let margin_capacity = (effective_equity - init_margin_req - open_buy_order_margin).max(0.0_f64);
-    (margin_capacity / margin_ratio * 100.0_f64).floor() / 100.0_f64
+    round_down_to_cent(margin_capacity / margin_ratio)
+}
+
+// Round a positive limit price down to an accepted cent boundary.
+fn round_down_to_cent(price: f64) -> f64 {
+    (price * 100.0_f64).floor() / 100.0_f64
+}
+
+// Round a positive limit price up to an accepted cent boundary.
+fn round_up_to_cent(price: f64) -> f64 {
+    (price * 100.0_f64).ceil() / 100.0_f64
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         Args, Side, VolatileOrder, VolatileState, calculate_buying_power,
-        calculate_open_buy_order_value, update_account_metric, update_price,
+        calculate_open_buy_order_value, calculate_open_sell_shares, round_down_to_cent,
+        round_up_to_cent, update_account_metric, update_price,
     };
     use clap::Parser;
     use ibapi::accounts::AccountSummaryTags;
@@ -889,6 +1005,14 @@ mod tests {
         ]);
 
         assert!((calculate_open_buy_order_value(&open_orders) - 20.0_f64).abs() < f64::EPSILON);
+        assert!((calculate_open_sell_shares(&open_orders) - 4.0_f64).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn round_limit_prices_conservatively() {
+        // Keep buys below and sells above fractional-cent strategy prices.
+        assert!((round_down_to_cent(10.129_f64) - 10.12_f64).abs() < f64::EPSILON);
+        assert!((round_up_to_cent(10.121_f64) - 10.13_f64).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -896,6 +1020,7 @@ mod tests {
         // Confirm unusable quote updates clear previously valid prices on their side.
         let mut state = VolatileState {
             open_orders: HashMap::new(),
+            position: None,
             equity_with_loan_value: None,
             init_margin_req: None,
             bid_price: None,
@@ -915,6 +1040,7 @@ mod tests {
         // Confirm only finite numeric tracked summaries update volatile state.
         let state = RwLock::new(VolatileState {
             open_orders: HashMap::new(),
+            position: None,
             equity_with_loan_value: None,
             init_margin_req: None,
             bid_price: None,
