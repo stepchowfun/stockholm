@@ -361,7 +361,7 @@ fn run_step(
                 )
             });
     info!(
-        "Equity with loan value: {}; buying power: {}; open orders: {}; current bid: {}; current ask: {}",
+        "Equity: {}; buying power: {}; open orders: {}; bid: {}; ask: {}",
         state
             .equity_with_loan_value
             .map_or_else(|| "unavailable".to_string(), |equity| equity.to_string()),
