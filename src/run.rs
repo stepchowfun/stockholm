@@ -20,7 +20,7 @@ use uuid::Uuid;
 // These constants configure trading defaults, routing venues, and failure recovery.
 const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
-const DEFAULT_BUYING_POWER_BUFFER: f64 = 90.0_f64;
+const DEFAULT_BUYING_POWER_BUFFER: f64 = 10.0_f64;
 const DEFAULT_INITIAL_MARGIN_REQUIREMENT: f64 = 75.0_f64;
 const ORDER_REF_PREFIX: &str = "stockholm:";
 const SMART_EXCHANGE: &str = "SMART";
@@ -348,6 +348,7 @@ fn run_step(
     let state = volatile_state
         .read()
         .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
+    let open_buy_order_value = calculate_open_buy_order_value(&state.open_orders);
     let buying_power =
         state
             .equity_with_loan_value
@@ -358,6 +359,7 @@ fn run_step(
                     margin,
                     buying_power_buffer,
                     initial_margin_requirement,
+                    open_buy_order_value,
                 )
             });
     info!(
@@ -742,22 +744,38 @@ fn parse_percent(value: &str) -> Result<f64, String> {
     }
 }
 
+// Total the notional still reserved by active buy orders.
+fn calculate_open_buy_order_value(open_orders: &HashMap<i32, VolatileOrder>) -> f64 {
+    // Reserve only the unfilled notional of orders that increase the long position.
+    open_orders
+        .values()
+        .filter(|order| order.side == Side::Buy)
+        .map(|order| order.price * order.remaining)
+        .sum()
+}
+
 // Calculate buffered buying power and round it down to the nearest cent.
 fn calculate_buying_power(
     equity_with_loan_value: f64,
     init_margin_req: f64,
     buying_power_buffer: f64,
     initial_margin_requirement: f64,
+    open_buy_order_value: f64,
 ) -> f64 {
-    // Reserve buffered equity, clamp exhausted margin capacity, and apply the margin ratio.
+    // Reserve buffered equity and the margin needed by unfilled buy orders.
+    let margin_ratio = initial_margin_requirement / 100.0_f64;
     let effective_equity = equity_with_loan_value * (1.0_f64 - buying_power_buffer / 100.0_f64);
-    let margin_capacity = (effective_equity - init_margin_req).max(0.0_f64);
-    (margin_capacity / (initial_margin_requirement / 100.0_f64) * 100.0_f64).floor() / 100.0_f64
+    let open_buy_order_margin = open_buy_order_value * margin_ratio;
+    let margin_capacity = (effective_equity - init_margin_req - open_buy_order_margin).max(0.0_f64);
+    (margin_capacity / margin_ratio * 100.0_f64).floor() / 100.0_f64
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, VolatileState, calculate_buying_power, update_account_metric, update_price};
+    use super::{
+        Args, Side, VolatileOrder, VolatileState, calculate_buying_power,
+        calculate_open_buy_order_value, update_account_metric, update_price,
+    };
     use clap::Parser;
     use ibapi::accounts::AccountSummaryTags;
     use ibapi::contracts::tick_types::TickType;
@@ -776,7 +794,7 @@ mod tests {
         let cli = TestCli::try_parse_from(["run"]).unwrap();
 
         assert_eq!(cli.args.symbol, "SOXL");
-        assert!((cli.args.buying_power_buffer - 90.0_f64).abs() < f64::EPSILON);
+        assert!((cli.args.buying_power_buffer - 10.0_f64).abs() < f64::EPSILON);
         assert!((cli.args.initial_margin_requirement - 75.0_f64).abs() < f64::EPSILON);
     }
 
@@ -821,7 +839,7 @@ mod tests {
     #[test]
     fn buffer_and_round_down_buying_power() {
         // Apply the equity buffer before the margin formula and floor the result to cents.
-        let buying_power = calculate_buying_power(1_000.0, 100.0, 20.0, 75.0);
+        let buying_power = calculate_buying_power(1_000.0, 100.0, 20.0, 75.0, 0.0);
 
         assert!((buying_power - 933.33_f64).abs() < f64::EPSILON);
     }
@@ -829,9 +847,48 @@ mod tests {
     #[test]
     fn clamp_negative_buying_power() {
         // Report zero once existing margin exceeds the buffered margin budget.
-        let buying_power = calculate_buying_power(1_000.0, 900.0, 20.0, 75.0);
+        let buying_power = calculate_buying_power(1_000.0, 900.0, 20.0, 75.0, 0.0);
 
         assert!(buying_power.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn reserve_open_buy_order_margin() {
+        // Deduct the unfilled buy notional after converting it to required margin.
+        let buying_power = calculate_buying_power(1_000.0, 100.0, 20.0, 75.0, 200.0);
+
+        assert!((buying_power - 733.33_f64).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn total_only_remaining_buy_orders() {
+        // Ignore filled quantities and sell orders when totaling reserved notional.
+        let open_orders = HashMap::from([
+            (
+                1_i32,
+                VolatileOrder {
+                    order_ref: "stockholm:buy".to_string(),
+                    symbol: "SOXL".to_string(),
+                    price: 10.0,
+                    side: Side::Buy,
+                    filled: 3.0,
+                    remaining: 2.0,
+                },
+            ),
+            (
+                2_i32,
+                VolatileOrder {
+                    order_ref: "stockholm:sell".to_string(),
+                    symbol: "SOXL".to_string(),
+                    price: 20.0,
+                    side: Side::Sell,
+                    filled: 0.0,
+                    remaining: 4.0,
+                },
+            ),
+        ]);
+
+        assert!((calculate_open_buy_order_value(&open_orders) - 20.0_f64).abs() < f64::EPSILON);
     }
 
     #[test]
