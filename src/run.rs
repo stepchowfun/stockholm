@@ -2,7 +2,7 @@ use crate::{DEFAULT_SYMBOL, state};
 use clap::Args as ClapArgs;
 use ibapi::{
     Client,
-    accounts::{AccountSummaryResult, AccountSummaryTags, PositionUpdate, types::AccountGroup},
+    accounts::{AccountSummaryResult, AccountSummaryTags, types::AccountGroup},
     contracts::{Contract, tick_types::TickType},
     market_data::{MarketDataType, TradingHours, realtime::TickTypes},
     orders::{Action, OrderData, OrderUpdate, Orders},
@@ -17,7 +17,7 @@ use std::{
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-// These constants configure the instrument and failure recovery.
+// These constants configure trading defaults, routing venues, and failure recovery.
 const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 const DEFAULT_BUYING_POWER_BUFFER: f64 = 90.0_f64;
@@ -152,10 +152,9 @@ async fn run_with_connection(
         .switch_market_data_type(MarketDataType::Realtime)
         .await?;
 
-    // Subscribe before reconciling initial snapshots so intervening order updates are buffered.
+    // Subscribe before reconciling the initial snapshot so intervening order updates are buffered.
     let order_updates = client.order_update_stream().await?;
     list_orders(client, persistent_state, &volatile_state).await?;
-    list_positions(client).await?;
 
     // Keep every operating loop alive until any one of them requires a reconnect.
     tokio::try_join!(
@@ -235,60 +234,6 @@ async fn stream_account_summary(
     }
 
     Err(ibapi::Error::UnexpectedEndOfStream.into())
-}
-
-// Update tracked metrics from matching account-summary fields.
-fn update_account_metric(state: &RwLock<VolatileState>, tag: &str, value: &str) -> io::Result<()> {
-    // Ignore nonnumeric and nonfinite account-summary values.
-    let Ok(value) = value.parse::<f64>() else {
-        return Ok(());
-    };
-    if !value.is_finite() {
-        return Ok(());
-    }
-
-    // Ignore unrelated fields and retain recognized metrics.
-    let mut state = state
-        .write()
-        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
-    match tag {
-        AccountSummaryTags::EQUITY_WITH_LOAN_VALUE => state.equity_with_loan_value = Some(value),
-        AccountSummaryTags::INIT_MARGIN_REQ => state.init_margin_req = Some(value),
-        _ => {}
-    }
-
-    Ok(())
-}
-
-// Parse a finite percentage that is strictly positive and at most one hundred.
-fn parse_positive_percent(value: &str) -> Result<f64, String> {
-    // Reject invalid percentages before they reach the trading control loop.
-    match value.parse::<f64>() {
-        Ok(value) if value > 0.0_f64 && value <= 100.0_f64 => Ok(value),
-        _ => Err("The percentage must be a finite number in the range (0, 100].".to_string()),
-    }
-}
-
-// Parse a finite percentage in the inclusive range from zero to one hundred.
-fn parse_percent(value: &str) -> Result<f64, String> {
-    // Reject invalid percentages before they reach the trading control loop.
-    match value.parse::<f64>() {
-        Ok(value) if (0.0_f64..=100.0_f64).contains(&value) => Ok(value),
-        _ => Err("The percentage must be a finite number in the range [0, 100].".to_string()),
-    }
-}
-
-// Calculate buffered buying power and round it down to the nearest cent.
-fn calculate_buying_power(
-    equity_with_loan_value: f64,
-    init_margin_req: f64,
-    buying_power_buffer: f64,
-    initial_margin_requirement: f64,
-) -> f64 {
-    // Reduce effective equity by the configured buffer before applying the margin ratio.
-    let effective_equity = equity_with_loan_value * (1.0_f64 - buying_power_buffer / 100.0_f64);
-    let margin_capacity = (effective_equity - init_margin_req).max(0.0_f64);
-    (margin_capacity / (initial_margin_requirement / 100.0_f64) * 100.0_f64).floor() / 100.0_f64
 }
 
 // Stream live market data for the configured symbol.
@@ -399,7 +344,7 @@ fn run_step(
     buying_power_buffer: f64,
     initial_margin_requirement: f64,
 ) -> io::Result<()> {
-    // Calculate buying power and log the latest account and quote snapshot.
+    // Calculate buying power and log the latest account, order, and quote snapshot.
     let state = volatile_state
         .read()
         .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
@@ -416,11 +361,12 @@ fn run_step(
                 )
             });
     info!(
-        "Equity with loan value: {}; buying power: {}; current bid: {}; current ask: {}",
+        "Equity with loan value: {}; buying power: {}; open orders: {}; current bid: {}; current ask: {}",
         state
             .equity_with_loan_value
             .map_or_else(|| "unavailable".to_string(), |equity| equity.to_string()),
         buying_power.map_or_else(|| "unavailable".to_string(), |power| power.to_string()),
+        state.open_orders.len(),
         state
             .bid_price
             .map_or_else(|| "unavailable".to_string(), |price| price.to_string()),
@@ -552,6 +498,100 @@ async fn place_limit_sell(
     Ok(())
 }
 
+// Reconcile current open orders placed by Stockholm.
+async fn list_orders(
+    client: &Client,
+    persistent_state: &RwLock<state::State>,
+    volatile_state: &RwLock<VolatileState>,
+) -> Result<(), Box<dyn Error>> {
+    // Mark the start of the request before collecting its results.
+    debug!("Requesting Stockholm open orders…");
+
+    // Request every current open order across associated accounts and API clients.
+    let subscription = client.all_open_orders().await?;
+    let mut orders = subscription.filter_data();
+    let mut order_count: usize = 0;
+    let mut open_order_refs = HashSet::new();
+
+    // Process and log only orders carrying Stockholm's reference prefix.
+    while let Some(order) = orders.next().await {
+        match order? {
+            Orders::OrderData(data) if data.order.order_ref.starts_with(ORDER_REF_PREFIX) => {
+                order_count += 1;
+                open_order_refs.insert(data.order.order_ref.clone());
+                update_open_order(persistent_state, volatile_state, &data)?;
+                debug!("Stockholm open order: {data:?}");
+            }
+            Orders::OrderStatus(status) => {
+                update_order_status(
+                    persistent_state,
+                    volatile_state,
+                    status.order_id,
+                    status.filled,
+                    status.remaining,
+                    status.status.is_terminal(),
+                )?;
+            }
+            Orders::OrderData(_) => {}
+        }
+    }
+
+    // Remove every persisted record absent from IB's complete open-order snapshot.
+    {
+        let mut state = persistent_state
+            .write()
+            .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
+        let previous_len = state.open_orders.len();
+        state
+            .open_orders
+            .retain(|order| open_order_refs.contains(&order.order_ref));
+        if state.open_orders.len() != previous_len {
+            state::save(&state)?;
+        }
+    }
+
+    // Keep volatile details aligned with the same complete snapshot.
+    volatile_state
+        .write()
+        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?
+        .open_orders
+        .retain(|_, order| open_order_refs.contains(&order.order_ref));
+
+    // Confirm that the complete response arrived even when it contained no orders.
+    if order_count == 0 {
+        debug!("No Stockholm open orders found.");
+    } else if order_count == 1 {
+        debug!("Finished listing 1 Stockholm open order.");
+    } else {
+        debug!("Finished listing {order_count} Stockholm open orders.");
+    }
+
+    Ok(())
+}
+
+// Update tracked metrics from matching account-summary fields.
+fn update_account_metric(state: &RwLock<VolatileState>, tag: &str, value: &str) -> io::Result<()> {
+    // Ignore nonnumeric and nonfinite account-summary values.
+    let Ok(value) = value.parse::<f64>() else {
+        return Ok(());
+    };
+    if !value.is_finite() {
+        return Ok(());
+    }
+
+    // Ignore unrelated fields and retain recognized metrics.
+    let mut state = state
+        .write()
+        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
+    match tag {
+        AccountSummaryTags::EQUITY_WITH_LOAN_VALUE => state.equity_with_loan_value = Some(value),
+        AccountSummaryTags::INIT_MARGIN_REQ => state.init_margin_req = Some(value),
+        _ => {}
+    }
+
+    Ok(())
+}
+
 // Record the latest details for an open Stockholm order.
 fn update_open_order(
     persistent_state: &RwLock<state::State>,
@@ -616,7 +656,7 @@ fn update_open_order(
     Ok(())
 }
 
-// Synchronize volatile and persistent state for a status on a Stockholm-managed order.
+// Apply a status to volatile state and remove terminal orders from persisted state.
 fn update_order_status(
     persistent_state: &RwLock<state::State>,
     volatile_state: &RwLock<VolatileState>,
@@ -684,108 +724,35 @@ fn update_price(state: &mut VolatileState, tick_type: &TickType, price: f64) {
     }
 }
 
-// Reconcile current open orders placed by Stockholm.
-async fn list_orders(
-    client: &Client,
-    persistent_state: &RwLock<state::State>,
-    volatile_state: &RwLock<VolatileState>,
-) -> Result<(), Box<dyn Error>> {
-    // Mark the start of the request before collecting its results.
-    debug!("Requesting Stockholm open orders…");
-
-    // Request every current open order across associated accounts and API clients.
-    let subscription = client.all_open_orders().await?;
-    let mut orders = subscription.filter_data();
-    let mut order_count: usize = 0;
-    let mut open_order_refs = HashSet::new();
-
-    // Process and log only orders carrying Stockholm's reference prefix.
-    while let Some(order) = orders.next().await {
-        match order? {
-            Orders::OrderData(data) if data.order.order_ref.starts_with(ORDER_REF_PREFIX) => {
-                order_count += 1;
-                open_order_refs.insert(data.order.order_ref.clone());
-                update_open_order(persistent_state, volatile_state, &data)?;
-                debug!("Stockholm open order: {data:?}");
-            }
-            Orders::OrderStatus(status) => {
-                update_order_status(
-                    persistent_state,
-                    volatile_state,
-                    status.order_id,
-                    status.filled,
-                    status.remaining,
-                    status.status.is_terminal(),
-                )?;
-            }
-            Orders::OrderData(_) => {}
-        }
+// Parse a finite percentage that is strictly positive and at most one hundred.
+fn parse_positive_percent(value: &str) -> Result<f64, String> {
+    // Reject invalid percentages before they reach the trading control loop.
+    match value.parse::<f64>() {
+        Ok(value) if value > 0.0_f64 && value <= 100.0_f64 => Ok(value),
+        _ => Err("The percentage must be a finite number in the range (0, 100].".to_string()),
     }
-
-    // Remove every local record absent from IB's complete open-order snapshot.
-    {
-        let mut state = persistent_state
-            .write()
-            .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
-        let previous_len = state.open_orders.len();
-        state
-            .open_orders
-            .retain(|order| open_order_refs.contains(&order.order_ref));
-        if state.open_orders.len() != previous_len {
-            state::save(&state)?;
-        }
-    }
-
-    // Keep volatile details aligned with the same complete snapshot.
-    volatile_state
-        .write()
-        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?
-        .open_orders
-        .retain(|_, order| open_order_refs.contains(&order.order_ref));
-
-    // Confirm that the complete response arrived even when it contained no orders.
-    if order_count == 0 {
-        debug!("No Stockholm open orders found.");
-    } else if order_count == 1 {
-        debug!("Finished listing 1 Stockholm open order.");
-    } else {
-        debug!("Finished listing {order_count} Stockholm open orders.");
-    }
-
-    Ok(())
 }
 
-// List all current positions.
-async fn list_positions(client: &Client) -> Result<(), Box<dyn Error>> {
-    // Mark the start of the request before collecting its results.
-    debug!("Requesting all positions…");
-
-    // Request every current position across accessible accounts.
-    let subscription = client.positions().await?;
-    let mut positions = subscription.filter_data();
-    let mut position_count: usize = 0;
-
-    // Log position details until the complete initial snapshot arrives.
-    while let Some(update) = positions.next().await {
-        match update? {
-            PositionUpdate::Position(position) => {
-                position_count += 1;
-                debug!("Position: {position:?}");
-            }
-            PositionUpdate::PositionEnd => break,
-        }
+// Parse a finite percentage in the inclusive range from zero to one hundred.
+fn parse_percent(value: &str) -> Result<f64, String> {
+    // Reject invalid percentages before they reach the trading control loop.
+    match value.parse::<f64>() {
+        Ok(value) if (0.0_f64..=100.0_f64).contains(&value) => Ok(value),
+        _ => Err("The percentage must be a finite number in the range [0, 100].".to_string()),
     }
+}
 
-    // Confirm that the complete response arrived even when it contained no positions.
-    if position_count == 0 {
-        debug!("No positions found.");
-    } else if position_count == 1 {
-        debug!("Finished listing 1 position.");
-    } else {
-        debug!("Finished listing {position_count} positions.");
-    }
-
-    Ok(())
+// Calculate buffered buying power and round it down to the nearest cent.
+fn calculate_buying_power(
+    equity_with_loan_value: f64,
+    init_margin_req: f64,
+    buying_power_buffer: f64,
+    initial_margin_requirement: f64,
+) -> f64 {
+    // Reserve buffered equity, clamp exhausted margin capacity, and apply the margin ratio.
+    let effective_equity = equity_with_loan_value * (1.0_f64 - buying_power_buffer / 100.0_f64);
+    let margin_capacity = (effective_equity - init_margin_req).max(0.0_f64);
+    (margin_capacity / (initial_margin_requirement / 100.0_f64) * 100.0_f64).floor() / 100.0_f64
 }
 
 #[cfg(test)]
