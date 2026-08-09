@@ -38,7 +38,7 @@ You can evaluate a strategy over historical CSV files with the `backtest` subcom
 stockholm backtest --strategy buy-and-hold --data-paths data/validation/*.csv
 ```
 
-The `market-maker` strategy treats each input CSV as one trading day and repeatedly places whole-share limit orders below and above each one-second bar's closing price. Existing orders fill when a subsequent bar trades through their limit and expire after their configured lifetime. Each eligible order fills at most `--bar-volume-limit` shares per one-second bar (1,000 by default), with the remainder staying open. During the final rows of each day selected by `--liquidation-seconds` (900 by default), the strategy cancels all buy orders, places no new buys, and liquidates up to the same volume limit at the current closing price each second. Account value compounds across days. The reported CSV includes the final marked-to-market account value and the unannualized Sharpe ratio calculated as mean daily return divided by its population standard deviation:
+The `market-maker` strategy treats each input CSV as one trading day and repeatedly places whole-share limit orders below and above each one-second bar's closing price. Existing orders fill when a subsequent bar trades through their limit and expire after their configured lifetime. Each eligible order fills at most `--bar-volume-limit` shares per one-second bar (1,000 by default), with the remainder staying open. During the final rows of each day selected by `--liquidation-seconds` (900 by default), the strategy cancels all buy and sell orders, places no new ordinary orders, and liquidates up to the same volume limit at the current closing price each second. Account value compounds across days. The reported CSV includes the final marked-to-market account value and the unannualized Sharpe ratio calculated as mean daily return divided by its population standard deviation:
 
 ```sh
 stockholm backtest --strategy market-maker --data-paths data/validation/*.csv --initial-cash 1000000 --buy-ttl 3600 --sell-ttl 14400 --discount-percent 0.25 --markup-percent 0.25
@@ -55,6 +55,8 @@ You can select the symbol whose live market data and five-second bars should be 
 ```sh
 stockholm run --symbol AAPL
 ```
+
+The live strategy runs its control loop once per second. Between 3:45 p.m. and 9:30 a.m. Eastern time, it suppresses ordinary market-making orders, immediately cancels its buy orders for the selected symbol, gives matching sell orders a 10-second lifetime, and repeatedly offers every unreserved whole share at the current ask. Stockholm-managed orders for other symbols and orders placed outside Stockholm are unaffected.
 
 You can fetch historical bars as CSV with the `historical` subcommand. The start and end are ISO 8601 datetimes with explicit UTC offsets, and the interval defaults to `SEC`:
 

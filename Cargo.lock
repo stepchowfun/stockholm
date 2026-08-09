@@ -4656,7 +4656,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stockholm"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "burn",
  "chrono",
@@ -4670,6 +4670,7 @@ dependencies = [
  "serde",
  "tempfile",
  "time",
+ "time-tz",
  "tokio",
  "uuid",
  "yaml_serde",
