@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.29] - 2026-08-08
+
+### Changed
+- Keep connection-specific order IDs and execution details in volatile state keyed by stable order references.
+- Persist only stable order references, permanent IDs, and creation timestamps for managed orders.
+- Clarify market-maker limit-order field names and live-run comments.
+
 ## [0.2.28] - 2026-08-08
 
 ### Changed

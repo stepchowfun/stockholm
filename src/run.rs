@@ -5,10 +5,15 @@ use ibapi::{
     accounts::{AccountSummaryResult, AccountSummaryTags, PositionUpdate, types::AccountGroup},
     contracts::{Contract, tick_types::TickType},
     market_data::{MarketDataType, TradingHours, realtime::TickTypes},
-    orders::{OrderUpdate, Orders},
+    orders::{Action, OrderData, OrderUpdate, Orders},
     prelude::{StreamExt, Subscription, SubscriptionItemStreamExt},
 };
-use std::{collections::HashSet, error::Error, io, sync::RwLock};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    io,
+    sync::RwLock,
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -29,6 +34,9 @@ pub struct Args {
 
 // This connection-local state tracks values that do not need to survive a restart.
 struct VolatileState {
+    // Details for open orders, keyed by Stockholm's stable order reference.
+    open_orders: HashMap<String, VolatileOrder>,
+
     // The most recently reported funds available for opening new positions.
     available_funds: Option<f64>,
 
@@ -37,6 +45,35 @@ struct VolatileState {
 
     // The most recently observed ask price, if one is available.
     ask_price: Option<f64>,
+}
+
+// These connection-local details describe one open Stockholm order.
+#[allow(dead_code)]
+struct VolatileOrder {
+    // The connection-specific order identifier assigned by TWS.
+    order_id: i32,
+
+    // The instrument being traded.
+    symbol: String,
+
+    // The order's limit price.
+    price: f64,
+
+    // Whether the order buys or sells shares.
+    side: Side,
+
+    // The number of shares filled so far.
+    filled: f64,
+
+    // The number of shares still awaiting execution.
+    remaining: f64,
+}
+
+// This direction distinguishes buy orders from sell orders.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Side {
+    Buy,
+    Sell,
 }
 
 // Supply the same defaults when the run subcommand is omitted.
@@ -74,14 +111,15 @@ pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<d
     }
 }
 
-// Run the order loop and both market data streams concurrently on one connection.
+// Run every control and streaming task concurrently on one connection.
 async fn run_with_connection(
     client: &Client,
     symbol: &str,
     persistent_state: &RwLock<state::State>,
 ) -> Result<(), Box<dyn Error>> {
-    // Start connection-local market state without any observed prices.
+    // Start connection-local state without account, quote, or order details.
     let volatile_state = RwLock::new(VolatileState {
+        open_orders: HashMap::new(),
         available_funds: None,
         bid_price: None,
         ask_price: None,
@@ -94,14 +132,14 @@ async fn run_with_connection(
 
     // Subscribe before reconciling the initial snapshot so intervening updates are buffered.
     let order_updates = client.order_update_stream().await?;
-    list_orders(client, persistent_state).await?;
+    list_orders(client, persistent_state, &volatile_state).await?;
 
     // Keep every operating loop alive until any one of them requires a reconnect.
     tokio::try_join!(
         control_loop(client, &volatile_state),
         stream_account_summary(client, &volatile_state),
         stream_live_data(client, symbol, &volatile_state),
-        stream_order_updates(order_updates, persistent_state),
+        stream_order_updates(order_updates, persistent_state, &volatile_state),
         stream_realtime_bars(client, symbol, OVERNIGHT_EXCHANGE),
         stream_realtime_bars(client, symbol, SMART_EXCHANGE),
     )?;
@@ -134,7 +172,7 @@ async fn stream_account_summary(
         .await?;
     let mut summaries = subscription.filter_data();
 
-    // Print the initial summary and subsequent updates for the life of the connection.
+    // Log the initial summary and subsequent updates for the life of the connection.
     while let Some(update) = summaries.next().await {
         match update? {
             AccountSummaryResult::Summary(summary) => {
@@ -199,11 +237,11 @@ async fn stream_live_data(
     let mut ticks = subscription.filter_data();
     info!("Streaming {symbol} market data…");
 
-    // Print every tick and propagate stream failures to the connection loop.
+    // Process and log every tick while propagating stream failures to the connection loop.
     while let Some(tick) = ticks.next().await {
         let tick = tick?;
 
-        // Retain positive bid and ask prices from either form of price update.
+        // Refresh bid and ask availability from either form of price update.
         match &tick {
             TickTypes::Price(tick) => {
                 update_locked_price(state, &tick.tick_type, tick.price)?;
@@ -224,31 +262,30 @@ async fn stream_live_data(
 // Stream order updates for the life of the connection.
 async fn stream_order_updates(
     subscription: Subscription<OrderUpdate>,
-    state: &RwLock<state::State>,
+    persistent_state: &RwLock<state::State>,
+    volatile_state: &RwLock<VolatileState>,
 ) -> Result<(), Box<dyn Error>> {
     // Consume the subscription established before the initial order reconciliation.
     let mut updates = subscription.filter_data();
     info!("Streaming order updates…");
 
-    // Print every order-related event while propagating stream failures.
+    // Process and log every order-related event while propagating stream failures.
     while let Some(update) = updates.next().await {
         let update: OrderUpdate = update?;
 
-        // Apply open-order details and terminal statuses to the persisted order set.
+        // Keep persistent identities and volatile details synchronized for managed orders.
         match &update {
             OrderUpdate::OpenOrder(data) if data.order.order_ref.starts_with(ORDER_REF_PREFIX) => {
-                update_open_order(
-                    state,
-                    data.order_id,
-                    &data.order.order_ref,
-                    data.order.perm_id,
-                )?;
+                update_open_order(persistent_state, volatile_state, data)?;
             }
             OrderUpdate::OrderStatus(status) => {
                 update_order_status(
-                    state,
+                    persistent_state,
+                    volatile_state,
                     status.order_id,
                     status.perm_id,
+                    status.filled,
+                    status.remaining,
                     status.status.is_terminal(),
                 )?;
             }
@@ -279,7 +316,7 @@ async fn stream_realtime_bars(
     let mut bars = subscription.filter_data();
     info!("Streaming {symbol} five-second bars from {exchange}…");
 
-    // Print every completed bar and propagate stream failures to the connection loop.
+    // Log every completed bar and propagate stream failures to the connection loop.
     while let Some(bar) = bars.next().await {
         debug!("Five-second bar for {symbol} ({exchange}): {:?}", bar?);
     }
@@ -287,7 +324,7 @@ async fn stream_realtime_bars(
     Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
-// Run one set of independent account checks.
+// Run one control-loop step.
 async fn run_step(
     client: &Client,
     volatile_state: &RwLock<VolatileState>,
@@ -295,7 +332,7 @@ async fn run_step(
     // Fetch the current positions for this step.
     list_positions(client).await?;
 
-    // Print the latest account and quote snapshot after the account checks finish.
+    // Log the latest account and quote snapshot after the positions request finishes.
     let state = volatile_state
         .read()
         .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
@@ -322,7 +359,8 @@ async fn place_limit_buy(
     symbol: &str,
     shares: i32,
     limit: f64,
-    state: &RwLock<state::State>,
+    persistent_state: &RwLock<state::State>,
+    volatile_state: &RwLock<VolatileState>,
 ) -> Result<(), Box<dyn Error>> {
     // Build the order with a stable Stockholm-generated correlation reference.
     let contract = Contract::stock(symbol).build();
@@ -339,17 +377,33 @@ async fn place_limit_buy(
     // Persist the pending order before submitting it to Interactive Brokers.
     let order_id = client.next_order_id();
     {
-        let mut state = state
+        let mut state = persistent_state
             .write()
             .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
         state.open_orders.push(state::OpenOrder {
-            order_id,
             order_ref: order_ref.clone(),
             perm_id: None,
             created_at: OffsetDateTime::now_utc(),
         });
         state::save(&state)?;
     }
+
+    // Retain the order details for this connection before submitting the order.
+    volatile_state
+        .write()
+        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?
+        .open_orders
+        .insert(
+            order_ref.clone(),
+            VolatileOrder {
+                order_id,
+                symbol: symbol.to_string(),
+                price: limit,
+                side: Side::Buy,
+                filled: 0.0_f64,
+                remaining: f64::from(shares),
+            },
+        );
 
     // Submit the order only after its state has been safely persisted.
     client.submit_order(order_id, &contract, &order).await?;
@@ -365,7 +419,8 @@ async fn place_limit_sell(
     symbol: &str,
     shares: i32,
     limit: f64,
-    state: &RwLock<state::State>,
+    persistent_state: &RwLock<state::State>,
+    volatile_state: &RwLock<VolatileState>,
 ) -> Result<(), Box<dyn Error>> {
     // Build the order with a stable Stockholm-generated correlation reference.
     let contract = Contract::stock(symbol).build();
@@ -382,17 +437,33 @@ async fn place_limit_sell(
     // Persist the pending order before submitting it to Interactive Brokers.
     let order_id = client.next_order_id();
     {
-        let mut state = state
+        let mut state = persistent_state
             .write()
             .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
         state.open_orders.push(state::OpenOrder {
-            order_id,
             order_ref: order_ref.clone(),
             perm_id: None,
             created_at: OffsetDateTime::now_utc(),
         });
         state::save(&state)?;
     }
+
+    // Retain the order details for this connection before submitting the order.
+    volatile_state
+        .write()
+        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?
+        .open_orders
+        .insert(
+            order_ref.clone(),
+            VolatileOrder {
+                order_id,
+                symbol: symbol.to_string(),
+                price: limit,
+                side: Side::Sell,
+                filled: 0.0_f64,
+                remaining: f64::from(shares),
+            },
+        );
 
     // Submit the order only after its state has been safely persisted.
     client.submit_order(order_id, &contract, &order).await?;
@@ -401,77 +472,113 @@ async fn place_limit_sell(
     Ok(())
 }
 
-// Record the latest identifiers for an open Stockholm order.
+// Record the latest details for an open Stockholm order.
 fn update_open_order(
-    state: &RwLock<state::State>,
-    order_id: i32,
-    order_ref: &str,
-    perm_id: i64,
+    persistent_state: &RwLock<state::State>,
+    volatile_state: &RwLock<VolatileState>,
+    data: &OrderData,
 ) -> io::Result<()> {
-    // Update an existing record by its stable reference or add a newly discovered order.
-    let mut state = state
-        .write()
-        .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
-    let perm_id = (perm_id != 0).then_some(perm_id);
-    let changed = if let Some(order) = state
-        .open_orders
-        .iter_mut()
-        .find(|order| order.order_ref == order_ref)
-    {
-        let changed = order.order_id != order_id || order.perm_id != perm_id;
-        order.order_id = order_id;
-        order.perm_id = perm_id;
-        changed
-    } else {
-        state.open_orders.push(state::OpenOrder {
-            order_id,
-            order_ref: order_ref.to_string(),
-            perm_id,
-            created_at: OffsetDateTime::now_utc(),
-        });
-        true
+    // Extract the connection-local fields from Interactive Brokers' open-order details.
+    let price = data
+        .order
+        .limit_price
+        .ok_or_else(|| io::Error::other("A Stockholm order is missing its limit price."))?;
+    let side = match data.order.action {
+        Action::Buy => Side::Buy,
+        Action::Sell | Action::SellShort | Action::SellLong => Side::Sell,
     };
+    let perm_id = (data.order.perm_id != 0).then_some(data.order.perm_id);
+    let symbol = data.contract.symbol.to_string();
 
-    // Persist every mutation before releasing the state lock.
-    if changed {
-        state::save(&state)?;
+    // Update persistent identifiers by stable reference before retaining volatile details.
+    {
+        let mut state = persistent_state
+            .write()
+            .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
+        let changed = if let Some(order) = state
+            .open_orders
+            .iter_mut()
+            .find(|order| order.order_ref == data.order.order_ref)
+        {
+            let changed = order.perm_id != perm_id;
+            order.perm_id = perm_id;
+            changed
+        } else {
+            state.open_orders.push(state::OpenOrder {
+                order_ref: data.order.order_ref.clone(),
+                perm_id,
+                created_at: OffsetDateTime::now_utc(),
+            });
+            true
+        };
+        if changed {
+            state::save(&state)?;
+        }
     }
+
+    // Refresh volatile details while retaining the latest filled quantity.
+    let mut state = volatile_state
+        .write()
+        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
+    let filled = state
+        .open_orders
+        .get(&data.order.order_ref)
+        .map_or(0.0_f64, |order| order.filled);
+    state.open_orders.insert(
+        data.order.order_ref.clone(),
+        VolatileOrder {
+            order_id: data.order_id,
+            symbol,
+            price,
+            side,
+            filled,
+            remaining: data.order.total_quantity - filled,
+        },
+    );
 
     Ok(())
 }
 
 // Apply an order status when it identifies an order already managed by Stockholm.
 fn update_order_status(
-    state: &RwLock<state::State>,
+    persistent_state: &RwLock<state::State>,
+    volatile_state: &RwLock<VolatileState>,
     order_id: i32,
     perm_id: i64,
+    filled: f64,
+    remaining: f64,
     is_terminal: bool,
 ) -> io::Result<()> {
-    // Match only the stable permanent ID so unrelated connection-local IDs are ignored.
-    let mut state = state
-        .write()
-        .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
-    let index = state
-        .open_orders
-        .iter()
-        .position(|order| order.perm_id == Some(perm_id));
-    let changed = if let Some(index) = index {
+    // Match only the stable permanent ID and persist terminal removal.
+    let order_ref = {
+        let mut state = persistent_state
+            .write()
+            .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
+        let Some(index) = state
+            .open_orders
+            .iter()
+            .position(|order| order.perm_id == Some(perm_id))
+        else {
+            return Ok(());
+        };
+        let order_ref = state.open_orders[index].order_ref.clone();
         if is_terminal {
             state.open_orders.remove(index);
-            true
-        } else {
-            let order = &mut state.open_orders[index];
-            let changed = order.order_id != order_id;
-            order.order_id = order_id;
-            changed
+            state::save(&state)?;
         }
-    } else {
-        false
+        order_ref
     };
 
-    // Persist every mutation before releasing the state lock.
-    if changed {
-        state::save(&state)?;
+    // Remove terminal orders or refresh execution quantities in volatile state.
+    let mut state = volatile_state
+        .write()
+        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?;
+    if is_terminal {
+        state.open_orders.remove(&order_ref);
+    } else if let Some(order) = state.open_orders.get_mut(&order_ref) {
+        order.order_id = order_id;
+        order.filled = filled;
+        order.remaining = remaining;
     }
 
     Ok(())
@@ -503,8 +610,12 @@ fn update_price(state: &mut VolatileState, tick_type: &TickType, price: f64) {
     }
 }
 
-// Print current open orders placed by Stockholm.
-async fn list_orders(client: &Client, state: &RwLock<state::State>) -> Result<(), Box<dyn Error>> {
+// Reconcile current open orders placed by Stockholm.
+async fn list_orders(
+    client: &Client,
+    persistent_state: &RwLock<state::State>,
+    volatile_state: &RwLock<VolatileState>,
+) -> Result<(), Box<dyn Error>> {
     // Mark the start of the request before collecting its results.
     info!("Requesting Stockholm open orders…");
 
@@ -514,25 +625,23 @@ async fn list_orders(client: &Client, state: &RwLock<state::State>) -> Result<()
     let mut order_count: usize = 0;
     let mut open_order_refs = HashSet::new();
 
-    // Print only orders carrying Stockholm's reference prefix.
+    // Process and log only orders carrying Stockholm's reference prefix.
     while let Some(order) = orders.next().await {
         match order? {
             Orders::OrderData(data) if data.order.order_ref.starts_with(ORDER_REF_PREFIX) => {
                 order_count += 1;
                 open_order_refs.insert(data.order.order_ref.clone());
-                update_open_order(
-                    state,
-                    data.order_id,
-                    &data.order.order_ref,
-                    data.order.perm_id,
-                )?;
+                update_open_order(persistent_state, volatile_state, &data)?;
                 debug!("Stockholm open order: {data:?}");
             }
             Orders::OrderStatus(status) => {
                 update_order_status(
-                    state,
+                    persistent_state,
+                    volatile_state,
                     status.order_id,
                     status.perm_id,
+                    status.filled,
+                    status.remaining,
                     status.status.is_terminal(),
                 )?;
             }
@@ -541,16 +650,25 @@ async fn list_orders(client: &Client, state: &RwLock<state::State>) -> Result<()
     }
 
     // Remove every local record absent from IB's complete open-order snapshot.
-    let mut state = state
-        .write()
-        .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
-    let previous_len = state.open_orders.len();
-    state
-        .open_orders
-        .retain(|order| open_order_refs.contains(&order.order_ref));
-    if state.open_orders.len() != previous_len {
-        state::save(&state)?;
+    {
+        let mut state = persistent_state
+            .write()
+            .map_err(|_| io::Error::other("The persistent state lock is poisoned."))?;
+        let previous_len = state.open_orders.len();
+        state
+            .open_orders
+            .retain(|order| open_order_refs.contains(&order.order_ref));
+        if state.open_orders.len() != previous_len {
+            state::save(&state)?;
+        }
     }
+
+    // Keep volatile details aligned with the same complete snapshot.
+    volatile_state
+        .write()
+        .map_err(|_| io::Error::other("Volatile state lock was poisoned."))?
+        .open_orders
+        .retain(|order_ref, _| open_order_refs.contains(order_ref));
 
     // Confirm that the complete response arrived even when it contained no orders.
     if order_count == 0 {
@@ -564,7 +682,7 @@ async fn list_orders(client: &Client, state: &RwLock<state::State>) -> Result<()
     Ok(())
 }
 
-// Print all current positions.
+// List all current positions.
 async fn list_positions(client: &Client) -> Result<(), Box<dyn Error>> {
     // Mark the start of the request before collecting its results.
     info!("Requesting all positions…");
@@ -574,7 +692,7 @@ async fn list_positions(client: &Client) -> Result<(), Box<dyn Error>> {
     let mut positions = subscription.filter_data();
     let mut position_count: usize = 0;
 
-    // Print position details until the complete initial snapshot arrives.
+    // Log position details until the complete initial snapshot arrives.
     while let Some(update) = positions.next().await {
         match update? {
             PositionUpdate::Position(position) => {
@@ -603,7 +721,7 @@ mod tests {
     use clap::Parser;
     use ibapi::accounts::AccountSummaryTags;
     use ibapi::contracts::tick_types::TickType;
-    use std::sync::RwLock;
+    use std::{collections::HashMap, sync::RwLock};
 
     // This parser exposes the run arguments for focused tests.
     #[derive(Parser)]
@@ -632,6 +750,7 @@ mod tests {
     fn clear_nonpositive_bid_and_ask_prices() {
         // Confirm unusable quote updates clear previously valid prices on their side.
         let mut state = VolatileState {
+            open_orders: HashMap::new(),
             available_funds: None,
             bid_price: None,
             ask_price: None,
@@ -649,6 +768,7 @@ mod tests {
     fn retain_only_valid_available_funds() {
         // Confirm only finite numeric available-funds summaries update volatile state.
         let state = RwLock::new(VolatileState {
+            open_orders: HashMap::new(),
             available_funds: None,
             bid_price: None,
             ask_price: None,
