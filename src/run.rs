@@ -22,10 +22,10 @@ const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 const DEFAULT_BUYING_POWER_BUFFER: f64 = 10.0_f64;
 const DEFAULT_INITIAL_MARGIN_REQUIREMENT: f64 = 75.0_f64;
-const BUY_DISCOUNT_PERCENT: f64 = 0.25_f64;
-const SELL_MARKUP_PERCENT: f64 = 0.25_f64;
-const BUY_ORDER_TTL: Duration = Duration::hours(1);
-const SELL_ORDER_TTL: Duration = Duration::hours(4);
+const BUY_DISCOUNT_PERCENT: f64 = 3.0_f64;
+const SELL_MARKUP_PERCENT: f64 = 1.0_f64;
+const BUY_ORDER_TTL: Duration = Duration::seconds(30);
+const SELL_ORDER_TTL: Duration = Duration::seconds(300);
 const CANCEL_RETRY_DELAY: Duration = Duration::seconds(10);
 const ORDER_REF_PREFIX: &str = "stockholm:";
 
@@ -1021,7 +1021,7 @@ mod tests {
     #[test]
     fn retry_expired_order_cancellations() {
         // Cancel only after the buy lifetime and then at ten-second retry intervals.
-        let now = OffsetDateTime::UNIX_EPOCH + Duration::hours(2);
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(30);
         let mut order = state::OpenOrder {
             order_ref: "stockholm:test".to_string(),
             perm_id: None,
