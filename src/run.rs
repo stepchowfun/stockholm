@@ -199,7 +199,7 @@ async fn control_loop(
     initial_margin_requirement: f64,
 ) -> Result<(), Box<dyn Error>> {
     loop {
-        run_step(
+        run_control_step(
             client,
             persistent_state,
             volatile_state,
@@ -361,7 +361,7 @@ async fn stream_tick_by_tick(
 }
 
 // Run one control-loop step and submit orders for currently available resources.
-async fn run_step(
+async fn run_control_step(
     client: &Client,
     persistent_state: &RwLock<state::State>,
     volatile_state: &RwLock<VolatileState>,
@@ -427,7 +427,7 @@ async fn run_step(
         )
     };
 
-    // Choose ordinary market-making limits or a liquidation limit at the bid.
+    // Choose ordinary market-making limits or a liquidation limit at the ask.
     let (buy_limit, sell_limit) = calculate_order_limits(bid_price, ask_price, liquidating);
 
     // Use all available buying power for one whole-share discounted limit order.
@@ -894,7 +894,7 @@ fn calculate_order_limits(
     liquidating: bool,
 ) -> (Option<f64>, Option<f64>) {
     if liquidating {
-        (None, bid_price.map(round_down_to_cent))
+        (None, ask_price.map(round_up_to_cent))
     } else {
         (
             bid_price.map(|price| {
@@ -1093,17 +1093,17 @@ mod tests {
 
     #[test]
     fn select_limits_for_current_trading_behavior() {
-        // Suppress buys and cross the spread only while liquidating.
+        // Suppress buys and quote directly at the ask only while liquidating.
         assert_eq!(
             calculate_order_limits(Some(10.129_f64), Some(10.231_f64), false),
             (Some(9.82_f64), Some(10.34_f64)),
         );
         assert_eq!(
             calculate_order_limits(Some(10.129_f64), Some(10.231_f64), true),
-            (None, Some(10.12_f64)),
+            (None, Some(10.24_f64)),
         );
         assert_eq!(
-            calculate_order_limits(None, Some(10.231_f64), true),
+            calculate_order_limits(Some(10.129_f64), None, true),
             (None, None),
         );
     }
