@@ -28,7 +28,7 @@ pub struct Args {
     #[arg(long, default_value_t = 900)]
     liquidation_seconds: u64,
 
-    /// Maximum shares of each eligible order filled per bar. Used by both market-maker strategies.
+    /// Maximum total shares filled per bar. Used by both market-maker strategies.
     #[arg(long, default_value_t = 1_000.0, value_parser = parse_positive_f64)]
     bar_volume_limit: f64,
 
@@ -358,23 +358,34 @@ fn simulate_market_maker_day(
             }
         });
 
-        // Partially fill each eligible buy order by at most one bar's configured volume.
+        // Share one fill budget across every order eligible during this bar.
+        let mut remaining_bar_volume = config.bar_volume_limit;
+
+        // Partially fill eligible buy orders while preserving volume for later orders.
         for order in &mut buy_orders {
+            if remaining_bar_volume <= 0.0_f64 {
+                break;
+            }
             if bar.low <= order.price {
-                let filled_shares = order.remaining_shares.min(config.bar_volume_limit);
+                let filled_shares = order.remaining_shares.min(remaining_bar_volume);
                 available_shares += filled_shares;
                 order.remaining_shares -= filled_shares;
+                remaining_bar_volume -= filled_shares;
                 logger.execution(bar.timestamp, "buy", filled_shares, order);
             }
         }
         buy_orders.retain(|order| order.remaining_shares > 0.0_f64);
 
-        // Partially fill each eligible sell order by at most one bar's configured volume.
+        // Partially fill eligible sell orders with the volume left after buy executions.
         for order in &mut sell_orders {
+            if remaining_bar_volume <= 0.0_f64 {
+                break;
+            }
             if bar.high >= order.price {
-                let filled_shares = order.remaining_shares.min(config.bar_volume_limit);
+                let filled_shares = order.remaining_shares.min(remaining_bar_volume);
                 available_cash += filled_shares * order.price;
                 order.remaining_shares -= filled_shares;
+                remaining_bar_volume -= filled_shares;
                 logger.execution(bar.timestamp, "sell", filled_shares, order);
             }
         }
@@ -1054,6 +1065,77 @@ mod tests {
         )
         .unwrap();
         assert!((result.final_value - 1_010.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn share_volume_limit_across_market_maker_orders() {
+        // Create two pending buy orders before making both eligible on the same bar.
+        let bars = vec![
+            Bar {
+                timestamp: 1_000,
+                low: 100.0,
+                high: 100.0,
+                close: 100.0,
+                liquidate: false,
+            },
+            Bar {
+                timestamp: 1_001,
+                low: 99.0,
+                high: 100.0,
+                close: 100.0,
+                liquidate: false,
+            },
+            Bar {
+                timestamp: 1_002,
+                low: 99.0,
+                high: 100.0,
+                close: 100.0,
+                liquidate: false,
+            },
+            Bar {
+                timestamp: 1_003,
+                low: 100.0,
+                high: 101.0,
+                close: 100.0,
+                liquidate: false,
+            },
+            Bar {
+                timestamp: 1_004,
+                low: 99.0,
+                high: 100.0,
+                close: 100.0,
+                liquidate: false,
+            },
+            Bar {
+                timestamp: 1_005,
+                low: 90.0,
+                high: 90.0,
+                close: 90.0,
+                liquidate: true,
+            },
+        ];
+        let config = MarketMakerConfig {
+            initial_cash: 1_000.0,
+            liquidation_seconds: 900,
+            bar_volume_limit: 2.0,
+            buy_ttl: 3_600,
+            sell_ttl: 14_400,
+            discount_percent: 1.0,
+            markup_percent: 1.0,
+            bet_size: 100.0,
+        };
+
+        // Confirm the two eligible buys consume at most two shares of volume in total.
+        let result = simulate_market_maker(
+            &[Day {
+                filename: "prices.csv".to_string(),
+                bars,
+            }],
+            config,
+            false,
+        )
+        .unwrap();
+        assert!((result.final_value - 968.0).abs() < f64::EPSILON);
     }
 
     #[test]
