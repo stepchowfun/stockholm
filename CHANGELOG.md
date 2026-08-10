@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.38] - 2026-08-09
+
+### Changed
+- Coordinate persistent and connection-local live state through a shared asynchronous lock.
+
+### Fixed
+- Remove terminal orders from persistent state using their permanent Interactive Brokers identifier when connection-local details are unavailable.
+
 ## [0.2.37] - 2026-08-09
 
 ### Added
