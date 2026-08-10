@@ -1,6 +1,18 @@
 use clap::{Args as ClapArgs, ValueEnum};
 use rayon::prelude::*;
 use std::{error::Error, fs, path::PathBuf, sync::Mutex};
+use time::{OffsetDateTime, Time};
+use time_tz::{OffsetDateTimeExt, timezones::db::america::NEW_YORK};
+
+// These Eastern times bound the unreliable early-morning trade-reporting window.
+const UNRELIABLE_DATA_START_TIME: Time = match Time::from_hms(4, 0, 0) {
+    Ok(time) => time,
+    Err(_) => panic!("The unreliable data start time must be valid."),
+};
+const UNRELIABLE_DATA_END_TIME: Time = match Time::from_hms(4, 15, 0) {
+    Ok(time) => time,
+    Err(_) => panic!("The unreliable data end time must be valid."),
+};
 
 // These strategies can be evaluated by a backtest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -648,12 +660,16 @@ fn parse_days(
         let mut bars = Vec::with_capacity(records.len());
         for (index, record) in records.iter().enumerate() {
             let line = index + 2;
+            let timestamp = parse_timestamp(
+                record.get(timestamp_index),
+                path,
+                &format!("date on line {line}"),
+            )?;
+            if is_unreliable_early_data(timestamp) {
+                continue;
+            }
             bars.push(Bar {
-                timestamp: parse_timestamp(
-                    record.get(timestamp_index),
-                    path,
-                    &format!("date on line {line}"),
-                )?,
+                timestamp: timestamp.unix_timestamp(),
                 low: parse_price(record.get(low_index), path, &format!("low on line {line}"))?,
                 high: parse_price(
                     record.get(high_index),
@@ -673,7 +689,12 @@ fn parse_days(
         let liquidation_seconds = i64::try_from(liquidation_seconds)?;
         let final_timestamp = bars
             .last()
-            .ok_or_else(|| format!("{} must contain at least one data row", path.display()))?
+            .ok_or_else(|| {
+                format!(
+                    "{} must contain at least one row outside the unreliable early-data window",
+                    path.display(),
+                )
+            })?
             .timestamp;
         for bar in &mut bars {
             bar.liquidate = liquidation_seconds > 0
@@ -701,12 +722,21 @@ fn parse_timestamp(
     value: Option<&str>,
     path: &std::path::Path,
     description: &str,
-) -> Result<i64, Box<dyn Error>> {
-    // Reject missing and noninteger timestamps before they reach simulation timing and logs.
+) -> Result<OffsetDateTime, Box<dyn Error>> {
+    // Reject missing, noninteger, and out-of-range timestamps before simulation.
     let value = value.ok_or_else(|| format!("{} is missing its {description}", path.display()))?;
-    value
+    let timestamp = value
         .parse::<i64>()
+        .map_err(|error| format!("invalid {description} in {}: {error}", path.display()))?;
+    OffsetDateTime::from_unix_timestamp(timestamp)
         .map_err(|error| format!("invalid {description} in {}: {error}", path.display()).into())
+}
+
+// Identify trade reports that cannot be treated as contemporaneous fill opportunities.
+fn is_unreliable_early_data(timestamp: OffsetDateTime) -> bool {
+    let eastern_time = timestamp.to_timezone(NEW_YORK).time();
+
+    eastern_time >= UNRELIABLE_DATA_START_TIME && eastern_time < UNRELIABLE_DATA_END_TIME
 }
 
 // Locate one required CSV price column.
@@ -730,6 +760,7 @@ fn buy_and_hold(files: &[(PathBuf, String)], initial_cash: f64) -> Result<f64, B
     for (path, contents) in files {
         let mut reader = csv::Reader::from_reader(contents.as_bytes());
         let headers = reader.headers()?;
+        let timestamp_index = column_index(headers, path, "date")?;
         let open_index = headers
             .iter()
             .position(|header| header == "open")
@@ -739,10 +770,28 @@ fn buy_and_hold(files: &[(PathBuf, String)], initial_cash: f64) -> Result<f64, B
             .position(|header| header == "close")
             .ok_or_else(|| format!("{} must contain a close column", path.display()))?;
         let records = reader.records().collect::<Result<Vec<_>, _>>()?;
-        let first_record = records
-            .first()
-            .ok_or_else(|| format!("{} must contain at least one data row", path.display()))?;
-        let last_record = records.last().unwrap();
+        let mut first_record = None;
+        let mut last_record = None;
+        for (index, record) in records.iter().enumerate() {
+            let line = index + 2;
+            let timestamp = parse_timestamp(
+                record.get(timestamp_index),
+                path,
+                &format!("date on line {line}"),
+            )?;
+            if is_unreliable_early_data(timestamp) {
+                continue;
+            }
+            first_record.get_or_insert(record);
+            last_record = Some(record);
+        }
+        let first_record = first_record.ok_or_else(|| {
+            format!(
+                "{} must contain at least one row outside the unreliable early-data window",
+                path.display(),
+            )
+        })?;
+        let last_record = last_record.unwrap();
 
         // Parse finite positive prices before using the boundary records.
         let open = parse_price(first_record.get(open_index), path, "opening")?;
@@ -826,12 +875,13 @@ fn parse_percent(value: &str) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, Bar, Day, MarketMakerConfig, Strategy, buy_and_hold, market_maker, market_maker_grid,
-        parse_days, sharpe_ratio, simulate_market_maker,
+        Args, Bar, Day, MarketMakerConfig, Strategy, buy_and_hold, is_unreliable_early_data,
+        market_maker, market_maker_grid, parse_days, sharpe_ratio, simulate_market_maker,
     };
     use crate::{Cli, Subcommand};
     use clap::Parser;
     use std::path::PathBuf;
+    use time::OffsetDateTime;
 
     #[test]
     fn parse_backtest_subcommand() {
@@ -903,20 +953,75 @@ mod tests {
     }
 
     #[test]
+    fn exclude_early_data_across_eastern_time_offsets() {
+        // Apply the same inclusive start and exclusive end in daylight and standard time.
+        for start in [1_784_016_000_i64, 1_767_949_200_i64] {
+            assert!(!is_unreliable_early_data(
+                OffsetDateTime::from_unix_timestamp(start - 1).unwrap(),
+            ));
+            assert!(is_unreliable_early_data(
+                OffsetDateTime::from_unix_timestamp(start).unwrap(),
+            ));
+            assert!(is_unreliable_early_data(
+                OffsetDateTime::from_unix_timestamp(start + 899).unwrap(),
+            ));
+            assert!(!is_unreliable_early_data(
+                OffsetDateTime::from_unix_timestamp(start + 900).unwrap(),
+            ));
+        }
+    }
+
+    #[test]
+    fn discard_unreliable_rows_before_parsing_market_maker_prices() {
+        // Ignore malformed prices in the excluded window and retain the 4:15 a.m. boundary.
+        let files = vec![(
+            PathBuf::from("prices.csv"),
+            concat!(
+                "date,low,high,close\n",
+                "1784016000,invalid,invalid,invalid\n",
+                "1784016899,invalid,invalid,invalid\n",
+                "1784016900,100,101,100\n",
+            )
+            .to_string(),
+        )];
+
+        let days = parse_days(&files, 0).unwrap();
+
+        assert_eq!(days[0].bars.len(), 1);
+        assert_eq!(days[0].bars[0].timestamp, 1_784_016_900);
+    }
+
+    #[test]
     fn calculate_buy_and_hold_from_chronological_files() {
         // Confirm the strategy uses the first open and final close it receives.
         let files = vec![
             (
                 PathBuf::from("monday.csv"),
-                "open,close\n100,110\n110,120\n".to_string(),
+                "date,open,close\n1000,100,110\n1001,110,120\n".to_string(),
             ),
             (
                 PathBuf::from("tuesday.csv"),
-                "open,close\n200,210\n210,230\n".to_string(),
+                "date,open,close\n2000,200,210\n2001,210,230\n".to_string(),
             ),
         ];
 
         assert!((buy_and_hold(&files, 1_000.0).unwrap() - 2_300.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn discard_unreliable_rows_before_parsing_buy_and_hold_prices() {
+        // Invest at the first reliable open without validating excluded trade-report prices.
+        let files = vec![(
+            PathBuf::from("prices.csv"),
+            concat!(
+                "date,open,close\n",
+                "1784016000,invalid,invalid\n",
+                "1784016900,100,120\n",
+            )
+            .to_string(),
+        )];
+
+        assert!((buy_and_hold(&files, 1_000.0).unwrap() - 1_200.0).abs() < f64::EPSILON);
     }
 
     #[test]

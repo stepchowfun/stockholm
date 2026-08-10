@@ -32,7 +32,7 @@ Options:
   -h, --help                   Print help
 ```
 
-You can evaluate a strategy over historical CSV files with the `backtest` subcommand. Files are ordered lexicographically by filename; the buy-and-hold strategy invests the initial cash at the first opening price and prints the resulting account value at the final closing price:
+You can evaluate a strategy over historical CSV files with the `backtest` subcommand. Every strategy excludes records from 4:00 a.m. through 4:14:59 a.m. Eastern time because delayed overnight trade reports make that window unreliable for backtesting. Files are ordered lexicographically by filename; the buy-and-hold strategy invests the initial cash at the first remaining opening price and prints the resulting account value at the final closing price:
 
 ```sh
 stockholm backtest --strategy buy-and-hold --data-paths data/validation/*.csv
