@@ -400,7 +400,10 @@ async fn run_control_step(
             .position_shares
             .map(|shares| (shares - reserved_sell_shares).max(0.0_f64).floor());
         info!(
-            "Equity: {}; buying power: {}; open orders: {}; bid: {}; ask: {}",
+            concat!(
+                "Equity: {}; buying power: {}; open orders: {}; ",
+                "bid: {}; ask: {}; liquidating: {}",
+            ),
             state
                 .equity_with_loan_value
                 .map_or_else(|| "unavailable".to_string(), |equity| equity.to_string()),
@@ -412,6 +415,7 @@ async fn run_control_step(
             state
                 .ask_price
                 .map_or_else(|| "unavailable".to_string(), |price| price.to_string()),
+            liquidating,
         );
         (
             buying_power,
