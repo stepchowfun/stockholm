@@ -2,8 +2,6 @@ mod backtest;
 mod historical;
 mod infer;
 mod run;
-// Keep the full persistence API compiled while state mutation and saving are not yet implemented.
-#[allow(dead_code)]
 mod state;
 mod train;
 
