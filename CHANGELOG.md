@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.41] - 2026-08-09
+
+### Changed
+- Track live bid and ask timestamps and clear prices older than five minutes.
+
 ## [0.2.40] - 2026-08-09
 
 ### Changed
