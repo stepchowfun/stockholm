@@ -349,9 +349,7 @@ async fn stream_positions(
 }
 
 // Periodically clear bid and ask prices whose source timestamps are too old.
-async fn clear_stale_quotes(
-    runtime_state: &RwLock<RuntimeState>,
-) -> Result<(), Box<dyn Error>> {
+async fn clear_stale_quotes(runtime_state: &RwLock<RuntimeState>) -> Result<(), Box<dyn Error>> {
     loop {
         // Reuse the control cadence so stale prices disappear promptly after crossing the limit.
         tokio::time::sleep(RUN_DELAY).await;
@@ -1119,10 +1117,7 @@ mod tests {
         assert_eq!(state.bid_price, None);
         assert_eq!(state.bid_price_timestamp, None);
         assert_eq!(state.ask_price, Some(11.0_f64));
-        assert_eq!(
-            state.ask_price_timestamp,
-            Some(now - Duration::minutes(5)),
-        );
+        assert_eq!(state.ask_price_timestamp, Some(now - Duration::minutes(5)));
     }
 
     #[test]
