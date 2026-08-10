@@ -31,14 +31,14 @@ const LIQUIDATION_SELL_ORDER_TTL: Duration = Duration::seconds(10);
 const CANCEL_RETRY_DELAY: Duration = Duration::seconds(10);
 const ORDER_REF_PREFIX: &str = "stockholm:";
 
-// These Eastern times bound the daily liquidation window across midnight.
-const LIQUIDATION_TIME: Time = match Time::from_hms(15, 45, 0) {
+// These Eastern times bound the daily liquidation window.
+const LIQUIDATION_START_TIME: Time = match Time::from_hms(15, 45, 0) {
     Ok(time) => time,
-    Err(_) => panic!("The liquidation time must be valid."),
+    Err(_) => panic!("The liquidation start time must be valid."),
 };
-const MARKET_OPEN_TIME: Time = match Time::from_hms(9, 30, 0) {
+const LIQUIDATION_END_TIME: Time = match Time::from_hms(20, 0, 0) {
     Ok(time) => time,
-    Err(_) => panic!("The market-open time must be valid."),
+    Err(_) => panic!("The liquidation end time must be valid."),
 };
 
 // These arguments configure the trading bot.
@@ -400,7 +400,10 @@ async fn run_control_step(
             .position_shares
             .map(|shares| (shares - reserved_sell_shares).max(0.0_f64).floor());
         info!(
-            "Equity: {}; buying power: {}; open orders: {}; bid: {}; ask: {}",
+            concat!(
+                "Equity: {}; buying power: {}; open orders: {}; ",
+                "bid: {}; ask: {}; liquidating: {}",
+            ),
             state
                 .equity_with_loan_value
                 .map_or_else(|| "unavailable".to_string(), |equity| equity.to_string()),
@@ -412,6 +415,7 @@ async fn run_control_step(
             state
                 .ask_price
                 .map_or_else(|| "unavailable".to_string(), |price| price.to_string()),
+            liquidating,
         );
         (
             buying_power,
@@ -493,11 +497,11 @@ async fn cancel_expired_orders(
     Ok(())
 }
 
-// Determine whether the Eastern clock is inside the overnight liquidation window.
+// Determine whether the Eastern clock is inside the daily liquidation window.
 fn is_liquidating(now: OffsetDateTime) -> bool {
     let eastern_time = now.to_timezone(NEW_YORK).time();
 
-    eastern_time >= LIQUIDATION_TIME || eastern_time < MARKET_OPEN_TIME
+    eastern_time >= LIQUIDATION_START_TIME && eastern_time < LIQUIDATION_END_TIME
 }
 
 // Place a limit order to buy the requested number of shares.
@@ -1106,14 +1110,16 @@ mod tests {
     }
 
     #[test]
-    fn liquidate_between_afternoon_cutoff_and_market_open() {
+    fn liquidate_between_start_and_end_times() {
         // Compare Eastern wall-clock boundaries in both daylight and standard time.
         assert!(!is_liquidating(utc_datetime(Month::August, 10, 19, 44, 59)));
         assert!(is_liquidating(utc_datetime(Month::August, 10, 19, 45, 0)));
-        assert!(is_liquidating(utc_datetime(Month::August, 11, 13, 29, 59)));
-        assert!(!is_liquidating(utc_datetime(Month::August, 11, 13, 30, 0)));
+        assert!(is_liquidating(utc_datetime(Month::August, 10, 23, 59, 59)));
+        assert!(!is_liquidating(utc_datetime(Month::August, 11, 0, 0, 0)));
         assert!(!is_liquidating(utc_datetime(Month::January, 9, 20, 44, 59)));
         assert!(is_liquidating(utc_datetime(Month::January, 9, 20, 45, 0)));
+        assert!(is_liquidating(utc_datetime(Month::January, 10, 0, 59, 59)));
+        assert!(!is_liquidating(utc_datetime(Month::January, 10, 1, 0, 0)));
     }
 
     #[tokio::test]
