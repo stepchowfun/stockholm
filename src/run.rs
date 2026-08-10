@@ -12,10 +12,10 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     io,
-    sync::RwLock,
 };
 use time::{Duration, OffsetDateTime, Time};
 use time_tz::{OffsetDateTimeExt, timezones::db::america::NEW_YORK};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 // These constants configure trading defaults, routing venues, and failure recovery.
@@ -183,10 +183,7 @@ async fn run_with_connection(
     runtime_state: &RwLock<RuntimeState>,
 ) -> Result<(), Box<dyn Error>> {
     // Discard details from the previous connection before rebuilding broker snapshots.
-    runtime_state
-        .write()
-        .map_err(|_| io::Error::other("Runtime state lock was poisoned."))?
-        .volatile = initial_volatile_state();
+    runtime_state.write().await.volatile = initial_volatile_state();
 
     // Subscribe before reconciling the initial snapshot so intervening order updates are buffered.
     let order_updates = client.order_update_stream().await?;
@@ -250,7 +247,7 @@ async fn stream_account_summary(
         match update? {
             AccountSummaryResult::Summary(summary) => {
                 // Retain valid account metrics for use by the control loop.
-                update_account_metric(runtime_state, &summary.tag, &summary.value)?;
+                update_account_metric(runtime_state, &summary.tag, &summary.value).await?;
 
                 if summary.currency.is_empty() {
                     debug!(
@@ -294,7 +291,7 @@ async fn stream_order_updates(
         // Keep persistent identities and volatile details synchronized for managed orders.
         match &update {
             OrderUpdate::OpenOrder(data) if data.order.order_ref.starts_with(ORDER_REF_PREFIX) => {
-                update_open_order(runtime_state, data)?;
+                update_open_order(runtime_state, data).await?;
             }
             OrderUpdate::OrderStatus(status) => {
                 update_order_status(
@@ -303,7 +300,8 @@ async fn stream_order_updates(
                     status.filled,
                     status.remaining,
                     status.status.is_terminal(),
-                )?;
+                )
+                .await?;
             }
             OrderUpdate::OpenOrder(_)
             | OrderUpdate::ExecutionData(_)
@@ -329,9 +327,7 @@ async fn stream_positions(
 
     // Retain the matching position and use zero when the initial snapshot omits the symbol.
     while let Some(update) = updates.next().await {
-        let mut state = runtime_state
-            .write()
-            .map_err(|_| io::Error::other("Runtime state lock was poisoned."))?;
+        let mut state = runtime_state.write().await;
         match update? {
             PositionUpdate::Position(position) if position.contract.symbol == symbol => {
                 state.volatile.position_shares = Some(position.position);
@@ -365,9 +361,7 @@ async fn stream_tick_by_tick(
     while let Some(quote) = quotes.next().await {
         let quote = quote?;
         {
-            let mut state = runtime_state
-                .write()
-                .map_err(|_| io::Error::other("Runtime state lock was poisoned."))?;
+            let mut state = runtime_state.write().await;
             state.volatile.bid_price = (quote.bid_price > 0.0_f64).then_some(quote.bid_price);
             state.volatile.ask_price = (quote.ask_price > 0.0_f64).then_some(quote.ask_price);
         }
@@ -392,9 +386,7 @@ async fn run_control_step(
 
     // Snapshot resources and quotes without retaining the state lock across submissions.
     let (buying_power, bid_price, ask_price, sellable_shares) = {
-        let state = runtime_state
-            .read()
-            .map_err(|_| io::Error::other("Runtime state lock was poisoned."))?;
+        let state = runtime_state.read().await;
         let state = &state.volatile;
         let open_buy_order_value = calculate_open_buy_order_value(&state.open_orders);
         let buying_power =
@@ -470,9 +462,7 @@ async fn cancel_expired_orders(
 ) -> Result<(), Box<dyn Error>> {
     // Join order representations and persist cancellation attempts under one state guard.
     let cancellation_attempts = {
-        let mut state = runtime_state
-            .write()
-            .map_err(|_| io::Error::other("Runtime state lock was poisoned."))?;
+        let mut state = runtime_state.write().await;
         let volatile_orders = state
             .volatile
             .open_orders
@@ -540,9 +530,7 @@ async fn place_limit_buy(
     // Record both representations and persist the pending order before submitting it.
     let order_id = client.next_order_id();
     {
-        let mut state = runtime_state
-            .write()
-            .map_err(|_| io::Error::other("Runtime state lock was poisoned."))?;
+        let mut state = runtime_state.write().await;
         state.persistent.open_orders.push(state::OpenOrder {
             order_ref: order_ref.clone(),
             perm_id: None,
@@ -593,9 +581,7 @@ async fn place_limit_sell(
     // Record both representations and persist the pending order before submitting it.
     let order_id = client.next_order_id();
     {
-        let mut state = runtime_state
-            .write()
-            .map_err(|_| io::Error::other("Runtime state lock was poisoned."))?;
+        let mut state = runtime_state.write().await;
         state.persistent.open_orders.push(state::OpenOrder {
             order_ref: order_ref.clone(),
             perm_id: None,
@@ -643,7 +629,7 @@ async fn fetch_orders(
             Orders::OrderData(data) if data.order.order_ref.starts_with(ORDER_REF_PREFIX) => {
                 order_count += 1;
                 open_order_refs.insert(data.order.order_ref.clone());
-                update_open_order(runtime_state, &data)?;
+                update_open_order(runtime_state, &data).await?;
                 debug!("Stockholm open order: {data:?}");
             }
             Orders::OrderStatus(status) => {
@@ -653,7 +639,8 @@ async fn fetch_orders(
                     status.filled,
                     status.remaining,
                     status.status.is_terminal(),
-                )?;
+                )
+                .await?;
             }
             Orders::OrderData(_) => {}
         }
@@ -661,9 +648,7 @@ async fn fetch_orders(
 
     // Prune both representations together using IB's complete open-order snapshot.
     {
-        let mut state = runtime_state
-            .write()
-            .map_err(|_| io::Error::other("Runtime state lock was poisoned."))?;
+        let mut state = runtime_state.write().await;
         let previous_len = state.persistent.open_orders.len();
         state
             .persistent
@@ -691,7 +676,7 @@ async fn fetch_orders(
 }
 
 // Update tracked metrics from matching account-summary fields.
-fn update_account_metric(
+async fn update_account_metric(
     runtime_state: &RwLock<RuntimeState>,
     tag: &str,
     value: &str,
@@ -705,9 +690,7 @@ fn update_account_metric(
     }
 
     // Ignore unrelated fields and retain recognized metrics.
-    let mut state = runtime_state
-        .write()
-        .map_err(|_| io::Error::other("Runtime state lock was poisoned."))?;
+    let mut state = runtime_state.write().await;
     match tag {
         AccountSummaryTags::EQUITY_WITH_LOAN_VALUE => {
             state.volatile.equity_with_loan_value = Some(value);
@@ -720,7 +703,10 @@ fn update_account_metric(
 }
 
 // Record the latest details for an open Stockholm order.
-fn update_open_order(runtime_state: &RwLock<RuntimeState>, data: &OrderData) -> io::Result<()> {
+async fn update_open_order(
+    runtime_state: &RwLock<RuntimeState>,
+    data: &OrderData,
+) -> io::Result<()> {
     // Validate connection-specific details before changing either representation.
     let volatile_order = VolatileOrder {
         order_ref: data.order.order_ref.clone(),
@@ -744,9 +730,7 @@ fn update_open_order(runtime_state: &RwLock<RuntimeState>, data: &OrderData) -> 
 
     // Refresh volatile details and persistent identifiers under one state guard.
     let perm_id = (data.order.perm_id != 0).then_some(data.order.perm_id);
-    let mut state = runtime_state
-        .write()
-        .map_err(|_| io::Error::other("Runtime state lock was poisoned."))?;
+    let mut state = runtime_state.write().await;
     state
         .volatile
         .open_orders
@@ -803,7 +787,7 @@ fn apply_order_status(
 }
 
 // Apply a status and persist any terminal removal under one state guard.
-fn update_order_status(
+async fn update_order_status(
     runtime_state: &RwLock<RuntimeState>,
     order_id: i32,
     filled_shares: f64,
@@ -811,9 +795,7 @@ fn update_order_status(
     is_terminal: bool,
 ) -> io::Result<()> {
     // Keep the state guard until both representations and durable state are updated.
-    let mut state = runtime_state
-        .write()
-        .map_err(|_| io::Error::other("Runtime state lock was poisoned."))?;
+    let mut state = runtime_state.write().await;
     let persistent_changed = apply_order_status(
         &mut state,
         order_id,
@@ -949,8 +931,9 @@ mod tests {
     use crate::state;
     use clap::Parser;
     use ibapi::accounts::AccountSummaryTags;
-    use std::{collections::HashMap, sync::RwLock};
+    use std::collections::HashMap;
     use time::{Date, Duration, Month, OffsetDateTime};
+    use tokio::sync::RwLock;
 
     // This parser exposes the run arguments for focused tests.
     #[derive(Parser)]
@@ -1197,20 +1180,27 @@ mod tests {
         assert!(is_liquidating(utc_datetime(Month::January, 9, 20, 45, 0)));
     }
 
-    #[test]
-    fn retain_only_valid_account_metrics() {
+    #[tokio::test]
+    async fn retain_only_valid_account_metrics() {
         // Confirm only finite numeric tracked summaries update volatile state.
         let state = RwLock::new(RuntimeState {
             persistent: state::initial(),
             volatile: initial_volatile_state(),
         });
         update_account_metric(&state, AccountSummaryTags::EQUITY_WITH_LOAN_VALUE, "1234.5")
+            .await
             .unwrap();
-        update_account_metric(&state, AccountSummaryTags::INIT_MARGIN_REQ, "234.5").unwrap();
-        update_account_metric(&state, AccountSummaryTags::INIT_MARGIN_REQ, "NaN").unwrap();
-        update_account_metric(&state, AccountSummaryTags::NET_LIQUIDATION, "9999").unwrap();
+        update_account_metric(&state, AccountSummaryTags::INIT_MARGIN_REQ, "234.5")
+            .await
+            .unwrap();
+        update_account_metric(&state, AccountSummaryTags::INIT_MARGIN_REQ, "NaN")
+            .await
+            .unwrap();
+        update_account_metric(&state, AccountSummaryTags::NET_LIQUIDATION, "9999")
+            .await
+            .unwrap();
 
-        let state = state.read().unwrap();
+        let state = state.read().await;
         assert_eq!(state.volatile.equity_with_loan_value, Some(1234.5_f64));
         assert_eq!(state.volatile.init_margin_req, Some(234.5_f64));
     }
