@@ -28,6 +28,7 @@ const SELL_MARKUP_PERCENT: f64 = 1.0_f64;
 const BUY_ORDER_TTL: Duration = Duration::seconds(30);
 const SELL_ORDER_TTL: Duration = Duration::seconds(300);
 const LIQUIDATION_SELL_ORDER_TTL: Duration = Duration::seconds(10);
+const QUOTE_MAX_AGE: Duration = Duration::minutes(5);
 const CANCEL_RETRY_DELAY: Duration = Duration::seconds(10);
 const ORDER_REF_PREFIX: &str = "stockholm:";
 const SMART_EXCHANGE: &str = "SMART";
@@ -84,8 +85,14 @@ struct VolatileState {
     // The most recently observed bid price, if one is available.
     bid_price: Option<f64>,
 
+    // The source timestamp of the most recently observed valid bid price.
+    bid_price_timestamp: Option<OffsetDateTime>,
+
     // The most recently observed ask price, if one is available.
     ask_price: Option<f64>,
+
+    // The source timestamp of the most recently observed valid ask price.
+    ask_price_timestamp: Option<OffsetDateTime>,
 }
 
 // This runtime state keeps durable and connection-local data behind one lock.
@@ -145,7 +152,9 @@ fn initial_volatile_state() -> VolatileState {
         equity_with_loan_value: None,
         init_margin_req: None,
         bid_price: None,
+        bid_price_timestamp: None,
         ask_price: None,
+        ask_price_timestamp: None,
     }
 }
 
@@ -205,6 +214,7 @@ async fn run_with_connection(
         stream_positions(client, &args.symbol, runtime_state),
         stream_tick_by_tick(client, &args.symbol, SMART_EXCHANGE, runtime_state),
         stream_tick_by_tick(client, &args.symbol, OVERNIGHT_EXCHANGE, runtime_state),
+        clear_stale_quotes(runtime_state),
     )?;
 
     Ok(())
@@ -338,6 +348,18 @@ async fn stream_positions(
     Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
+// Periodically clear bid and ask prices whose source timestamps are too old.
+async fn clear_stale_quotes(
+    runtime_state: &RwLock<RuntimeState>,
+) -> Result<(), Box<dyn Error>> {
+    loop {
+        // Reuse the control cadence so stale prices disappear promptly after crossing the limit.
+        tokio::time::sleep(RUN_DELAY).await;
+        let mut state = runtime_state.write().await;
+        clear_stale_quote_prices(&mut state.volatile, OffsetDateTime::now_utc());
+    }
+}
+
 // Stream tick-by-tick bid and ask prices for the configured symbol and exchange.
 async fn stream_tick_by_tick(
     client: &Client,
@@ -360,7 +382,9 @@ async fn stream_tick_by_tick(
         {
             let mut state = runtime_state.write().await;
             state.volatile.bid_price = (quote.bid_price > 0.0_f64).then_some(quote.bid_price);
+            state.volatile.bid_price_timestamp = state.volatile.bid_price.map(|_| quote.time);
             state.volatile.ask_price = (quote.ask_price > 0.0_f64).then_some(quote.ask_price);
+            state.volatile.ask_price_timestamp = state.volatile.ask_price.map(|_| quote.time);
         }
         debug!("Tick-by-tick quote for {symbol} ({exchange}): {quote:?}");
     }
@@ -851,6 +875,29 @@ fn calculate_order_limits(
     }
 }
 
+// Clear each quote side independently once its source timestamp exceeds the age limit.
+fn clear_stale_quote_prices(state: &mut VolatileState, now: OffsetDateTime) {
+    let cutoff = now - QUOTE_MAX_AGE;
+
+    // Clear a stale bid and its timestamp together.
+    if state
+        .bid_price_timestamp
+        .is_some_and(|timestamp| timestamp < cutoff)
+    {
+        state.bid_price = None;
+        state.bid_price_timestamp = None;
+    }
+
+    // Clear a stale ask and its timestamp together.
+    if state
+        .ask_price_timestamp
+        .is_some_and(|timestamp| timestamp < cutoff)
+    {
+        state.ask_price = None;
+        state.ask_price_timestamp = None;
+    }
+}
+
 // Determine whether an open order has expired and is eligible for another cancellation attempt.
 fn cancellation_due(
     order: &state::OpenOrder,
@@ -909,8 +956,8 @@ mod tests {
     use super::{
         Args, RuntimeState, Side, VolatileOrder, calculate_buying_power,
         calculate_open_buy_order_value, calculate_open_sell_shares, calculate_order_limits,
-        cancellation_due, initial_volatile_state, is_liquidating, round_down_to_cent,
-        round_up_to_cent, update_account_metric,
+        cancellation_due, clear_stale_quote_prices, initial_volatile_state, is_liquidating,
+        round_down_to_cent, round_up_to_cent, update_account_metric,
     };
     use crate::state;
     use clap::Parser;
@@ -1054,6 +1101,27 @@ mod tests {
         assert_eq!(
             calculate_order_limits(Some(10.129_f64), None, true),
             (None, None),
+        );
+    }
+
+    #[test]
+    fn clear_only_quotes_older_than_five_minutes() {
+        // Expire each side independently while retaining a quote exactly at the age boundary.
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::minutes(10);
+        let mut state = initial_volatile_state();
+        state.bid_price = Some(10.0_f64);
+        state.bid_price_timestamp = Some(now - Duration::minutes(5) - Duration::seconds(1));
+        state.ask_price = Some(11.0_f64);
+        state.ask_price_timestamp = Some(now - Duration::minutes(5));
+
+        clear_stale_quote_prices(&mut state, now);
+
+        assert_eq!(state.bid_price, None);
+        assert_eq!(state.bid_price_timestamp, None);
+        assert_eq!(state.ask_price, Some(11.0_f64));
+        assert_eq!(
+            state.ask_price_timestamp,
+            Some(now - Duration::minutes(5)),
         );
     }
 
