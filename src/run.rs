@@ -30,6 +30,8 @@ const SELL_ORDER_TTL: Duration = Duration::seconds(300);
 const LIQUIDATION_SELL_ORDER_TTL: Duration = Duration::seconds(10);
 const CANCEL_RETRY_DELAY: Duration = Duration::seconds(10);
 const ORDER_REF_PREFIX: &str = "stockholm:";
+const SMART_EXCHANGE: &str = "SMART";
+const OVERNIGHT_EXCHANGE: &str = "OVERNIGHT";
 
 // These Eastern times bound the daily liquidation window.
 const LIQUIDATION_START_TIME: Time = match Time::from_hms(15, 45, 0) {
@@ -201,7 +203,8 @@ async fn run_with_connection(
         stream_account_summary(client, runtime_state),
         stream_order_updates(order_updates, runtime_state),
         stream_positions(client, &args.symbol, runtime_state),
-        stream_tick_by_tick(client, &args.symbol, runtime_state),
+        stream_tick_by_tick(client, &args.symbol, SMART_EXCHANGE, runtime_state),
+        stream_tick_by_tick(client, &args.symbol, OVERNIGHT_EXCHANGE, runtime_state),
     )?;
 
     Ok(())
@@ -335,20 +338,21 @@ async fn stream_positions(
     Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
-// Stream tick-by-tick bid and ask prices for the configured symbol.
+// Stream tick-by-tick bid and ask prices for the configured symbol and exchange.
 async fn stream_tick_by_tick(
     client: &Client,
     symbol: &str,
+    exchange: &str,
     runtime_state: &RwLock<RuntimeState>,
 ) -> Result<(), Box<dyn Error>> {
-    // Subscribe to an unlimited stream of consolidated quotes without unused sizes.
-    let contract = Contract::stock(symbol).build();
+    // Subscribe to an unlimited quote stream from the requested routing venue.
+    let contract = Contract::stock(symbol).on_exchange(exchange).build();
     let subscription = client
         .tick_by_tick(&contract, 0)
         .bid_ask(IgnoreSize::Yes)
         .await?;
     let mut quotes = subscription.filter_data();
-    debug!("Streaming tick-by-tick quotes for {symbol}…");
+    debug!("Streaming tick-by-tick quotes for {symbol} from {exchange}…");
 
     // Update both sides atomically and propagate stream failures to the connection loop.
     while let Some(quote) = quotes.next().await {
@@ -358,7 +362,7 @@ async fn stream_tick_by_tick(
             state.volatile.bid_price = (quote.bid_price > 0.0_f64).then_some(quote.bid_price);
             state.volatile.ask_price = (quote.ask_price > 0.0_f64).then_some(quote.ask_price);
         }
-        debug!("Tick-by-tick quote for {symbol}: {quote:?}");
+        debug!("Tick-by-tick quote for {symbol} ({exchange}): {quote:?}");
     }
 
     Err(ibapi::Error::UnexpectedEndOfStream.into())
