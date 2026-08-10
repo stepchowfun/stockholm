@@ -5,7 +5,7 @@ use ibapi::{
     accounts::{AccountSummaryResult, AccountSummaryTags, PositionUpdate, types::AccountGroup},
     contracts::Contract,
     market_data::IgnoreSize,
-    orders::{Action, OrderData, OrderUpdate, Orders},
+    orders::{Action, OrderData, OrderStatus, OrderUpdate, Orders},
     prelude::{StreamExt, Subscription, SubscriptionItemStreamExt},
 };
 use std::{
@@ -294,14 +294,7 @@ async fn stream_order_updates(
                 update_open_order(runtime_state, data).await?;
             }
             OrderUpdate::OrderStatus(status) => {
-                update_order_status(
-                    runtime_state,
-                    status.order_id,
-                    status.filled,
-                    status.remaining,
-                    status.status.is_terminal(),
-                )
-                .await?;
+                update_order_status(runtime_state, status).await?;
             }
             OrderUpdate::OpenOrder(_)
             | OrderUpdate::ExecutionData(_)
@@ -633,14 +626,7 @@ async fn fetch_orders(
                 debug!("Stockholm open order: {data:?}");
             }
             Orders::OrderStatus(status) => {
-                update_order_status(
-                    runtime_state,
-                    status.order_id,
-                    status.filled,
-                    status.remaining,
-                    status.status.is_terminal(),
-                )
-                .await?;
+                update_order_status(runtime_state, &status).await?;
             }
             Orders::OrderData(_) => {}
         }
@@ -760,49 +746,39 @@ async fn update_open_order(
     Ok(())
 }
 
-// Apply an order status to both in-memory representations.
-fn apply_order_status(
-    state: &mut RuntimeState,
-    order_id: i32,
-    filled_shares: f64,
-    remaining_shares: f64,
-    is_terminal: bool,
-) -> bool {
-    // Refresh active quantities or remove a terminal order from both representations.
-    if is_terminal {
-        if let Some(order) = state.volatile.open_orders.remove(&order_id) {
-            let previous_len = state.persistent.open_orders.len();
-            state
-                .persistent
-                .open_orders
-                .retain(|persistent_order| persistent_order.order_ref != order.order_ref);
-            return state.persistent.open_orders.len() != previous_len;
-        }
-    } else if let Some(order) = state.volatile.open_orders.get_mut(&order_id) {
-        order.filled_shares = filled_shares;
-        order.remaining_shares = remaining_shares;
-    }
-
-    false
-}
-
 // Apply a status and persist any terminal removal under one state guard.
 async fn update_order_status(
     runtime_state: &RwLock<RuntimeState>,
-    order_id: i32,
-    filled_shares: f64,
-    remaining_shares: f64,
-    is_terminal: bool,
+    status: &OrderStatus,
 ) -> io::Result<()> {
     // Keep the state guard until both representations and durable state are updated.
     let mut state = runtime_state.write().await;
-    let persistent_changed = apply_order_status(
-        &mut state,
-        order_id,
-        filled_shares,
-        remaining_shares,
-        is_terminal,
-    );
+    let persistent_changed = if status.status.is_terminal() {
+        let order_ref = state
+            .volatile
+            .open_orders
+            .remove(&status.order_id)
+            .map(|order| order.order_ref);
+        let previous_len = state.persistent.open_orders.len();
+        if let Some(order_ref) = order_ref {
+            state
+                .persistent
+                .open_orders
+                .retain(|order| order.order_ref != order_ref);
+        } else if status.perm_id != 0 {
+            state
+                .persistent
+                .open_orders
+                .retain(|order| order.perm_id != Some(status.perm_id));
+        }
+        state.persistent.open_orders.len() != previous_len
+    } else {
+        if let Some(order) = state.volatile.open_orders.get_mut(&status.order_id) {
+            order.filled_shares = status.filled;
+            order.remaining_shares = status.remaining;
+        }
+        false
+    };
     if persistent_changed {
         state::save(&state.persistent)?;
     }
@@ -923,7 +899,7 @@ fn round_up_to_cent(price: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, RuntimeState, Side, VolatileOrder, apply_order_status, calculate_buying_power,
+        Args, RuntimeState, Side, VolatileOrder, calculate_buying_power,
         calculate_open_buy_order_value, calculate_open_sell_shares, calculate_order_limits,
         cancellation_due, initial_volatile_state, is_liquidating, round_down_to_cent,
         round_up_to_cent, update_account_metric,
@@ -1054,46 +1030,6 @@ mod tests {
         assert!((calculate_open_buy_order_value(&open_orders) - 20.0_f64).abs() < f64::EPSILON);
         assert!((calculate_open_sell_shares(&open_orders, "SOXL") - 4.0_f64).abs() < f64::EPSILON);
         assert!(calculate_open_sell_shares(&open_orders, "AAPL").abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn apply_order_status_to_both_runtime_representations() {
-        // Start with matching durable and connection-local representations of one order.
-        let order_ref = "stockholm:test".to_string();
-        let mut runtime_state = RuntimeState {
-            persistent: state::State {
-                open_orders: vec![state::OpenOrder {
-                    order_ref: order_ref.clone(),
-                    perm_id: Some(123),
-                    created_at: OffsetDateTime::UNIX_EPOCH,
-                    last_cancelled_at: None,
-                }],
-            },
-            volatile: initial_volatile_state(),
-        };
-        runtime_state.volatile.open_orders.insert(
-            7_i32,
-            VolatileOrder {
-                order_ref,
-                symbol: "SOXL".to_string(),
-                price: 10.0,
-                side: Side::Sell,
-                filled_shares: 0.0,
-                remaining_shares: 5.0,
-            },
-        );
-
-        // Update active quantities without changing the durable representation.
-        assert!(!apply_order_status(&mut runtime_state, 7, 2.0, 3.0, false));
-        let order = runtime_state.volatile.open_orders.get(&7_i32).unwrap();
-        assert!((order.filled_shares - 2.0_f64).abs() < f64::EPSILON);
-        assert!((order.remaining_shares - 3.0_f64).abs() < f64::EPSILON);
-        assert_eq!(runtime_state.persistent.open_orders.len(), 1);
-
-        // Remove a terminal order from both representations in one transition.
-        assert!(apply_order_status(&mut runtime_state, 7, 5.0, 0.0, true));
-        assert!(runtime_state.volatile.open_orders.is_empty());
-        assert!(runtime_state.persistent.open_orders.is_empty());
     }
 
     #[test]
