@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Report whether the live control loop is in liquidation mode in its periodic status log.
+- End the live liquidation window at 8 p.m. Eastern time so ordinary trading resumes with the overnight session.
 
 ## [0.2.38] - 2026-08-09
 
