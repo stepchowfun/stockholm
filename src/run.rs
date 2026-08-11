@@ -27,7 +27,7 @@ const BUY_DISCOUNT_PERCENT: f64 = 10.0_f64;
 const SELL_MARKUP_PERCENT: f64 = 3.0_f64;
 const BUY_ORDER_TTL: Duration = Duration::seconds(86_400);
 const SELL_ORDER_TTL: Duration = Duration::seconds(14_400);
-const LIQUIDATION_SELL_ORDER_TTL: Duration = Duration::seconds(10);
+const LIQUIDATION_SELL_ORDER_TTL: Duration = Duration::minutes(1);
 const QUOTE_MAX_AGE: Duration = Duration::minutes(5);
 const CANCEL_RETRY_DELAY: Duration = Duration::seconds(10);
 const ORDER_REF_PREFIX: &str = "stockholm:";
@@ -39,7 +39,7 @@ const LIQUIDATION_START_TIME: Time = match Time::from_hms(15, 45, 0) {
     Ok(time) => time,
     Err(_) => panic!("The liquidation start time must be valid."),
 };
-const LIQUIDATION_END_TIME: Time = match Time::from_hms(20, 0, 0) {
+const LIQUIDATION_END_TIME: Time = match Time::from_hms(20, 5, 0) {
     Ok(time) => time,
     Err(_) => panic!("The liquidation end time must be valid."),
 };
@@ -1160,7 +1160,7 @@ mod tests {
 
     #[test]
     fn expire_orders_quickly_during_liquidation() {
-        // Expire buys immediately and sells after ten seconds during liquidation.
+        // Expire buys immediately and sells after one minute during liquidation.
         let order = state::OpenOrder {
             order_ref: "stockholm:test".to_string(),
             perm_id: None,
@@ -1178,13 +1178,13 @@ mod tests {
             &order,
             Side::Sell,
             true,
-            OffsetDateTime::UNIX_EPOCH + Duration::seconds(9),
+            OffsetDateTime::UNIX_EPOCH + Duration::seconds(59),
         ));
         assert!(cancellation_due(
             &order,
             Side::Sell,
             true,
-            OffsetDateTime::UNIX_EPOCH + Duration::seconds(10),
+            OffsetDateTime::UNIX_EPOCH + Duration::seconds(60),
         ));
     }
 
@@ -1193,12 +1193,12 @@ mod tests {
         // Compare Eastern wall-clock boundaries in both daylight and standard time.
         assert!(!is_liquidating(utc_datetime(Month::August, 10, 19, 44, 59)));
         assert!(is_liquidating(utc_datetime(Month::August, 10, 19, 45, 0)));
-        assert!(is_liquidating(utc_datetime(Month::August, 10, 23, 59, 59)));
-        assert!(!is_liquidating(utc_datetime(Month::August, 11, 0, 0, 0)));
+        assert!(is_liquidating(utc_datetime(Month::August, 11, 0, 4, 59)));
+        assert!(!is_liquidating(utc_datetime(Month::August, 11, 0, 5, 0)));
         assert!(!is_liquidating(utc_datetime(Month::January, 9, 20, 44, 59)));
         assert!(is_liquidating(utc_datetime(Month::January, 9, 20, 45, 0)));
-        assert!(is_liquidating(utc_datetime(Month::January, 10, 0, 59, 59)));
-        assert!(!is_liquidating(utc_datetime(Month::January, 10, 1, 0, 0)));
+        assert!(is_liquidating(utc_datetime(Month::January, 10, 1, 4, 59)));
+        assert!(!is_liquidating(utc_datetime(Month::January, 10, 1, 5, 0)));
     }
 
     #[tokio::test]
