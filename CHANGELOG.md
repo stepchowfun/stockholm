@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.44] - 2026-08-11
 
 ### Changed
-- Tune live market-making to a 1% buy discount, 1% sell markup, 10-second buy lifetime, and 60-second sell lifetime.
+- Tune live market-making to a 2% buy discount, 0.75% sell markup, 30-second buy lifetime, and 45-second sell lifetime.
 
 ## [0.2.43] - 2026-08-11
 
