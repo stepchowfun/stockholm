@@ -23,10 +23,10 @@ const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 const DEFAULT_BUYING_POWER_BUFFER: f64 = 10.0_f64;
 const DEFAULT_INITIAL_MARGIN_REQUIREMENT: f64 = 75.0_f64;
-const BUY_DISCOUNT_PERCENT: f64 = 10.0_f64;
-const SELL_MARKUP_PERCENT: f64 = 3.0_f64;
-const BUY_ORDER_TTL: Duration = Duration::seconds(86_400);
-const SELL_ORDER_TTL: Duration = Duration::seconds(14_400);
+const BUY_DISCOUNT_PERCENT: f64 = 1.0_f64;
+const SELL_MARKUP_PERCENT: f64 = 1.0_f64;
+const BUY_ORDER_TTL: Duration = Duration::seconds(10);
+const SELL_ORDER_TTL: Duration = Duration::seconds(60);
 const LIQUIDATION_SELL_ORDER_TTL: Duration = Duration::minutes(1);
 const QUOTE_MAX_AGE: Duration = Duration::minutes(5);
 const CANCEL_RETRY_DELAY: Duration = Duration::seconds(10);
@@ -1090,7 +1090,7 @@ mod tests {
         // Suppress buys and quote directly at the ask only while liquidating.
         assert_eq!(
             calculate_order_limits(Some(10.129_f64), Some(10.231_f64), false),
-            (Some(9.11_f64), Some(10.54_f64)),
+            (Some(10.02_f64), Some(10.34_f64)),
         );
         assert_eq!(
             calculate_order_limits(Some(10.129_f64), Some(10.231_f64), true),
@@ -1130,7 +1130,7 @@ mod tests {
     #[test]
     fn retry_expired_order_cancellations() {
         // Cancel after the buy lifetime and then at ten-second retry intervals.
-        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(86_400);
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(10);
         let mut order = state::OpenOrder {
             order_ref: "stockholm:test".to_string(),
             perm_id: None,
@@ -1142,20 +1142,19 @@ mod tests {
             &order,
             Side::Sell,
             false,
-            OffsetDateTime::UNIX_EPOCH + Duration::seconds(14_399),
+            OffsetDateTime::UNIX_EPOCH + Duration::seconds(59),
         ));
         assert!(cancellation_due(
             &order,
             Side::Sell,
             false,
-            OffsetDateTime::UNIX_EPOCH + Duration::seconds(14_400),
+            OffsetDateTime::UNIX_EPOCH + Duration::seconds(60),
         ));
         assert!(cancellation_due(&order, Side::Buy, false, now));
         order.last_cancelled_at = Some(now - Duration::seconds(9));
         assert!(!cancellation_due(&order, Side::Buy, false, now));
         order.last_cancelled_at = Some(now - Duration::seconds(10));
         assert!(cancellation_due(&order, Side::Buy, false, now));
-        assert!(cancellation_due(&order, Side::Sell, false, now));
     }
 
     #[test]
