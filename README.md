@@ -56,7 +56,7 @@ You can select the symbol whose live market data and five-second bars should be 
 stockholm run --symbol AAPL
 ```
 
-The live strategy runs its control loop once per second. Between 7 p.m. and 8:05 p.m. Eastern time, it suppresses ordinary market-making orders, immediately cancels its buy orders for the selected symbol, gives matching sell orders a five-minute lifetime, and repeatedly offers every unreserved whole share at the current ask. Stockholm-managed orders for other symbols and orders placed outside Stockholm are unaffected.
+The live strategy runs its control loop once per second. Between 3:45 p.m. and 8:05 p.m. Eastern time, it suppresses ordinary market-making orders, immediately cancels its buy orders for the selected symbol, gives matching sell orders a one-minute lifetime, and repeatedly offers every unreserved whole share at the current ask. Stockholm-managed orders for other symbols and orders placed outside Stockholm are unaffected.
 
 You can fetch historical bars as CSV with the `historical` subcommand. The start and end are ISO 8601 datetimes with explicit UTC offsets, and the interval defaults to `SEC`:
 
