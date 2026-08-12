@@ -15,6 +15,9 @@ const UNRELIABLE_DATA_END_TIME: Time = match Time::from_hms(4, 15, 0) {
     Err(_) => panic!("The unreliable data end time must be valid."),
 };
 
+// This convention annualizes statistics calculated from one return per trading day.
+const TRADING_DAYS_PER_YEAR: f64 = 252.0_f64;
+
 // These strategies can be evaluated by a backtest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum Strategy {
@@ -155,7 +158,7 @@ struct MarketMakerConfig {
 #[derive(Clone)]
 struct MarketMakerResult {
     final_value: f64,
-    sharpe: f64,
+    annualized_sharpe: Option<f64>,
     daily_returns: Vec<f64>,
 }
 
@@ -169,7 +172,7 @@ struct GridCandidate {
 // These results identify the configurations favored by return and risk-adjusted return.
 struct GridResult {
     highest_return: GridCandidate,
-    highest_sharpe: GridCandidate,
+    highest_annualized_sharpe: Option<GridCandidate>,
 }
 
 // Backtest a trading strategy.
@@ -288,7 +291,7 @@ fn market_maker_grid(
 
     // Search results in configuration order while retaining the first candidate in a tie.
     let mut highest_return = None::<GridCandidate>;
-    let mut highest_sharpe = None::<GridCandidate>;
+    let mut highest_annualized_sharpe = None::<GridCandidate>;
     for candidate in candidates {
         if highest_return
             .as_ref()
@@ -296,18 +299,21 @@ fn market_maker_grid(
         {
             highest_return = Some(candidate.clone());
         }
-        if highest_sharpe
-            .as_ref()
-            .is_none_or(|highest| candidate.result.sharpe > highest.result.sharpe)
-        {
-            highest_sharpe = Some(candidate);
+        if let Some(candidate_sharpe) = candidate.result.annualized_sharpe {
+            let exceeds_highest = highest_annualized_sharpe
+                .as_ref()
+                .and_then(|highest| highest.result.annualized_sharpe)
+                .is_none_or(|highest_sharpe| candidate_sharpe > highest_sharpe);
+            if exceeds_highest {
+                highest_annualized_sharpe = Some(candidate);
+            }
         }
     }
 
-    // Both winners exist whenever the parameter grid contains at least one candidate.
+    // A return winner always exists, while Sharpe requires at least two daily observations.
     Ok(GridResult {
         highest_return: highest_return.ok_or("the parameter grid contains no valid candidates")?,
-        highest_sharpe: highest_sharpe.ok_or("the parameter grid contains no valid candidates")?,
+        highest_annualized_sharpe,
     })
 }
 
@@ -329,7 +335,7 @@ fn simulate_market_maker(
 
     Ok(MarketMakerResult {
         final_value,
-        sharpe: sharpe_ratio(&daily_returns)?,
+        annualized_sharpe: annualized_sharpe_ratio(&daily_returns)?,
         daily_returns,
     })
 }
@@ -542,30 +548,38 @@ impl MarketMakerLogger<'_> {
     }
 }
 
-// Calculate unannualized risk-adjusted return from daily return rates.
-fn sharpe_ratio(returns: &[f64]) -> Result<f64, Box<dyn Error>> {
-    // Use the population moments because the supplied days are the full backtest period.
+// Calculate annualized excess return per unit of risk from daily return rates.
+fn annualized_sharpe_ratio(returns: &[f64]) -> Result<Option<f64>, Box<dyn Error>> {
+    // At least two observations are needed to estimate historical return variability.
+    if returns.len() < 2 {
+        return Ok(None);
+    }
+
+    // Use a zero risk-free rate so the metric ranks return per unit of variability.
     let count = f64::from(u32::try_from(returns.len())?);
-    let mean = returns.iter().sum::<f64>() / count;
+    let mean_return = returns.iter().sum::<f64>() / count;
+
+    // Estimate historical daily volatility with the sample standard deviation.
     let variance = returns
         .iter()
-        .map(|value| (value - mean).powi(2))
+        .map(|value| (value - mean_return).powi(2))
         .sum::<f64>()
-        / count;
+        / (count - 1.0_f64);
     let standard_deviation = variance.sqrt();
 
-    // Give constant-return strategies an ordered result without producing `NaN` for zero returns.
-    let sharpe = if standard_deviation == 0.0_f64 {
-        match mean.total_cmp(&0.0_f64) {
+    // Give constant-return strategies an ordered result without producing `NaN`.
+    let daily_sharpe = if standard_deviation == 0.0_f64 {
+        match mean_return.total_cmp(&0.0_f64) {
             std::cmp::Ordering::Greater => f64::INFINITY,
             std::cmp::Ordering::Less => f64::NEG_INFINITY,
             std::cmp::Ordering::Equal => 0.0_f64,
         }
     } else {
-        mean / standard_deviation
+        mean_return / standard_deviation
     };
 
-    Ok(sharpe)
+    // Scale the daily ratio under the conventional zero-serial-correlation assumption.
+    Ok(Some(daily_sharpe * TRADING_DAYS_PER_YEAR.sqrt()))
 }
 
 // Copy market-maker command-line values into one simulation configuration.
@@ -586,7 +600,7 @@ fn market_maker_config(args: &Args) -> MarketMakerConfig {
 fn print_market_maker_result(result: &MarketMakerResult, config: MarketMakerConfig) {
     // Present the summary before the effective simulation parameters.
     println!("Final account value: {:.2}", result.final_value);
-    println!("Sharpe ratio: {:.4}", result.sharpe);
+    print_sharpe_ratio(result.annualized_sharpe);
     println!();
     print_config(config);
 }
@@ -596,7 +610,12 @@ fn print_grid_result(result: &GridResult) {
     // Give each optimization criterion its own complete section.
     print_grid_candidate("Highest return", &result.highest_return);
     println!();
-    print_grid_candidate("Highest Sharpe ratio", &result.highest_sharpe);
+    if let Some(candidate) = &result.highest_annualized_sharpe {
+        print_grid_candidate("Highest annualized Sharpe ratio", candidate);
+    } else {
+        println!("Highest annualized Sharpe ratio");
+        println!("Annualized Sharpe ratio: unavailable (requires at least two daily returns)");
+    }
 }
 
 // Print one winning grid candidate and its daily return series.
@@ -604,13 +623,23 @@ fn print_grid_candidate(label: &str, candidate: &GridCandidate) {
     // Present summary statistics before the detailed daily returns and configuration.
     println!("{label}");
     println!("Final account value: {:.2}", candidate.result.final_value);
-    println!("Sharpe ratio: {:.4}", candidate.result.sharpe);
+    print_sharpe_ratio(candidate.result.annualized_sharpe);
     println!("Daily returns:");
     for (index, daily_return) in candidate.result.daily_returns.iter().enumerate() {
         println!("  Day {}: {:.2}%", index + 1, 100.0_f64 * daily_return);
     }
     println!("Configuration:");
     print_config_fields(candidate.config);
+}
+
+// Print one available annualized Sharpe ratio or explain why it is unavailable.
+fn print_sharpe_ratio(sharpe: Option<f64>) {
+    match sharpe {
+        Some(sharpe) => println!("Annualized Sharpe ratio: {sharpe:.4}"),
+        None => {
+            println!("Annualized Sharpe ratio: unavailable (requires at least two daily returns)");
+        }
+    }
 }
 
 // Print a labeled market-maker configuration.
@@ -867,8 +896,9 @@ fn parse_percent(value: &str) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, Bar, Day, MarketMakerConfig, Strategy, buy_and_hold, is_unreliable_early_data,
-        market_maker, market_maker_grid, parse_days, sharpe_ratio, simulate_market_maker,
+        Args, Bar, Day, MarketMakerConfig, Strategy, TRADING_DAYS_PER_YEAR,
+        annualized_sharpe_ratio, buy_and_hold, is_unreliable_early_data, market_maker,
+        market_maker_grid, parse_days, simulate_market_maker,
     };
     use crate::{Cli, Subcommand};
     use clap::Parser;
@@ -1033,7 +1063,7 @@ mod tests {
 
         let result = market_maker(&files, &args).unwrap();
         assert!((result.final_value - 1_020.0).abs() < f64::EPSILON);
-        assert!(result.sharpe.is_infinite() && result.sharpe.is_sign_positive());
+        assert_eq!(result.annualized_sharpe, None);
     }
 
     #[test]
@@ -1075,7 +1105,11 @@ mod tests {
 
         let result = market_maker(&files, &args).unwrap();
         assert!((result.final_value - 1_040.0).abs() < f64::EPSILON);
-        assert!(result.sharpe.is_finite() && result.sharpe > 0.0_f64);
+        assert!(
+            result
+                .annualized_sharpe
+                .is_some_and(|sharpe| sharpe.is_finite() && sharpe > 0.0_f64),
+        );
     }
 
     #[test]
@@ -1089,7 +1123,7 @@ mod tests {
 
         let result = market_maker(&files, &args).unwrap();
         assert!((result.final_value - 1_000.0).abs() < f64::EPSILON);
-        assert!(result.sharpe.abs() < f64::EPSILON);
+        assert_eq!(result.annualized_sharpe, None);
     }
 
     #[test]
@@ -1161,7 +1195,7 @@ mod tests {
         assert!((result.highest_return.config.markup_percent - 1.0).abs() < f64::EPSILON);
         assert_eq!(result.highest_return.config.buy_ttl, 5);
         assert_eq!(result.highest_return.config.sell_ttl, 5);
-        assert!(result.highest_sharpe.result.sharpe.is_infinite());
+        assert!(result.highest_annualized_sharpe.is_none());
     }
 
     #[test]
@@ -1283,11 +1317,19 @@ mod tests {
     }
 
     #[test]
-    fn calculate_sharpe_from_daily_returns() {
-        // Confirm Sharpe uses the mean and population standard deviation of daily returns.
-        let sharpe = sharpe_ratio(&[0.1_f64, 0.2_f64]).unwrap();
+    fn calculate_annualized_sharpe_from_daily_returns() {
+        // Annualize mean excess return divided by the sample standard deviation.
+        let sharpe = annualized_sharpe_ratio(&[0.1_f64, 0.2_f64])
+            .unwrap()
+            .unwrap();
+        let expected = (0.15_f64 / 0.005_f64.sqrt()) * TRADING_DAYS_PER_YEAR.sqrt();
 
-        assert!((sharpe - 3.0_f64).abs() < 1e-12_f64);
+        assert!((sharpe - expected).abs() < 1e-12_f64);
+        assert_eq!(
+            annualized_sharpe_ratio(&[0.0_f64, 0.0_f64]).unwrap(),
+            Some(0.0_f64),
+        );
+        assert_eq!(annualized_sharpe_ratio(&[0.1_f64]).unwrap(), None);
     }
 
     // Construct focused market-maker settings without invoking command-line parsing.
