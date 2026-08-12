@@ -21,7 +21,7 @@ use uuid::Uuid;
 // These constants configure trading defaults, routing venues, and failure recovery.
 const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
-const DEFAULT_BUYING_POWER_BUFFER: f64 = 10.0_f64;
+const DEFAULT_BUYING_POWER_BUFFER: f64 = 20.0_f64;
 const DEFAULT_INITIAL_MARGIN_REQUIREMENT: f64 = 75.0_f64;
 const BUY_DISCOUNT_PERCENT: f64 = 0.7_f64;
 const SELL_MARKUP_PERCENT: f64 = 0.9_f64;
@@ -986,7 +986,7 @@ mod tests {
         let cli = TestCli::try_parse_from(["run"]).unwrap();
 
         assert_eq!(cli.args.symbol, "SOXL");
-        assert!((cli.args.buying_power_buffer - 10.0_f64).abs() < f64::EPSILON);
+        assert!((cli.args.buying_power_buffer - 20.0_f64).abs() < f64::EPSILON);
         assert!((cli.args.initial_margin_requirement - 75.0_f64).abs() < f64::EPSILON);
     }
 
