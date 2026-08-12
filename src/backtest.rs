@@ -199,7 +199,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
         }
         Strategy::MarketMaker => {
             let result = market_maker(&files, args)?;
-            print_market_maker_result(&result, market_maker_config(args));
+            print_market_maker_result(None, &result, market_maker_config(args));
         }
         Strategy::MarketMakerGrid => {
             let result = market_maker_grid(&files, args)?;
@@ -596,40 +596,50 @@ fn market_maker_config(args: &Args) -> MarketMakerConfig {
     }
 }
 
-// Print one market-maker result as a human-readable report.
-fn print_market_maker_result(result: &MarketMakerResult, config: MarketMakerConfig) {
-    // Present the summary before the effective simulation parameters.
+// Print one market-maker result with an optional grid-ranking label.
+fn print_market_maker_result(
+    label: Option<&str>,
+    result: &MarketMakerResult,
+    config: MarketMakerConfig,
+) {
+    // Identify a grid winner while leaving single-strategy reports unlabelled.
+    if let Some(label) = label {
+        println!("{label}");
+    }
+
+    // Present summary statistics before the detailed daily returns.
     println!("Final account value: {:.2}", result.final_value);
     print_sharpe_ratio(result.annualized_sharpe);
-    println!();
+
+    // Number days in chronological input order for easy comparison between reports.
+    println!("Daily returns:");
+    for (index, daily_return) in result.daily_returns.iter().enumerate() {
+        println!("  Day {}: {:.2}%", index + 1, 100.0_f64 * daily_return);
+    }
+
+    // Finish with the effective simulation parameters.
     print_config(config);
 }
 
 // Print both winning grid candidates as a human-readable report.
 fn print_grid_result(result: &GridResult) {
     // Give each optimization criterion its own complete section.
-    print_grid_candidate("Highest return", &result.highest_return);
+    print_market_maker_result(
+        Some("Highest return"),
+        &result.highest_return.result,
+        result.highest_return.config,
+    );
     println!();
     if let Some(candidate) = &result.highest_annualized_sharpe {
-        print_grid_candidate("Highest annualized Sharpe ratio", candidate);
+        print_market_maker_result(
+            Some("Highest Sharpe ratio"),
+            &candidate.result,
+            candidate.config,
+        );
     } else {
-        println!("Highest annualized Sharpe ratio");
+        println!("Highest Sharpe ratio");
         println!("Annualized Sharpe ratio: unavailable (requires at least two daily returns)");
     }
-}
-
-// Print one winning grid candidate and its daily return series.
-fn print_grid_candidate(label: &str, candidate: &GridCandidate) {
-    // Present summary statistics before the detailed daily returns and configuration.
-    println!("{label}");
-    println!("Final account value: {:.2}", candidate.result.final_value);
-    print_sharpe_ratio(candidate.result.annualized_sharpe);
-    println!("Daily returns:");
-    for (index, daily_return) in candidate.result.daily_returns.iter().enumerate() {
-        println!("  Day {}: {:.2}%", index + 1, 100.0_f64 * daily_return);
-    }
-    println!("Configuration:");
-    print_config_fields(candidate.config);
 }
 
 // Print one available annualized Sharpe ratio or explain why it is unavailable.
