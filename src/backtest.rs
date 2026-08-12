@@ -1,3 +1,4 @@
+use crate::run::{LIQUIDATION_END_TIME, LIQUIDATION_START_TIME};
 use clap::{Args as ClapArgs, ValueEnum};
 use rayon::prelude::*;
 use std::{error::Error, fs, path::PathBuf, sync::Mutex};
@@ -36,10 +37,6 @@ pub struct Args {
     /// Starting cash used by market-maker and market-maker-grid.
     #[arg(long, default_value_t = 1_000_000.0, value_parser = parse_positive_f64)]
     initial_cash: f64,
-
-    /// Seconds before each file's final timestamp when liquidation begins.
-    #[arg(long, default_value_t = 900)]
-    liquidation_seconds: u64,
 
     /// Maximum total shares filled per bar. Used by both market-maker strategies.
     #[arg(long, default_value_t = 1_000.0, value_parser = parse_positive_f64)]
@@ -146,7 +143,6 @@ struct MarketMakerLogger<'a> {
 #[derive(Clone, Copy)]
 struct MarketMakerConfig {
     initial_cash: f64,
-    liquidation_seconds: u64,
     bar_volume_limit: f64,
     buy_ttl: u64,
     sell_ttl: u64,
@@ -217,7 +213,7 @@ fn market_maker(
     args: &Args,
 ) -> Result<MarketMakerResult, Box<dyn Error>> {
     // Parse each chronological trading day before changing the simulated portfolio.
-    let days = parse_days(files, args.liquidation_seconds)?;
+    let days = parse_days(files)?;
     simulate_market_maker(&days, market_maker_config(args), true)
 }
 
@@ -227,7 +223,7 @@ fn market_maker_grid(
     args: &Args,
 ) -> Result<GridResult, Box<dyn Error>> {
     // Parse the historical days once because every candidate uses identical market data.
-    let days = parse_days(files, args.liquidation_seconds)?;
+    let days = parse_days(files)?;
 
     // Count the Cartesian product before allocating its configurations.
     let total_candidates = args.buy_ttls.len()
@@ -246,7 +242,6 @@ fn market_maker_grid(
                     for &bet_size in &args.bet_sizes {
                         configs.push(MarketMakerConfig {
                             initial_cash: args.initial_cash,
-                            liquidation_seconds: args.liquidation_seconds,
                             bar_volume_limit: args.bar_volume_limit,
                             buy_ttl,
                             sell_ttl,
@@ -578,7 +573,6 @@ fn market_maker_config(args: &Args) -> MarketMakerConfig {
     // Keep simulation code independent from unrelated backtest arguments.
     MarketMakerConfig {
         initial_cash: args.initial_cash,
-        liquidation_seconds: args.liquidation_seconds,
         bar_volume_limit: args.bar_volume_limit,
         buy_ttl: args.buy_ttl,
         sell_ttl: args.sell_ttl,
@@ -628,9 +622,10 @@ fn print_config(config: MarketMakerConfig) {
 
 // Print the fields of one market-maker configuration.
 fn print_config_fields(config: MarketMakerConfig) {
-    // Follow command-line argument order to make reproducing the run straightforward.
+    // Present the shared liquidation schedule alongside the tunable simulation fields.
     println!("  Initial cash: {:.2}", config.initial_cash);
-    println!("  Liquidation seconds: {}", config.liquidation_seconds);
+    println!("  Liquidation start time (ET): {LIQUIDATION_START_TIME}");
+    println!("  Liquidation end time (ET): {LIQUIDATION_END_TIME}");
     println!("  Bar volume limit: {}", config.bar_volume_limit);
     println!("  Buy TTL: {}", config.buy_ttl);
     println!("  Sell TTL: {}", config.sell_ttl);
@@ -640,10 +635,7 @@ fn print_config_fields(config: MarketMakerConfig) {
 }
 
 // Parse the low, high, and closing prices from every input file as one trading day.
-fn parse_days(
-    files: &[(PathBuf, String)],
-    liquidation_seconds: u64,
-) -> Result<Vec<Day>, Box<dyn Error>> {
+fn parse_days(files: &[(PathBuf, String)]) -> Result<Vec<Day>, Box<dyn Error>> {
     // Preserve sorted day and record order while validating each price.
     let mut days = Vec::with_capacity(files.len());
     for (path, contents) in files {
@@ -681,24 +673,17 @@ fn parse_days(
                     path,
                     &format!("close on line {line}"),
                 )?,
-                liquidate: false,
+                liquidate: is_liquidating(timestamp),
             });
         }
 
-        // Mark bars within the configured elapsed-time window before the final timestamp.
-        let liquidation_seconds = i64::try_from(liquidation_seconds)?;
-        let final_timestamp = bars
-            .last()
-            .ok_or_else(|| {
-                format!(
-                    "{} must contain at least one row outside the unreliable early-data window",
-                    path.display(),
-                )
-            })?
-            .timestamp;
-        for bar in &mut bars {
-            bar.liquidate = liquidation_seconds > 0
-                && final_timestamp.saturating_sub(bar.timestamp) < liquidation_seconds;
+        // Require at least one usable bar after applying the early-data filter.
+        if bars.is_empty() {
+            return Err(format!(
+                "{} must contain at least one row outside the unreliable early-data window",
+                path.display(),
+            )
+            .into());
         }
 
         days.push(Day {
@@ -737,6 +722,13 @@ fn is_unreliable_early_data(timestamp: OffsetDateTime) -> bool {
     let eastern_time = timestamp.to_timezone(NEW_YORK).time();
 
     eastern_time >= UNRELIABLE_DATA_START_TIME && eastern_time < UNRELIABLE_DATA_END_TIME
+}
+
+// Identify bars inside the shared Eastern-time liquidation window.
+fn is_liquidating(timestamp: OffsetDateTime) -> bool {
+    let eastern_time = timestamp.to_timezone(NEW_YORK).time();
+
+    eastern_time >= LIQUIDATION_START_TIME && eastern_time < LIQUIDATION_END_TIME
 }
 
 // Locate one required CSV price column.
@@ -924,32 +916,32 @@ mod tests {
         assert_eq!(args.markup_percentages.first(), Some(&0.01_f64));
         assert_eq!(args.markup_percentages.last(), Some(&10.0_f64));
         assert_eq!(args.bet_sizes, vec![80.0_f64, 90.0_f64, 100.0_f64]);
-        assert_eq!(args.liquidation_seconds, 900);
         assert!((args.bar_volume_limit - 1_000.0).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn mark_liquidation_by_elapsed_time() {
-        // Exclude an adjacent row separated from the final bar by more than the time window.
+    fn mark_liquidation_by_eastern_time() {
+        // Apply the shared inclusive start and exclusive end to historical bars.
         let files = vec![(
             PathBuf::from("prices.csv"),
             concat!(
                 "date,low,high,close\n",
-                "1000,100,100,100\n",
-                "1001,100,100,100\n",
-                "2000,100,100,100\n",
+                "1786391099,100,100,100\n",
+                "1786391100,100,100,100\n",
+                "1786406699,100,100,100\n",
+                "1786406700,100,100,100\n",
             )
             .to_string(),
         )];
 
-        let days = parse_days(&files, 10).unwrap();
+        let days = parse_days(&files).unwrap();
         let liquidation_flags = days[0]
             .bars
             .iter()
             .map(|bar| bar.liquidate)
             .collect::<Vec<_>>();
 
-        assert_eq!(liquidation_flags, vec![false, false, true]);
+        assert_eq!(liquidation_flags, vec![false, true, true, false]);
     }
 
     #[test]
@@ -985,7 +977,7 @@ mod tests {
             .to_string(),
         )];
 
-        let days = parse_days(&files, 0).unwrap();
+        let days = parse_days(&files).unwrap();
 
         assert_eq!(days[0].bars.len(), 1);
         assert_eq!(days[0].bars[0].timestamp, 1_784_016_900);
@@ -1031,9 +1023,9 @@ mod tests {
             PathBuf::from("prices.csv"),
             concat!(
                 "date,low,high,close\n",
-                "1000,100,100,100\n",
-                "1001,99,100,100\n",
-                "1002,100,101,100\n",
+                "36000,100,100,100\n",
+                "36001,99,100,100\n",
+                "36002,100,101,100\n",
             )
             .to_string(),
         )];
@@ -1051,9 +1043,9 @@ mod tests {
             PathBuf::from("prices.csv"),
             concat!(
                 "date,low,high,close\n",
-                "1000,100,100,100\n",
-                "1001,99,100,100\n",
-                "1002,100,101,100\n",
+                "36000,100,100,100\n",
+                "36001,99,100,100\n",
+                "36002,100,101,100\n",
             )
             .to_string(),
         )];
@@ -1070,12 +1062,12 @@ mod tests {
         let files = vec![
             (
                 PathBuf::from("monday.csv"),
-                "date,low,high,close\n1000,100,100,100\n1001,99,100,100\n1002,100,101,100\n"
+                "date,low,high,close\n36000,100,100,100\n36001,99,100,100\n36002,100,101,100\n"
                     .to_string(),
             ),
             (
                 PathBuf::from("tuesday.csv"),
-                "date,low,high,close\n2000,100,100,100\n2001,99,100,100\n2002,100,101,100\n"
+                "date,low,high,close\n122400,100,100,100\n122401,99,100,100\n122402,100,101,100\n"
                     .to_string(),
             ),
         ];
@@ -1091,7 +1083,7 @@ mod tests {
         // Confirm canceling an expired buy restores its reserved cash.
         let files = vec![(
             PathBuf::from("prices.csv"),
-            "date,low,high,close\n1000,100,100,100\n1001,200,200,200\n".to_string(),
+            "date,low,high,close\n36000,100,100,100\n36001,200,200,200\n".to_string(),
         )];
         let args = market_maker_args(1_000.0, 0, 14_400);
 
@@ -1128,7 +1120,6 @@ mod tests {
         ];
         let config = MarketMakerConfig {
             initial_cash: 1_000.0,
-            liquidation_seconds: 900,
             bar_volume_limit: 1_000.0,
             buy_ttl: 3_600,
             sell_ttl: 14_400,
@@ -1156,9 +1147,9 @@ mod tests {
             PathBuf::from("prices.csv"),
             concat!(
                 "date,low,high,close\n",
-                "1000,100,100,100\n",
-                "1001,99,100,100\n",
-                "1002,100,102,100\n",
+                "36000,100,100,100\n",
+                "36001,99,100,100\n",
+                "36002,100,102,100\n",
             )
             .to_string(),
         )];
@@ -1201,7 +1192,6 @@ mod tests {
         ];
         let config = MarketMakerConfig {
             initial_cash: 1_000.0,
-            liquidation_seconds: 900,
             bar_volume_limit: 5.0,
             buy_ttl: 3_600,
             sell_ttl: 14_400,
@@ -1271,7 +1261,6 @@ mod tests {
         ];
         let config = MarketMakerConfig {
             initial_cash: 1_000.0,
-            liquidation_seconds: 900,
             bar_volume_limit: 2.0,
             buy_ttl: 3_600,
             sell_ttl: 14_400,
@@ -1321,7 +1310,6 @@ mod tests {
             discount_percentages: vec![0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
             markup_percentages: vec![0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
             bet_sizes: vec![100.0],
-            liquidation_seconds: 0,
             bar_volume_limit: 1_000.0,
         }
     }
