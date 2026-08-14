@@ -112,7 +112,7 @@ impl<B: Backend> Batcher<B, SeriesItem, SeriesBatch<B>> for SeriesBatcher<B> {
 
 // This model predicts several future returns directly from a fixed input window.
 #[derive(Module, Debug)]
-pub(crate) struct Model<B: Backend> {
+pub struct Model<B: Backend> {
     layer1: Linear<B>,
     layer2: Linear<B>,
     layer3: Linear<B>,
@@ -122,20 +122,20 @@ pub(crate) struct Model<B: Backend> {
 
 // This configuration records the model, training, and preprocessing settings.
 #[derive(Config, Debug)]
-pub(crate) struct ModelConfig {
-    pub(crate) inputs: usize,
+pub struct ModelConfig {
+    pub inputs: usize,
     outputs: usize,
     batch_size: usize,
     epochs: usize,
     learning_rate: f64,
     seed: u64,
-    pub(crate) return_mean: f32,
-    pub(crate) return_deviation: f32,
+    pub return_mean: f32,
+    pub return_deviation: f32,
 }
 
 impl ModelConfig {
     // Initialize every model layer on the selected device.
-    pub(crate) fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
         Model {
             layer1: LinearConfig::new(self.inputs, HIDDEN_SIZE).init(device),
             layer2: LinearConfig::new(HIDDEN_SIZE, HIDDEN_SIZE).init(device),
@@ -148,7 +148,7 @@ impl ModelConfig {
 
 impl<B: Backend> Model<B> {
     // Apply the three hidden transformations and output projection.
-    pub(crate) fn forward(&self, inputs: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn forward(&self, inputs: Tensor<B, 2>) -> Tensor<B, 2> {
         let values = self.activation.forward(self.layer1.forward(inputs));
         let values = self.activation.forward(self.layer2.forward(values));
         let values = self.activation.forward(self.layer3.forward(values));
@@ -343,7 +343,7 @@ fn validation_loss<B: Backend>(
 }
 
 // Parse finite positive opening prices from a historical-data CSV file.
-pub(crate) fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
+pub fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
     // Locate the opening-price column by name so column order remains explicit.
     let mut reader = csv::Reader::from_reader(contents.as_bytes());
     let headers = reader.headers()?;
@@ -395,7 +395,7 @@ fn parse_positive_f64(value: &str) -> Result<f64, String> {
 }
 
 // Convert raw prices into stationary relative changes.
-pub(crate) fn log_returns(prices: &[f32]) -> Vec<f32> {
+pub fn log_returns(prices: &[f32]) -> Vec<f32> {
     prices
         .windows(2)
         .map(|pair| (pair[1] / pair[0]).ln())

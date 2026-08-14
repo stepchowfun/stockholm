@@ -35,11 +35,11 @@ const SMART_EXCHANGE: &str = "SMART";
 const OVERNIGHT_EXCHANGE: &str = "OVERNIGHT";
 
 // These Eastern times bound the daily liquidation window.
-pub(crate) const LIQUIDATION_START_TIME: Time = match Time::from_hms(15, 45, 0) {
+pub const LIQUIDATION_START_TIME: Time = match Time::from_hms(15, 45, 0) {
     Ok(time) => time,
     Err(_) => panic!("The liquidation start time must be valid."),
 };
-pub(crate) const LIQUIDATION_END_TIME: Time = match Time::from_hms(20, 5, 0) {
+pub const LIQUIDATION_END_TIME: Time = match Time::from_hms(20, 5, 0) {
     Ok(time) => time,
     Err(_) => panic!("The liquidation end time must be valid."),
 };
