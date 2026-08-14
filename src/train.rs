@@ -17,6 +17,9 @@ use burn::{
 use clap::Args as ClapArgs;
 use std::{error::Error, fs, marker::PhantomData, path::PathBuf, sync::Arc};
 
+// Keep every hidden layer at one consistent width.
+const HIDDEN_SIZE: usize = 32;
+
 // These arguments configure a time-series training run.
 #[derive(ClapArgs)]
 pub struct Args {
@@ -29,11 +32,11 @@ pub struct Args {
     validation_paths: Vec<PathBuf>,
 
     /// Number of recent returns supplied to the model.
-    #[arg(long, default_value_t = 20, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = 300, value_parser = parse_positive_usize)]
     inputs: usize,
 
     /// Number of future returns predicted by the model.
-    #[arg(long, default_value_t = 5, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = 60, value_parser = parse_positive_usize)]
     outputs: usize,
 
     /// Number of examples processed in each optimization step.
@@ -41,7 +44,7 @@ pub struct Args {
     batch_size: usize,
 
     /// Number of complete passes through the training dataset.
-    #[arg(long, default_value_t = 50, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = 5, value_parser = parse_positive_usize)]
     epochs: usize,
 
     /// Step size used by the Adam optimizer.
@@ -52,7 +55,7 @@ pub struct Args {
     #[arg(long, default_value_t = 42)]
     seed: u64,
 
-    /// Directory where the trained model and its metadata will be saved.
+    /// Directory where the trained model and its configuration will be saved.
     #[arg(long, default_value = "model")]
     model_directory: PathBuf,
 }
@@ -109,51 +112,46 @@ impl<B: Backend> Batcher<B, SeriesItem, SeriesBatch<B>> for SeriesBatcher<B> {
 
 // This model predicts several future returns directly from a fixed input window.
 #[derive(Module, Debug)]
-pub(crate) struct Model<B: Backend> {
-    input: Linear<B>,
-    hidden: Linear<B>,
+pub struct Model<B: Backend> {
+    layer1: Linear<B>,
+    layer2: Linear<B>,
+    layer3: Linear<B>,
     output: Linear<B>,
     activation: Relu,
 }
 
-// This configuration defines the model dimensions.
+// This configuration records the model, training, and preprocessing settings.
 #[derive(Config, Debug)]
-pub(crate) struct ModelConfig {
-    pub(crate) inputs: usize,
-    hidden: usize,
-    outputs: usize,
-}
-
-// This configuration records training and preprocessing metadata.
-#[derive(Config, Debug)]
-pub(crate) struct MetadataConfig {
-    inputs: usize,
+pub struct ModelConfig {
+    pub inputs: usize,
     outputs: usize,
     batch_size: usize,
     epochs: usize,
     learning_rate: f64,
     seed: u64,
-    pub(crate) return_mean: f32,
-    pub(crate) return_deviation: f32,
+    pub return_mean: f32,
+    pub return_deviation: f32,
 }
 
 impl ModelConfig {
     // Initialize every model layer on the selected device.
-    pub(crate) fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
         Model {
-            input: LinearConfig::new(self.inputs, self.hidden).init(device),
-            hidden: LinearConfig::new(self.hidden, self.hidden).init(device),
-            output: LinearConfig::new(self.hidden, self.outputs).init(device),
+            layer1: LinearConfig::new(self.inputs, HIDDEN_SIZE).init(device),
+            layer2: LinearConfig::new(HIDDEN_SIZE, HIDDEN_SIZE).init(device),
+            layer3: LinearConfig::new(HIDDEN_SIZE, HIDDEN_SIZE).init(device),
+            output: LinearConfig::new(HIDDEN_SIZE, self.outputs).init(device),
             activation: Relu::new(),
         }
     }
 }
 
 impl<B: Backend> Model<B> {
-    // Apply the two hidden transformations and output projection.
-    pub(crate) fn forward(&self, inputs: Tensor<B, 2>) -> Tensor<B, 2> {
-        let values = self.activation.forward(self.input.forward(inputs));
-        let values = self.activation.forward(self.hidden.forward(values));
+    // Apply the three hidden transformations and output projection.
+    pub fn forward(&self, inputs: Tensor<B, 2>) -> Tensor<B, 2> {
+        let values = self.activation.forward(self.layer1.forward(inputs));
+        let values = self.activation.forward(self.layer2.forward(values));
+        let values = self.activation.forward(self.layer3.forward(values));
         self.output.forward(values)
     }
 }
@@ -205,28 +203,45 @@ fn train<B: AutodiffBackend>(
     args: &Args,
     data: &PreparedData,
 ) -> Result<(), Box<dyn Error>> {
-    // Seed Burn and construct a modest model based on the requested dimensions.
-    B::seed(device, args.seed);
-    let hidden = (args.inputs + args.outputs).next_power_of_two().max(32);
-    let config = ModelConfig::new(args.inputs, hidden, args.outputs);
+    // Collect every reproducibility setting into the model's saved configuration.
+    let config = ModelConfig::new(
+        args.inputs,
+        args.outputs,
+        args.batch_size,
+        args.epochs,
+        args.learning_rate,
+        args.seed,
+        data.mean,
+        data.deviation,
+    );
+
+    // Seed Burn and construct the fixed-width model for the requested endpoints.
+    B::seed(device, config.seed);
     let mut model = config.init::<B>(device);
     let mut optimizer = AdamConfig::new().init::<B, Model<B>>();
 
     // Scan all windows while shuffling only the training order each epoch.
     let training_loader = DataLoaderBuilder::new(SeriesBatcher::<B>::new())
-        .batch_size(args.batch_size)
-        .shuffle(args.seed)
+        .batch_size(config.batch_size)
+        .shuffle(config.seed)
         .num_workers(1)
         .build(InMemDataset::new(data.training.clone()));
     let training_evaluation_loader =
         DataLoaderBuilder::new(SeriesBatcher::<B::InnerBackend>::new())
-            .batch_size(args.batch_size)
+            .batch_size(config.batch_size)
             .num_workers(1)
             .build(InMemDataset::new(data.training.clone()));
     let validation_loader = DataLoaderBuilder::new(SeriesBatcher::<B::InnerBackend>::new())
-        .batch_size(args.batch_size)
+        .batch_size(config.batch_size)
         .num_workers(1)
         .build(InMemDataset::new(data.validation.clone()));
+
+    // Establish the validation target by predicting no future price movement.
+    let baseline_loss = baseline_loss(&data.validation, data.mean, data.deviation);
+    println!(
+        "No-change baseline RMSE: {:.2} bps",
+        baseline_loss.sqrt() * data.deviation * 10_000.0,
+    );
 
     // Report the initialized model's error before applying any optimizer steps.
     let initial_model = model.valid();
@@ -244,37 +259,34 @@ fn train<B: AutodiffBackend>(
         data.training.len(),
         data.validation.len(),
     );
-    for epoch in 1..=args.epochs {
+    for epoch in 1..=config.epochs {
         let training_loss = train_epoch(
             &mut model,
             &mut optimizer,
             &training_loader,
-            args.learning_rate,
+            config.learning_rate,
         );
         let validation_loss = validation_loss(&model.valid(), &validation_loader);
         println!(
             "Epoch {:>2}/{}: train RMSE {:.2} bps, validation RMSE {:.2} bps",
             epoch,
-            args.epochs,
+            config.epochs,
             training_loss.sqrt() * data.deviation * 10_000.0,
             validation_loss.sqrt() * data.deviation * 10_000.0,
         );
     }
 
-    // Compare the model against predicting no future price movement.
+    // Report the trained model's final validation error without repeating the baseline.
     let final_loss = validation_loss(&model.valid(), &validation_loader);
-    let baseline_loss = baseline_loss(&data.validation, data.mean, data.deviation);
     println!(
-        "Validation RMSE: model {:.2} bps, no-change baseline {:.2} bps",
+        "Final validation RMSE: {:.2} bps",
         final_loss.sqrt() * data.deviation * 10_000.0,
-        baseline_loss.sqrt() * data.deviation * 10_000.0,
     );
 
-    // Save both the Burn model and the values needed to reconstruct price forecasts.
+    // Save the Burn parameters and their complete reconstruction configuration.
     fs::create_dir_all(&args.model_directory)?;
     model.save_file(args.model_directory.join("model"), &CompactRecorder::new())?;
     config.save(args.model_directory.join("model.json"))?;
-    save_metadata(args, data)?;
     println!(
         "Saved training artifacts to {}.",
         args.model_directory.display(),
@@ -331,7 +343,7 @@ fn validation_loss<B: Backend>(
 }
 
 // Parse finite positive opening prices from a historical-data CSV file.
-pub(crate) fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
+pub fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
     // Locate the opening-price column by name so column order remains explicit.
     let mut reader = csv::Reader::from_reader(contents.as_bytes());
     let headers = reader.headers()?;
@@ -383,7 +395,7 @@ fn parse_positive_f64(value: &str) -> Result<f64, String> {
 }
 
 // Convert raw prices into stationary relative changes.
-pub(crate) fn log_returns(prices: &[f32]) -> Vec<f32> {
+pub fn log_returns(prices: &[f32]) -> Vec<f32> {
     prices
         .windows(2)
         .map(|pair| (pair[1] / pair[0]).ln())
@@ -484,24 +496,6 @@ fn usize_to_f32(value: usize) -> f32 {
     value as f32
 }
 
-// Persist preprocessing values required to convert predicted returns back to prices.
-fn save_metadata(args: &Args, data: &PreparedData) -> Result<(), Box<dyn Error>> {
-    // Serialize one shared configuration type for reliable inference-time parsing.
-    let metadata = MetadataConfig::new(
-        args.inputs,
-        args.outputs,
-        args.batch_size,
-        args.epochs,
-        args.learning_rate,
-        args.seed,
-        data.mean,
-        data.deviation,
-    );
-    metadata.save(args.model_directory.join("metadata.json"))?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{baseline_loss, log_returns, parse_prices, prepare_data};
@@ -531,10 +525,10 @@ mod tests {
             vec![PathBuf::from("monday.csv"), PathBuf::from("tuesday.csv")],
         );
         assert_eq!(args.validation_paths, vec![PathBuf::from("wednesday.csv")]);
-        assert_eq!(args.inputs, 20);
-        assert_eq!(args.outputs, 5);
+        assert_eq!(args.inputs, 300);
+        assert_eq!(args.outputs, 60);
         assert_eq!(args.batch_size, 64);
-        assert_eq!(args.epochs, 50);
+        assert_eq!(args.epochs, 5);
         assert!((args.learning_rate - 1e-3).abs() < f64::EPSILON);
         assert_eq!(args.seed, 42);
         assert_eq!(args.model_directory, PathBuf::from("model"));
