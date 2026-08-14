@@ -124,7 +124,6 @@ pub(crate) struct Model<B: Backend> {
 #[derive(Config, Debug)]
 pub(crate) struct ModelConfig {
     pub(crate) inputs: usize,
-    hidden: usize,
     outputs: usize,
     batch_size: usize,
     epochs: usize,
@@ -138,10 +137,10 @@ impl ModelConfig {
     // Initialize every model layer on the selected device.
     pub(crate) fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
         Model {
-            layer1: LinearConfig::new(self.inputs, self.hidden).init(device),
-            layer2: LinearConfig::new(self.hidden, self.hidden).init(device),
-            layer3: LinearConfig::new(self.hidden, self.hidden).init(device),
-            output: LinearConfig::new(self.hidden, self.outputs).init(device),
+            layer1: LinearConfig::new(self.inputs, HIDDEN_SIZE).init(device),
+            layer2: LinearConfig::new(HIDDEN_SIZE, HIDDEN_SIZE).init(device),
+            layer3: LinearConfig::new(HIDDEN_SIZE, HIDDEN_SIZE).init(device),
+            output: LinearConfig::new(HIDDEN_SIZE, self.outputs).init(device),
             activation: Relu::new(),
         }
     }
@@ -207,7 +206,6 @@ fn train<B: AutodiffBackend>(
     // Collect every reproducibility setting into the model's saved configuration.
     let config = ModelConfig::new(
         args.inputs,
-        HIDDEN_SIZE,
         args.outputs,
         args.batch_size,
         args.epochs,
