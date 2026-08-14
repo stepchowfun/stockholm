@@ -1,4 +1,4 @@
-use crate::train::{MetadataConfig, ModelConfig, log_returns, parse_prices};
+use crate::train::{ModelConfig, log_returns, parse_prices};
 use burn::{
     backend::{NdArray, ndarray::NdArrayDevice},
     module::Module,
@@ -11,7 +11,7 @@ use std::{error::Error, fs, io, path::PathBuf};
 // These arguments configure a single model inference.
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Directory containing the trained model and its metadata.
+    /// Directory containing the trained model and its configuration.
     #[arg(long, default_value = "model")]
     model_directory: PathBuf,
 
@@ -24,12 +24,11 @@ pub struct Args {
 pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     // Load the architecture and normalization values saved by the train subcommand.
     let config = ModelConfig::load(args.model_directory.join("model.json"))?;
-    let metadata = MetadataConfig::load(args.model_directory.join("metadata.json"))?;
-    if !metadata.return_mean.is_finite()
-        || !metadata.return_deviation.is_finite()
-        || metadata.return_deviation <= f32::EPSILON
+    if !config.return_mean.is_finite()
+        || !config.return_deviation.is_finite()
+        || config.return_deviation <= f32::EPSILON
     {
-        return Err("model metadata contains invalid normalization values".into());
+        return Err("model configuration contains invalid normalization values".into());
     }
 
     // Parse one raw price window and transform it exactly as training inputs are transformed.
@@ -52,7 +51,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     }
     let normalized = log_returns(&prices)
         .into_iter()
-        .map(|value| (value - metadata.return_mean) / metadata.return_deviation)
+        .map(|value| (value - config.return_mean) / config.return_deviation)
         .collect::<Vec<_>>();
 
     // Restore the trained parameters and evaluate the single normalized input window.
@@ -66,7 +65,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     let normalized_predictions = model.forward(inputs).into_data().to_vec::<f32>()?;
     let predicted_returns = normalized_predictions
         .into_iter()
-        .map(|value| value * metadata.return_deviation + metadata.return_mean);
+        .map(|value| value * config.return_deviation + config.return_mean);
     let predicted_prices = forecast_prices(*prices.last().unwrap(), predicted_returns);
 
     // Emit the predicted opening prices without mixing diagnostics into standard output.

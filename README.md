@@ -70,9 +70,9 @@ The `train` subcommand trains a simple neural network to predict multiple future
 stockholm train --training-paths monday.csv tuesday.csv --validation-paths wednesday.csv
 ```
 
-Training uses log returns and every available overlapping window. Normalization is fitted exclusively from the training files. By default, the model uses 20 inputs to predict 5 outputs, a batch size of 64, 50 epochs, a learning rate of 0.001, and a seed of 42, and writes the trained Burn model and its preprocessing metadata to `model`; these settings can be changed with `--inputs`, `--outputs`, `--batch-size`, `--epochs`, `--learning-rate`, `--seed`, and `--model-directory`.
+Training uses log returns and every available overlapping window. Normalization is fitted exclusively from the training files. The model has three hidden layers of 32 units each. By default, it uses 300 inputs to predict 60 outputs, a batch size of 64, 5 epochs, a learning rate of 0.001, and a seed of 42, and writes the trained Burn model and its configuration to `model`; these settings can be changed with `--inputs`, `--outputs`, `--batch-size`, `--epochs`, `--learning-rate`, `--seed`, and `--model-directory`.
 
-The `infer` subcommand loads those artifacts and forecasts opening prices from one CSV input window. Because prices are converted to log returns, the CSV must contain one more raw price than the model's input count; the default 20-input model therefore consumes 21 prices:
+The `infer` subcommand loads those artifacts and forecasts opening prices from one CSV input window. Because prices are converted to log returns, the CSV must contain one more raw price than the model's input count; the default 300-input model therefore consumes 301 prices:
 
 ```sh
 stockholm infer
