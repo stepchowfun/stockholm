@@ -32,49 +32,30 @@ Options:
   -h, --help                   Print help
 ```
 
-You can evaluate a strategy over historical CSV files with the `backtest` subcommand. Every strategy excludes records from 4:00 a.m. through 4:14:59 a.m. Eastern time because delayed overnight trade reports make that window unreliable for backtesting. Files are ordered lexicographically by filename; the buy-and-hold strategy invests the initial cash at the first remaining opening price and prints the resulting account value at the final closing price:
+You can evaluate the buy-and-hold, market-maker, and market-maker grid-search strategies over historical CSV files with the `backtest` subcommand. Run `stockholm backtest --help` for the available strategy parameters.
 
 ```sh
 stockholm backtest --strategy buy-and-hold --data-paths data/validation/*.csv
-```
-
-The `market-maker` strategy treats each input CSV as one trading day and repeatedly places whole-share limit orders below and above each one-second bar's closing price. Existing orders fill when a subsequent bar trades through their limit and expire after their configured lifetime. Each eligible order fills at most `--bar-volume-limit` shares per one-second bar (1,000 by default), with the remainder staying open. From 3:45 p.m. until 8:05 p.m. Eastern time, the strategy cancels all buy and sell orders, places no new ordinary orders, and liquidates up to the same volume limit at the current closing price each second. Account value compounds across days. The report includes the final marked-to-market account value, each daily return, and an annualized Sharpe ratio calculated from daily returns using their sample standard deviation, a 0% risk-free rate, and 252 trading days per year. At least two daily returns are required, and √252 annualization assumes serially uncorrelated returns:
-
-```sh
-stockholm backtest --strategy market-maker --data-paths data/validation/*.csv --initial-cash 1000000 --buy-ttl 3600 --sell-ttl 14400 --discount-percent 0.25 --markup-percent 0.25
-```
-
-The `market-maker-grid` strategy evaluates buy and sell TTLs of 5, 15, 30, 60, 120, 300, 900, 3,600, 7,200, 14,400, 43,200, and 86,400 seconds, discount and markup percentages of 0.01, 0.03, 0.1, 0.3, 1, 3, and 10, and bet sizes of 80, 90, and 100 percent by default. It reports the configurations with the highest final return and highest Sharpe ratio among the resulting 21,168 combinations, including the daily return series for each winner. Override each part of the search space independently with comma-separated `--buy-ttls`, `--sell-ttls`, `--discount-percentages`, `--markup-percentages`, and `--bet-sizes` values. Initial cash and the per-bar volume limit apply to every grid candidate, while the single-run TTL and percentage options do not affect grid mode:
-
-```sh
+stockholm backtest --strategy market-maker --data-paths data/validation/*.csv
 stockholm backtest --strategy market-maker-grid --data-paths data/training/*.csv
 ```
 
-You can select the symbol whose live market data and five-second bars should be streamed with the `run` subcommand:
+Use the `run` subcommand to trade a symbol with the live strategy:
 
 ```sh
 stockholm run --symbol AAPL
 ```
 
-The live strategy runs its control loop once per second. Between 3:45 p.m. and 8:05 p.m. Eastern time, it suppresses ordinary market-making orders, immediately cancels its buy orders for the selected symbol, gives matching sell orders a one-minute lifetime, and repeatedly offers every unreserved whole share at the current ask. Stockholm-managed orders for other symbols and orders placed outside Stockholm are unaffected.
-
-You can fetch historical bars as CSV with the `historical` subcommand. The start and end are ISO 8601 datetimes with explicit UTC offsets, and the interval defaults to `SEC`:
+Use the `historical` subcommand to fetch historical bars as CSV:
 
 ```sh
 stockholm historical --start 2026-07-31T13:30:00Z --end 2026-07-31T20:00:00Z --symbol SOXL --interval MIN5
 ```
 
-The `train` subcommand trains a simple neural network to predict multiple future samples from a fixed window of historical stock prices. Each input must be a CSV file produced by the `historical` subcommand; only its `open` column is used. Training and validation files are specified separately, and every file is treated as an independent time series so windows never span file boundaries:
+Use the `train` subcommand to train a forecasting model from separate training and validation datasets, then use `infer` to load the saved model and forecast future prices. Run either subcommand with `--help` for its data and configuration options.
 
 ```sh
 stockholm train --training-paths monday.csv tuesday.csv --validation-paths wednesday.csv
-```
-
-Training uses log returns and every available overlapping window. Normalization is fitted exclusively from the training files. The model has three hidden layers of 32 units each. By default, it uses 300 inputs to predict 60 outputs, a batch size of 64, 5 epochs, a learning rate of 0.001, and a seed of 42, and writes the trained Burn model and its configuration to `model`; these settings can be changed with `--inputs`, `--outputs`, `--batch-size`, `--epochs`, `--learning-rate`, `--seed`, and `--model-directory`.
-
-The `infer` subcommand loads those artifacts and forecasts opening prices from one CSV input window. Because prices are converted to log returns, the CSV must contain one more raw price than the model's input count; the default 300-input model therefore consumes 301 prices:
-
-```sh
 stockholm infer
 ```
 
