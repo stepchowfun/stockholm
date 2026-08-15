@@ -6,11 +6,11 @@ use time::{OffsetDateTime, Time};
 use time_tz::{OffsetDateTimeExt, timezones::db::america::NEW_YORK};
 
 // These Eastern times bound the unreliable early-morning trade-reporting window.
-const UNRELIABLE_DATA_START_TIME: Time = match Time::from_hms(4, 0, 0) {
+pub const UNRELIABLE_DATA_START_TIME: Time = match Time::from_hms(4, 0, 0) {
     Ok(time) => time,
     Err(_) => panic!("The unreliable data start time must be valid."),
 };
-const UNRELIABLE_DATA_END_TIME: Time = match Time::from_hms(4, 15, 0) {
+pub const UNRELIABLE_DATA_END_TIME: Time = match Time::from_hms(4, 15, 0) {
     Ok(time) => time,
     Err(_) => panic!("The unreliable data end time must be valid."),
 };
