@@ -6,7 +6,7 @@ use burn::{
     },
     module::AutodiffModule,
     nn::{
-        Linear, LinearConfig, Relu,
+        Dropout, DropoutConfig, Linear, LinearConfig, Relu,
         loss::{MseLoss, Reduction::Mean},
     },
     optim::{AdamConfig, GradientsParams, Optimizer},
@@ -50,6 +50,10 @@ pub struct Args {
     /// Step size used by the Adam optimizer.
     #[arg(long, default_value_t = 1e-3, value_parser = parse_positive_f64)]
     learning_rate: f64,
+
+    /// Probability of dropping each hidden activation during training.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_dropout)]
+    dropout: f64,
 
     /// Seed used for model initialization and training-data shuffling.
     #[arg(long, default_value_t = 42)]
@@ -118,6 +122,7 @@ pub struct Model<B: Backend> {
     layer3: Linear<B>,
     output: Linear<B>,
     activation: Relu,
+    dropout: Dropout,
 }
 
 // This configuration records the model, training, and preprocessing settings.
@@ -128,6 +133,7 @@ pub struct ModelConfig {
     batch_size: usize,
     epochs: usize,
     learning_rate: f64,
+    dropout: f64,
     seed: u64,
     pub return_mean: f32,
     pub return_deviation: f32,
@@ -142,6 +148,7 @@ impl ModelConfig {
             layer3: LinearConfig::new(HIDDEN_SIZE, HIDDEN_SIZE).init(device),
             output: LinearConfig::new(HIDDEN_SIZE, self.outputs).init(device),
             activation: Relu::new(),
+            dropout: DropoutConfig::new(self.dropout).init(),
         }
     }
 }
@@ -150,8 +157,11 @@ impl<B: Backend> Model<B> {
     // Apply the three hidden transformations and output projection.
     pub fn forward(&self, inputs: Tensor<B, 2>) -> Tensor<B, 2> {
         let values = self.activation.forward(self.layer1.forward(inputs));
+        let values = self.dropout.forward(values);
         let values = self.activation.forward(self.layer2.forward(values));
+        let values = self.dropout.forward(values);
         let values = self.activation.forward(self.layer3.forward(values));
+        let values = self.dropout.forward(values);
         self.output.forward(values)
     }
 }
@@ -210,6 +220,7 @@ fn train<B: AutodiffBackend>(
         args.batch_size,
         args.epochs,
         args.learning_rate,
+        args.dropout,
         args.seed,
         data.mean,
         data.deviation,
@@ -394,6 +405,17 @@ fn parse_positive_f64(value: &str) -> Result<f64, String> {
     Ok(parsed)
 }
 
+// Parse a finite dropout probability that leaves some activations enabled.
+fn parse_dropout(value: &str) -> Result<f64, String> {
+    // Permit disabled dropout while preventing Burn's scaling from dividing by zero.
+    let parsed = value.parse::<f64>().map_err(|error| error.to_string())?;
+    if !parsed.is_finite() || !(0.0_f64..1.0_f64).contains(&parsed) {
+        return Err("value must be finite, nonnegative, and less than one".to_string());
+    }
+
+    Ok(parsed)
+}
+
 // Convert raw prices into stationary relative changes.
 pub fn log_returns(prices: &[f32]) -> Vec<f32> {
     prices
@@ -498,7 +520,7 @@ fn usize_to_f32(value: usize) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{baseline_loss, log_returns, parse_prices, prepare_data};
+    use super::{baseline_loss, log_returns, parse_dropout, parse_prices, prepare_data};
     use crate::{Cli, Subcommand};
     use clap::Parser;
     use std::path::PathBuf;
@@ -530,8 +552,19 @@ mod tests {
         assert_eq!(args.batch_size, 64);
         assert_eq!(args.epochs, 5);
         assert!((args.learning_rate - 1e-3).abs() < f64::EPSILON);
+        assert!(args.dropout.abs() < f64::EPSILON);
         assert_eq!(args.seed, 42);
         assert_eq!(args.model_directory, PathBuf::from("model"));
+    }
+
+    #[test]
+    fn validate_dropout_probability() {
+        // Accept disabled and partial dropout while rejecting invalid scaling probabilities.
+        assert!(parse_dropout("0").unwrap().abs() < f64::EPSILON);
+        assert!((parse_dropout("0.5").unwrap() - 0.5_f64).abs() < f64::EPSILON);
+        for value in ["-0.1", "1", "NaN", "infinity"] {
+            assert!(parse_dropout(value).is_err());
+        }
     }
 
     #[test]
