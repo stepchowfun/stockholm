@@ -1,3 +1,4 @@
+use crate::backtest::{UNRELIABLE_DATA_END_TIME, UNRELIABLE_DATA_START_TIME};
 use burn::{
     backend::{Autodiff, NdArray, ndarray::NdArrayDevice},
     data::{
@@ -16,9 +17,11 @@ use burn::{
 };
 use clap::Args as ClapArgs;
 use std::{error::Error, fs, marker::PhantomData, path::PathBuf, sync::Arc};
+use time::OffsetDateTime;
+use time_tz::{OffsetDateTimeExt, timezones::db::america::NEW_YORK};
 
 // Keep every hidden layer at one consistent width.
-const HIDDEN_SIZE: usize = 32;
+const HIDDEN_SIZE: usize = 360;
 
 // These arguments configure a time-series training run.
 #[derive(ClapArgs)]
@@ -200,7 +203,7 @@ fn load_series(paths: &[PathBuf]) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
         .map(|path| {
             let contents = fs::read_to_string(path)
                 .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-            let prices = parse_prices(&contents)
+            let prices = parse_training_prices(&contents)
                 .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
             Ok(log_returns(&prices))
         })
@@ -251,7 +254,7 @@ fn train<B: AutodiffBackend>(
     let baseline_loss = baseline_loss(&data.validation, data.mean, data.deviation);
     println!(
         "No-change baseline RMSE: {:.2} bps",
-        baseline_loss.sqrt() * data.deviation * 10_000.0,
+        baseline_loss.sqrt() * f64::from(data.deviation) * 10_000.0_f64,
     );
 
     // Report the initialized model's error before applying any optimizer steps.
@@ -353,21 +356,61 @@ fn validation_loss<B: Backend>(
     total_loss / usize_to_f32(total_items)
 }
 
-// Parse finite positive opening prices from a historical-data CSV file.
+// Parse finite positive opening prices without filtering a single inference window.
 pub fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
-    // Locate the opening-price column by name so column order remains explicit.
+    parse_prices_internal(contents, false)
+}
+
+// Parse training prices after excluding delayed early-morning trade reports.
+fn parse_training_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
+    parse_prices_internal(contents, true)
+}
+
+// Parse opening prices with optional filtering based on each row's Eastern time.
+fn parse_prices_internal(
+    contents: &str,
+    exclude_unreliable_data: bool,
+) -> Result<Vec<f32>, Box<dyn Error>> {
+    // Locate required columns by name so their order remains explicit.
     let mut reader = csv::Reader::from_reader(contents.as_bytes());
     let headers = reader.headers()?;
     let open_index = headers
         .iter()
         .position(|header| header == "open")
         .ok_or("the CSV file must contain an open column")?;
+    let timestamp_index = if exclude_unreliable_data {
+        Some(
+            headers
+                .iter()
+                .position(|header| header == "date")
+                .ok_or("the CSV file must contain a date column")?,
+        )
+    } else {
+        None
+    };
 
-    // Attach line numbers to malformed values so input problems are actionable.
+    // Filter unreliable timestamps before validating their intentionally ignored prices.
     let mut prices = Vec::new();
     for (index, result) in reader.records().enumerate() {
         let record = result?;
         let line = index + 2;
+        if let Some(timestamp_index) = timestamp_index {
+            let value = record
+                .get(timestamp_index)
+                .ok_or_else(|| format!("missing timestamp on line {line}"))?;
+            let timestamp = value
+                .parse::<i64>()
+                .map_err(|error| format!("invalid timestamp on line {line}: {error}"))?;
+            let timestamp = OffsetDateTime::from_unix_timestamp(timestamp)
+                .map_err(|error| format!("invalid timestamp on line {line}: {error}"))?;
+            let eastern_time = timestamp.to_timezone(NEW_YORK).time();
+            if eastern_time >= UNRELIABLE_DATA_START_TIME && eastern_time < UNRELIABLE_DATA_END_TIME
+            {
+                continue;
+            }
+        }
+
+        // Attach line numbers to malformed values so input problems are actionable.
         let value = record
             .get(open_index)
             .ok_or_else(|| format!("missing opening price on line {line}"))?;
@@ -500,16 +543,17 @@ fn windows(values: &[f32], inputs: usize, outputs: usize) -> Vec<SeriesItem> {
 }
 
 // Measure the normalized error from predicting zero return at every horizon.
-fn baseline_loss(items: &[SeriesItem], mean: f32, deviation: f32) -> f32 {
-    // Zero raw return has this value after applying the training normalization.
-    let prediction = -mean / deviation;
-    let squared_error = items
-        .iter()
-        .flat_map(|item| item.targets.iter())
-        .map(|target| (target - prediction).powi(2))
-        .sum::<f32>();
-    let target_count = items.iter().map(|item| item.targets.len()).sum::<usize>();
-    squared_error / usize_to_f32(target_count)
+fn baseline_loss(items: &[SeriesItem], mean: f32, deviation: f32) -> f64 {
+    // Accumulate normalized errors in double precision across the large target set.
+    let prediction = -f64::from(mean) / f64::from(deviation);
+    let (squared_error, target_count) = items.iter().flat_map(|item| item.targets.iter()).fold(
+        (0.0_f64, 0.0_f64),
+        |(squared_error, count), target| {
+            let error = f64::from(*target) - prediction;
+            (squared_error + error.powi(2), count + 1.0_f64)
+        },
+    );
+    squared_error / target_count
 }
 
 // Convert collection sizes for floating-point averages where minor rounding is acceptable.
@@ -520,7 +564,10 @@ fn usize_to_f32(value: usize) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{baseline_loss, log_returns, parse_dropout, parse_prices, prepare_data};
+    use super::{
+        SeriesItem, baseline_loss, log_returns, parse_dropout, parse_prices, parse_training_prices,
+        prepare_data,
+    };
     use crate::{Cli, Subcommand};
     use clap::Parser;
     use std::path::PathBuf;
@@ -582,6 +629,28 @@ mod tests {
     }
 
     #[test]
+    fn discard_unreliable_training_prices_across_eastern_time_offsets() {
+        // Apply the shared inclusive start and exclusive end in daylight and standard time.
+        for start in [1_784_016_000_i64, 1_767_949_200_i64] {
+            let contents = format!(
+                concat!(
+                    "date,open\n",
+                    "{},99\n",
+                    "{},invalid\n",
+                    "{},invalid\n",
+                    "{},100\n",
+                ),
+                start - 1,
+                start,
+                start + 899,
+                start + 900,
+            );
+
+            assert_eq!(parse_training_prices(&contents).unwrap(), vec![99.0, 100.0]);
+        }
+    }
+
+    #[test]
     fn reject_nonpositive_prices() {
         // Confirm logarithmic preprocessing rejects values outside its domain.
         let error = parse_prices("date,open\n1,100\n2,0\n").unwrap_err();
@@ -600,6 +669,17 @@ mod tests {
         assert_eq!(data.training.len(), 95);
         assert_eq!(data.validation.len(), 95);
         assert!(baseline_loss(&data.validation, data.mean, data.deviation).is_finite());
+    }
+
+    #[test]
+    fn calculate_baseline_loss_in_double_precision() {
+        // Preserve errors too small to affect a much larger term in single precision.
+        let items = [SeriesItem {
+            inputs: Vec::new(),
+            targets: vec![10_000.0_f32, 1.0_f32],
+        }];
+
+        assert!((baseline_loss(&items, 0.0, 1.0) - 50_000_000.5_f64).abs() < f64::EPSILON);
     }
 
     #[test]
