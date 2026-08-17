@@ -226,6 +226,13 @@ fn train<B: AutodiffBackend>(
         .num_workers(1)
         .build(InMemDataset::new(data.validation.clone()));
 
+    // Report the dataset sizes before calculating initial reference metrics.
+    println!(
+        "Training on {} windows and validating on {} windows…",
+        data.training.len(),
+        data.validation.len(),
+    );
+
     // Establish the validation target by predicting no future price movement.
     let baseline_loss = baseline_loss(&data.validation, data.mean, data.deviation);
     println!(
@@ -244,11 +251,6 @@ fn train<B: AutodiffBackend>(
     );
 
     // Optimize mean-squared error and display validation progress each epoch.
-    println!(
-        "Training on {} windows and validating on {} windows…",
-        data.training.len(),
-        data.validation.len(),
-    );
     for epoch in 1..=config.epochs {
         train_epoch(
             &mut model,
