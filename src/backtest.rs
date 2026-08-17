@@ -539,10 +539,7 @@ impl MarketMakerLogger<'_> {
                     "{} @ {}: Executed liquidation sell for {} shares ",
                     "@ ${:.2}",
                 ),
-                filename,
-                timestamp,
-                shares,
-                price,
+                filename, timestamp, shares, price,
             );
         }
     }

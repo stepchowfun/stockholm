@@ -265,17 +265,12 @@ async fn stream_account_summary(
                 if summary.currency.is_empty() {
                     debug!(
                         "Account summary for {}: {} = {}",
-                        summary.account,
-                        summary.tag,
-                        summary.value,
+                        summary.account, summary.tag, summary.value,
                     );
                 } else {
                     debug!(
                         "Account summary for {}: {} = {} {}",
-                        summary.account,
-                        summary.tag,
-                        summary.value,
-                        summary.currency,
+                        summary.account, summary.tag, summary.value, summary.currency,
                     );
                 }
             }

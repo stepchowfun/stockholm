@@ -196,18 +196,18 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// Load opening-price returns while preserving every file as an independent series.
+// Load opening-price returns while preserving every parsed segment as an independent series.
 fn load_series(paths: &[PathBuf]) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
-    paths
-        .iter()
-        .map(|path| {
-            let contents = fs::read_to_string(path)
-                .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-            let prices = parse_training_prices(&contents)
-                .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
-            Ok(log_returns(&prices))
-        })
-        .collect()
+    paths.iter().try_fold(Vec::new(), |mut series, path| {
+        // Parse and append every independent segment produced by this file.
+        let contents = fs::read_to_string(path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        let prices = parse_training_prices(&contents)
+            .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+        series.extend(prices.iter().map(|prices| log_returns(prices)));
+
+        Ok(series)
+    })
 }
 
 // Train the model, evaluate it chronologically, and save its artifacts.
@@ -358,11 +358,15 @@ fn validation_loss<B: Backend>(
 
 // Parse finite positive opening prices without filtering a single inference window.
 pub fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
-    parse_prices_internal(contents, false)
+    let prices = parse_prices_internal(contents, false)?;
+    Ok(prices
+        .last()
+        .cloned()
+        .ok_or("`parse_prices_internal` returned no data")?)
 }
 
 // Parse training prices after excluding delayed early-morning trade reports.
-fn parse_training_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
+fn parse_training_prices(contents: &str) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
     parse_prices_internal(contents, true)
 }
 
@@ -370,7 +374,7 @@ fn parse_training_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
 fn parse_prices_internal(
     contents: &str,
     exclude_unreliable_data: bool,
-) -> Result<Vec<f32>, Box<dyn Error>> {
+) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
     // Locate required columns by name so their order remains explicit.
     let mut reader = csv::Reader::from_reader(contents.as_bytes());
     let headers = reader.headers()?;
@@ -378,36 +382,31 @@ fn parse_prices_internal(
         .iter()
         .position(|header| header == "open")
         .ok_or("the CSV file must contain an open column")?;
-    let timestamp_index = if exclude_unreliable_data {
-        Some(
-            headers
-                .iter()
-                .position(|header| header == "date")
-                .ok_or("the CSV file must contain a date column")?,
-        )
-    } else {
-        None
-    };
+    let timestamp_index = headers
+        .iter()
+        .position(|header| header == "date")
+        .ok_or("the CSV file must contain a date column")?;
 
-    // Filter unreliable timestamps before validating their intentionally ignored prices.
-    let mut prices = Vec::new();
+    // Split retained prices whenever consecutive source timestamps are not one second apart.
+    let mut price_series = Vec::<Vec<f32>>::new();
+    let mut previous_timestamp: Option<i64> = None;
     for (index, result) in reader.records().enumerate() {
         let record = result?;
         let line = index + 2;
-        if let Some(timestamp_index) = timestamp_index {
-            let value = record
-                .get(timestamp_index)
-                .ok_or_else(|| format!("missing timestamp on line {line}"))?;
-            let timestamp = value
-                .parse::<i64>()
-                .map_err(|error| format!("invalid timestamp on line {line}: {error}"))?;
-            let timestamp = OffsetDateTime::from_unix_timestamp(timestamp)
-                .map_err(|error| format!("invalid timestamp on line {line}: {error}"))?;
-            let eastern_time = timestamp.to_timezone(NEW_YORK).time();
-            if eastern_time >= UNRELIABLE_DATA_START_TIME && eastern_time < UNRELIABLE_DATA_END_TIME
-            {
-                continue;
-            }
+        let value = record
+            .get(timestamp_index)
+            .ok_or_else(|| format!("missing timestamp on line {line}"))?;
+        let timestamp = value
+            .parse::<i64>()
+            .map_err(|error| format!("invalid timestamp on line {line}: {error}"))?;
+        let datetime = OffsetDateTime::from_unix_timestamp(timestamp)
+            .map_err(|error| format!("invalid timestamp on line {line}: {error}"))?;
+        let eastern_time = datetime.to_timezone(NEW_YORK).time();
+        if exclude_unreliable_data
+            && eastern_time >= UNRELIABLE_DATA_START_TIME
+            && eastern_time < UNRELIABLE_DATA_END_TIME
+        {
+            continue;
         }
 
         // Attach line numbers to malformed values so input problems are actionable.
@@ -420,10 +419,17 @@ fn parse_prices_internal(
         if !price.is_finite() || price <= 0.0 {
             return Err(format!("opening price on line {line} must be finite and positive").into());
         }
-        prices.push(price);
+        if previous_timestamp.is_none_or(|previous| previous.checked_add(1) != Some(timestamp)) {
+            price_series.push(Vec::new());
+        }
+        price_series
+            .last_mut()
+            .ok_or("the price series must contain a current chunk")?
+            .push(price);
+        previous_timestamp = Some(timestamp);
     }
 
-    Ok(prices)
+    Ok(price_series)
 }
 
 // Parse a strictly positive model dimension from the command line.
@@ -646,8 +652,30 @@ mod tests {
                 start + 900,
             );
 
-            assert_eq!(parse_training_prices(&contents).unwrap(), vec![99.0, 100.0]);
+            assert_eq!(
+                parse_training_prices(&contents).unwrap(),
+                vec![vec![99.0], vec![100.0]],
+            );
         }
+    }
+
+    #[test]
+    fn split_prices_at_timestamp_gaps() {
+        // Keep one-second observations together while separating gaps and reversed timestamps.
+        let prices = parse_training_prices(concat!(
+            "date,open\n",
+            "1784030400,100\n",
+            "1784030401,101\n",
+            "1784030403,102\n",
+            "1784030404,103\n",
+            "1784030402,104\n",
+        ))
+        .unwrap();
+
+        assert_eq!(
+            prices,
+            vec![vec![100.0, 101.0], vec![102.0, 103.0], vec![104.0]],
+        );
     }
 
     #[test]
