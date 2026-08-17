@@ -23,10 +23,10 @@ const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 const DEFAULT_BUYING_POWER_BUFFER: f64 = 20.0_f64;
 const DEFAULT_INITIAL_MARGIN_REQUIREMENT: f64 = 75.0_f64;
-const BUY_DISCOUNT_PERCENT: f64 = 0.7_f64;
-const SELL_MARKUP_PERCENT: f64 = 0.9_f64;
+const BUY_DISCOUNT_PERCENT: f64 = 1.0_f64;
+const SELL_MARKUP_PERCENT: f64 = 0.5_f64;
 const BUY_ORDER_TTL: Duration = Duration::seconds(5);
-const SELL_ORDER_TTL: Duration = Duration::seconds(30);
+const SELL_ORDER_TTL: Duration = Duration::seconds(120);
 const LIQUIDATION_SELL_ORDER_TTL: Duration = Duration::minutes(1);
 const QUOTE_MAX_AGE: Duration = Duration::minutes(5);
 const CANCEL_RETRY_DELAY: Duration = Duration::seconds(10);
@@ -1072,7 +1072,7 @@ mod tests {
         // Suppress buys and quote directly at the ask only while liquidating.
         assert_eq!(
             calculate_order_limits(Some(10.129_f64), Some(10.231_f64), false),
-            (Some(10.05_f64), Some(10.33_f64)),
+            (Some(10.02_f64), Some(10.29_f64)),
         );
         assert_eq!(
             calculate_order_limits(Some(10.129_f64), Some(10.231_f64), true),
