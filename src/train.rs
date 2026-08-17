@@ -196,15 +196,15 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// Load opening-price returns while preserving every parsed segment as an independent series.
+// Load opening prices while preserving every contiguous segment as an independent series.
 fn load_series(paths: &[PathBuf]) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
     paths.iter().try_fold(Vec::new(), |mut series, path| {
         // Parse and append every independent segment produced by this file.
         let contents = fs::read_to_string(path)
             .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-        let prices = parse_training_prices(&contents)
+        let parsed_series = parse_training_prices(&contents)
             .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
-        series.extend(prices.iter().map(|prices| log_returns(prices)));
+        series.extend(parsed_series);
 
         Ok(series)
     })
@@ -356,7 +356,7 @@ fn validation_loss<B: Backend>(
     total_loss / usize_to_f32(total_items)
 }
 
-// Parse finite positive opening prices without filtering a single inference window.
+// Parse the latest contiguous opening-price series without training-time filtering.
 pub fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
     let prices = parse_prices_internal(contents, false)?;
     Ok(prices
@@ -365,12 +365,12 @@ pub fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
         .ok_or("`parse_prices_internal` returned no data")?)
 }
 
-// Parse training prices after excluding delayed early-morning trade reports.
+// Parse contiguous training-price series after excluding delayed early-morning trade reports.
 fn parse_training_prices(contents: &str) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
     parse_prices_internal(contents, true)
 }
 
-// Parse opening prices with optional filtering based on each row's Eastern time.
+// Parse opening prices into contiguous series with optional Eastern-time filtering.
 fn parse_prices_internal(
     contents: &str,
     exclude_unreliable_data: bool,
@@ -465,7 +465,7 @@ fn parse_dropout(value: &str) -> Result<f64, String> {
     Ok(parsed)
 }
 
-// Convert raw prices into stationary relative changes.
+// Convert raw prices into successive logarithmic returns.
 pub fn log_returns(prices: &[f32]) -> Vec<f32> {
     prices
         .windows(2)
@@ -473,25 +473,35 @@ pub fn log_returns(prices: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-// Normalize from training files and create windows within every independent series.
+// Transform and normalize raw prices before windowing every independent series.
 fn prepare_data(
-    training_series: &[Vec<f32>],
-    validation_series: &[Vec<f32>],
+    training_prices: &[Vec<f32>],
+    validation_prices: &[Vec<f32>],
     inputs: usize,
     outputs: usize,
 ) -> Result<PreparedData, Box<dyn Error>> {
-    // Require every file to contain at least one complete model window.
+    // Convert each price series independently so returns never cross a timestamp gap.
+    let training_series = training_prices
+        .iter()
+        .map(|prices| log_returns(prices))
+        .collect::<Vec<_>>();
+    let validation_series = validation_prices
+        .iter()
+        .map(|prices| log_returns(prices))
+        .collect::<Vec<_>>();
+
+    // Require every series to contain at least one complete model window.
     for (kind, series) in [
-        ("training", training_series),
-        ("validation", validation_series),
+        ("training", &training_series),
+        ("validation", &validation_series),
     ] {
         if series.is_empty() {
-            return Err(format!("at least one {kind} file is required").into());
+            return Err(format!("at least one {kind} series is required").into());
         }
         for (index, returns) in series.iter().enumerate() {
             if returns.len() < inputs + outputs {
                 return Err(format!(
-                    "{kind} file {} is too short for {inputs} inputs and {outputs} outputs",
+                    "{kind} series {} is too short for {inputs} inputs and {outputs} outputs",
                     index + 1,
                 )
                 .into());
@@ -499,7 +509,7 @@ fn prepare_data(
         }
     }
 
-    // Fit normalization exclusively to returns from the training files.
+    // Fit normalization exclusively to returns from the training series.
     let training_count = training_series.iter().map(Vec::len).sum::<usize>();
     let training_sum = training_series.iter().flatten().sum::<f32>();
     let mean = training_sum / usize_to_f32(training_count);
@@ -514,7 +524,7 @@ fn prepare_data(
         return Err("training returns must have nonzero finite variance".into());
     }
 
-    // Normalize and window each file separately so no example crosses a file boundary.
+    // Normalize and window each series separately so no example crosses a timestamp gap.
     let prepare = |series: &[Vec<f32>]| {
         let mut items = Vec::new();
         for returns in series {
@@ -526,8 +536,8 @@ fn prepare_data(
         }
         items
     };
-    let training = prepare(training_series);
-    let validation = prepare(validation_series);
+    let training = prepare(&training_series);
+    let validation = prepare(&validation_series);
 
     Ok(PreparedData {
         training,
@@ -571,8 +581,7 @@ fn usize_to_f32(value: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        SeriesItem, baseline_loss, log_returns, parse_dropout, parse_prices, parse_training_prices,
-        prepare_data,
+        SeriesItem, baseline_loss, parse_dropout, parse_prices, parse_training_prices, prepare_data,
     };
     use crate::{Cli, Subcommand};
     use clap::Parser;
@@ -636,7 +645,7 @@ mod tests {
 
     #[test]
     fn discard_unreliable_training_prices_across_eastern_time_offsets() {
-        // Apply the shared inclusive start and exclusive end in daylight and standard time.
+        // Filter the shared window and separate surrounding prices across Eastern offsets.
         for start in [1_784_016_000_i64, 1_767_949_200_i64] {
             let contents = format!(
                 concat!(
@@ -680,7 +689,7 @@ mod tests {
 
     #[test]
     fn reject_nonpositive_prices() {
-        // Confirm logarithmic preprocessing rejects values outside its domain.
+        // Confirm price parsing rejects values outside the logarithmic return domain.
         let error = parse_prices("date,open\n1,100\n2,0\n").unwrap_err();
 
         assert!(error.to_string().contains("finite and positive"));
@@ -688,10 +697,9 @@ mod tests {
 
     #[test]
     fn create_separate_training_and_validation_windows() {
-        // Confirm complete files contribute only to their selected dataset.
+        // Confirm raw price series contribute only to their selected dataset.
         let prices = (1_u16..=101).map(f32::from).collect::<Vec<_>>();
-        let returns = log_returns(&prices);
-        let series = std::slice::from_ref(&returns);
+        let series = std::slice::from_ref(&prices);
         let data = prepare_data(series, series, 4, 2).unwrap();
 
         assert_eq!(data.training.len(), 95);
@@ -711,11 +719,10 @@ mod tests {
     }
 
     #[test]
-    fn keep_file_windows_separate() {
-        // Confirm combining files does not add windows across their boundary.
+    fn keep_series_windows_separate() {
+        // Confirm combining series does not add windows across their boundary.
         let prices = (1_u16..=101).map(f32::from).collect::<Vec<_>>();
-        let returns = log_returns(&prices);
-        let series = [returns.clone(), returns];
+        let series = [prices.clone(), prices];
         let data = prepare_data(&series, &series, 4, 2).unwrap();
 
         assert_eq!(data.training.len(), 190);

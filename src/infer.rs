@@ -15,7 +15,7 @@ pub struct Args {
     #[arg(long, default_value = "model")]
     model_directory: PathBuf,
 
-    /// CSV file containing exactly one input window of opening prices.
+    /// CSV file whose latest contiguous series contains exactly one input window.
     #[arg(long, default_value = "data/inference-sample.csv")]
     input_path: PathBuf,
 }
@@ -31,7 +31,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
         return Err("model configuration contains invalid normalization values".into());
     }
 
-    // Parse one raw price window and transform it exactly as training inputs are transformed.
+    // Parse the latest raw price series and transform it exactly like a training window.
     let contents = fs::read_to_string(&args.input_path)
         .map_err(|error| format!("failed to read {}: {error}", args.input_path.display()))?;
     let prices = parse_prices(&contents)
@@ -112,7 +112,7 @@ mod tests {
 
     #[test]
     fn parse_infer_subcommand() {
-        // Confirm inference supplies the conventional model directory by default.
+        // Confirm inference supplies the conventional artifact and input paths by default.
         let cli = Cli::try_parse_from(["stockholm", "infer"]).unwrap();
 
         let Some(Subcommand::Infer(args)) = cli.command else {

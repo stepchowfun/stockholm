@@ -18,7 +18,7 @@ pub struct OpenOrder {
     // The permanent order identifier, once assigned by Interactive Brokers.
     pub perm_id: Option<i64>,
 
-    // The moment the order was created, persisted as a Unix timestamp.
+    // The moment the order was created or first observed, persisted as a Unix timestamp.
     #[serde(with = "time::serde::timestamp")]
     pub created_at: OffsetDateTime,
 
