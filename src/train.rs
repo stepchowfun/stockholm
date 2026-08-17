@@ -270,13 +270,6 @@ fn train<B: AutodiffBackend>(
         );
     }
 
-    // Report the trained model's final validation error without repeating the baseline.
-    let final_loss = validation_loss(&model.valid(), &validation_loader);
-    println!(
-        "Final validation RMSE: {:.2} bps",
-        final_loss.sqrt() * data.deviation * 10_000.0_f32,
-    );
-
     // Save the Burn parameters and their complete reconstruction configuration.
     fs::create_dir_all(&args.model_directory)?;
     model.save_file(args.model_directory.join("model"), &CompactRecorder::new())?;
