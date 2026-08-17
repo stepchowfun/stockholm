@@ -20,8 +20,9 @@ use std::{error::Error, fs, marker::PhantomData, path::PathBuf, sync::Arc};
 use time::OffsetDateTime;
 use time_tz::{OffsetDateTimeExt, timezones::db::america::NEW_YORK};
 
-// Keep every hidden layer at one consistent width.
-const HIDDEN_SIZE: usize = 360;
+// Fix the forecasting horizon and the amount of history supplied to the model.
+const INPUTS: usize = 56;
+const OUTPUTS: usize = 64;
 
 // These arguments configure a time-series training run.
 #[derive(ClapArgs)]
@@ -33,14 +34,6 @@ pub struct Args {
     /// CSV files used only to validate the model.
     #[arg(long, required = true, num_args = 1..)]
     validation_paths: Vec<PathBuf>,
-
-    /// Number of recent returns supplied to the model.
-    #[arg(long, default_value_t = 300, value_parser = parse_positive_usize)]
-    inputs: usize,
-
-    /// Number of future returns predicted by the model.
-    #[arg(long, default_value_t = 60, value_parser = parse_positive_usize)]
-    outputs: usize,
 
     /// Number of examples processed in each optimization step.
     #[arg(long, default_value_t = 64, value_parser = parse_positive_usize)]
@@ -120,9 +113,7 @@ impl<B: Backend> Batcher<B, SeriesItem, SeriesBatch<B>> for SeriesBatcher<B> {
 // This model predicts several future returns directly from a fixed input window.
 #[derive(Module, Debug)]
 pub struct Model<B: Backend> {
-    layer1: Linear<B>,
-    layer2: Linear<B>,
-    layer3: Linear<B>,
+    input: Linear<B>,
     output: Linear<B>,
     activation: Relu,
     dropout: Dropout,
@@ -131,8 +122,6 @@ pub struct Model<B: Backend> {
 // This configuration records the model, training, and preprocessing settings.
 #[derive(Config, Debug)]
 pub struct ModelConfig {
-    pub inputs: usize,
-    outputs: usize,
     batch_size: usize,
     epochs: usize,
     learning_rate: f64,
@@ -146,10 +135,8 @@ impl ModelConfig {
     // Initialize every model layer on the selected device.
     pub fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
         Model {
-            layer1: LinearConfig::new(self.inputs, HIDDEN_SIZE).init(device),
-            layer2: LinearConfig::new(HIDDEN_SIZE, HIDDEN_SIZE).init(device),
-            layer3: LinearConfig::new(HIDDEN_SIZE, HIDDEN_SIZE).init(device),
-            output: LinearConfig::new(HIDDEN_SIZE, self.outputs).init(device),
+            input: LinearConfig::new(INPUTS, 128).init(device),
+            output: LinearConfig::new(128, OUTPUTS).init(device),
             activation: Relu::new(),
             dropout: DropoutConfig::new(self.dropout).init(),
         }
@@ -157,13 +144,9 @@ impl ModelConfig {
 }
 
 impl<B: Backend> Model<B> {
-    // Apply the three hidden transformations and output projection.
+    // Apply the hidden transformation and output projection.
     pub fn forward(&self, inputs: Tensor<B, 2>) -> Tensor<B, 2> {
-        let values = self.activation.forward(self.layer1.forward(inputs));
-        let values = self.dropout.forward(values);
-        let values = self.activation.forward(self.layer2.forward(values));
-        let values = self.dropout.forward(values);
-        let values = self.activation.forward(self.layer3.forward(values));
+        let values = self.activation.forward(self.input.forward(inputs));
         let values = self.dropout.forward(values);
         self.output.forward(values)
     }
@@ -182,12 +165,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     // Load the two file groups independently so validation data never enters training.
     let training_series = load_series(&args.training_paths)?;
     let validation_series = load_series(&args.validation_paths)?;
-    let data = prepare_data(
-        &training_series,
-        &validation_series,
-        args.inputs,
-        args.outputs,
-    )?;
+    let data = prepare_data(&training_series, &validation_series, INPUTS, OUTPUTS)?;
 
     // Use Burn's portable CPU backend for deterministic local training.
     let device = NdArrayDevice::Cpu;
@@ -218,8 +196,6 @@ fn train<B: AutodiffBackend>(
 ) -> Result<(), Box<dyn Error>> {
     // Collect every reproducibility setting into the model's saved configuration.
     let config = ModelConfig::new(
-        args.inputs,
-        args.outputs,
         args.batch_size,
         args.epochs,
         args.learning_rate,
@@ -229,7 +205,7 @@ fn train<B: AutodiffBackend>(
         data.deviation,
     );
 
-    // Seed Burn and construct the fixed-width model for the requested endpoints.
+    // Seed Burn and construct the fixed architecture.
     B::seed(device, config.seed);
     let mut model = config.init::<B>(device);
     let mut optimizer = AdamConfig::new().init::<B, Model<B>>();
@@ -274,13 +250,17 @@ fn train<B: AutodiffBackend>(
         data.validation.len(),
     );
     for epoch in 1..=config.epochs {
-        let training_loss = train_epoch(
+        train_epoch(
             &mut model,
             &mut optimizer,
             &training_loader,
             config.learning_rate,
         );
-        let validation_loss = validation_loss(&model.valid(), &validation_loader);
+
+        // Evaluate the fully updated model on both splits for comparable epoch metrics.
+        let valid_model = model.valid();
+        let training_loss = validation_loss(&valid_model, &training_evaluation_loader);
+        let validation_loss = validation_loss(&valid_model, &validation_loader);
         println!(
             "Epoch {:>2}/{}: train RMSE {:.2} bps, validation RMSE {:.2} bps",
             epoch,
@@ -315,26 +295,18 @@ fn train_epoch<B: AutodiffBackend, O>(
     optimizer: &mut O,
     loader: &Arc<dyn DataLoader<B, SeriesBatch<B>>>,
     learning_rate: f64,
-) -> f32
-where
+) where
     O: Optimizer<Model<B>, B>,
 {
-    // Accumulate sample-weighted loss while applying each gradient update.
-    let mut total_loss = 0.0_f32;
-    let mut total_items = 0_usize;
+    // Apply one gradient update for every shuffled batch.
     for batch in loader.iter() {
-        let item_count = batch.targets.dims()[0];
         let predictions = model.forward(batch.inputs);
         let loss = MseLoss::new().forward(predictions, batch.targets, Mean);
-        total_loss += loss.clone().into_scalar().elem::<f32>() * usize_to_f32(item_count);
-        total_items += item_count;
 
         // Associate gradients with model parameters before applying Adam.
         let gradients = GradientsParams::from_grads(loss.backward(), model);
         *model = optimizer.step(learning_rate, model.clone(), gradients);
     }
-
-    total_loss / usize_to_f32(total_items)
 }
 
 // Transform and normalize raw prices before windowing every independent series.
@@ -598,8 +570,6 @@ mod tests {
             vec![PathBuf::from("monday.csv"), PathBuf::from("tuesday.csv")],
         );
         assert_eq!(args.validation_paths, vec![PathBuf::from("wednesday.csv")]);
-        assert_eq!(args.inputs, 300);
-        assert_eq!(args.outputs, 60);
         assert_eq!(args.batch_size, 64);
         assert_eq!(args.epochs, 5);
         assert!((args.learning_rate - 1e-3_f64).abs() < f64::EPSILON);
