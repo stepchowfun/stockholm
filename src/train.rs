@@ -51,11 +51,11 @@ pub struct Args {
     epochs: usize,
 
     /// Step size used by the Adam optimizer.
-    #[arg(long, default_value_t = 1e-3, value_parser = parse_positive_f64)]
+    #[arg(long, default_value_t = 1e-3_f64, value_parser = parse_positive_f64)]
     learning_rate: f64,
 
     /// Probability of dropping each hidden activation during training.
-    #[arg(long, default_value_t = 0.0, value_parser = parse_dropout)]
+    #[arg(long, default_value_t = 0.0_f64, value_parser = parse_dropout)]
     dropout: f64,
 
     /// Seed used for model initialization and training-data shuffling.
@@ -263,8 +263,8 @@ fn train<B: AutodiffBackend>(
     let initial_validation_loss = validation_loss(&initial_model, &validation_loader);
     println!(
         "Initial RMSE: train {:.2} bps, validation {:.2} bps",
-        initial_training_loss.sqrt() * data.deviation * 10_000.0,
-        initial_validation_loss.sqrt() * data.deviation * 10_000.0,
+        initial_training_loss.sqrt() * data.deviation * 10_000.0_f32,
+        initial_validation_loss.sqrt() * data.deviation * 10_000.0_f32,
     );
 
     // Optimize mean-squared error and display validation progress each epoch.
@@ -285,8 +285,8 @@ fn train<B: AutodiffBackend>(
             "Epoch {:>2}/{}: train RMSE {:.2} bps, validation RMSE {:.2} bps",
             epoch,
             config.epochs,
-            training_loss.sqrt() * data.deviation * 10_000.0,
-            validation_loss.sqrt() * data.deviation * 10_000.0,
+            training_loss.sqrt() * data.deviation * 10_000.0_f32,
+            validation_loss.sqrt() * data.deviation * 10_000.0_f32,
         );
     }
 
@@ -294,7 +294,7 @@ fn train<B: AutodiffBackend>(
     let final_loss = validation_loss(&model.valid(), &validation_loader);
     println!(
         "Final validation RMSE: {:.2} bps",
-        final_loss.sqrt() * data.deviation * 10_000.0,
+        final_loss.sqrt() * data.deviation * 10_000.0_f32,
     );
 
     // Save the Burn parameters and their complete reconstruction configuration.
@@ -335,142 +335,6 @@ where
     }
 
     total_loss / usize_to_f32(total_items)
-}
-
-// Measure mean-squared error without constructing an autodiff graph.
-fn validation_loss<B: Backend>(
-    model: &Model<B>,
-    loader: &Arc<dyn DataLoader<B, SeriesBatch<B>>>,
-) -> f32 {
-    // Accumulate sample-weighted loss across the ordered validation windows.
-    let mut total_loss = 0.0_f32;
-    let mut total_items = 0_usize;
-    for batch in loader.iter() {
-        let item_count = batch.targets.dims()[0];
-        let predictions = model.forward(batch.inputs);
-        let loss = MseLoss::new().forward(predictions, batch.targets, Mean);
-        total_loss += loss.into_scalar().elem::<f32>() * usize_to_f32(item_count);
-        total_items += item_count;
-    }
-
-    total_loss / usize_to_f32(total_items)
-}
-
-// Parse the latest contiguous opening-price series without training-time filtering.
-pub fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
-    let prices = parse_prices_internal(contents, false)?;
-    Ok(prices
-        .last()
-        .cloned()
-        .ok_or("`parse_prices_internal` returned no data")?)
-}
-
-// Parse contiguous training-price series after excluding delayed early-morning trade reports.
-fn parse_training_prices(contents: &str) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
-    parse_prices_internal(contents, true)
-}
-
-// Parse opening prices into contiguous series with optional Eastern-time filtering.
-fn parse_prices_internal(
-    contents: &str,
-    exclude_unreliable_data: bool,
-) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
-    // Locate required columns by name so their order remains explicit.
-    let mut reader = csv::Reader::from_reader(contents.as_bytes());
-    let headers = reader.headers()?;
-    let open_index = headers
-        .iter()
-        .position(|header| header == "open")
-        .ok_or("the CSV file must contain an open column")?;
-    let timestamp_index = headers
-        .iter()
-        .position(|header| header == "date")
-        .ok_or("the CSV file must contain a date column")?;
-
-    // Split retained prices whenever consecutive source timestamps are not one second apart.
-    let mut price_series = Vec::<Vec<f32>>::new();
-    let mut previous_timestamp: Option<i64> = None;
-    for (index, result) in reader.records().enumerate() {
-        let record = result?;
-        let line = index + 2;
-        let value = record
-            .get(timestamp_index)
-            .ok_or_else(|| format!("missing timestamp on line {line}"))?;
-        let timestamp = value
-            .parse::<i64>()
-            .map_err(|error| format!("invalid timestamp on line {line}: {error}"))?;
-        let datetime = OffsetDateTime::from_unix_timestamp(timestamp)
-            .map_err(|error| format!("invalid timestamp on line {line}: {error}"))?;
-        let eastern_time = datetime.to_timezone(NEW_YORK).time();
-        if exclude_unreliable_data
-            && eastern_time >= UNRELIABLE_DATA_START_TIME
-            && eastern_time < UNRELIABLE_DATA_END_TIME
-        {
-            continue;
-        }
-
-        // Attach line numbers to malformed values so input problems are actionable.
-        let value = record
-            .get(open_index)
-            .ok_or_else(|| format!("missing opening price on line {line}"))?;
-        let price: f32 = value
-            .parse()
-            .map_err(|error| format!("invalid opening price on line {line}: {error}"))?;
-        if !price.is_finite() || price <= 0.0 {
-            return Err(format!("opening price on line {line} must be finite and positive").into());
-        }
-        if previous_timestamp.is_none_or(|previous| previous.checked_add(1) != Some(timestamp)) {
-            price_series.push(Vec::new());
-        }
-        price_series
-            .last_mut()
-            .ok_or("the price series must contain a current chunk")?
-            .push(price);
-        previous_timestamp = Some(timestamp);
-    }
-
-    Ok(price_series)
-}
-
-// Parse a strictly positive model dimension from the command line.
-fn parse_positive_usize(value: &str) -> Result<usize, String> {
-    // Reject zero explicitly because empty tensor dimensions are not meaningful here.
-    let parsed = value.parse::<usize>().map_err(|error| error.to_string())?;
-    if parsed == 0 {
-        return Err("value must be greater than zero".to_string());
-    }
-
-    Ok(parsed)
-}
-
-// Parse a finite positive floating-point parameter from the command line.
-fn parse_positive_f64(value: &str) -> Result<f64, String> {
-    // Reject values that would make optimizer updates invalid or ineffective.
-    let parsed = value.parse::<f64>().map_err(|error| error.to_string())?;
-    if !parsed.is_finite() || parsed <= 0.0_f64 {
-        return Err("value must be finite and greater than zero".to_string());
-    }
-
-    Ok(parsed)
-}
-
-// Parse a finite dropout probability that leaves some activations enabled.
-fn parse_dropout(value: &str) -> Result<f64, String> {
-    // Permit disabled dropout while preventing Burn's scaling from dividing by zero.
-    let parsed = value.parse::<f64>().map_err(|error| error.to_string())?;
-    if !parsed.is_finite() || !(0.0_f64..1.0_f64).contains(&parsed) {
-        return Err("value must be finite, nonnegative, and less than one".to_string());
-    }
-
-    Ok(parsed)
-}
-
-// Convert raw prices into successive logarithmic returns.
-pub fn log_returns(prices: &[f32]) -> Vec<f32> {
-    prices
-        .windows(2)
-        .map(|pair| (pair[1] / pair[0]).ln())
-        .collect()
 }
 
 // Transform and normalize raw prices before windowing every independent series.
@@ -558,6 +422,25 @@ fn windows(values: &[f32], inputs: usize, outputs: usize) -> Vec<SeriesItem> {
         .collect()
 }
 
+// Measure mean-squared error without constructing an autodiff graph.
+fn validation_loss<B: Backend>(
+    model: &Model<B>,
+    loader: &Arc<dyn DataLoader<B, SeriesBatch<B>>>,
+) -> f32 {
+    // Accumulate sample-weighted loss across the ordered validation windows.
+    let mut total_loss = 0.0_f32;
+    let mut total_items = 0_usize;
+    for batch in loader.iter() {
+        let item_count = batch.targets.dims()[0];
+        let predictions = model.forward(batch.inputs);
+        let loss = MseLoss::new().forward(predictions, batch.targets, Mean);
+        total_loss += loss.into_scalar().elem::<f32>() * usize_to_f32(item_count);
+        total_items += item_count;
+    }
+
+    total_loss / usize_to_f32(total_items)
+}
+
 // Measure the normalized error from predicting zero return at every horizon.
 fn baseline_loss(items: &[SeriesItem], mean: f32, deviation: f32) -> f64 {
     // Accumulate normalized errors in double precision across the large target set.
@@ -572,10 +455,116 @@ fn baseline_loss(items: &[SeriesItem], mean: f32, deviation: f32) -> f64 {
     squared_error / target_count
 }
 
+// Convert raw prices into successive logarithmic returns.
+pub fn log_returns(prices: &[f32]) -> Vec<f32> {
+    prices
+        .windows(2)
+        .map(|pair| (pair[1] / pair[0]).ln())
+        .collect()
+}
+
 // Convert collection sizes for floating-point averages where minor rounding is acceptable.
 #[allow(clippy::cast_precision_loss)]
 fn usize_to_f32(value: usize) -> f32 {
     value as f32
+}
+
+// Parse the latest contiguous opening-price series after excluding unreliable reports.
+pub fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
+    let prices = parse_training_prices(contents)?;
+    Ok(prices
+        .last()
+        .cloned()
+        .ok_or("the CSV file contains no reliable price data")?)
+}
+
+// Parse contiguous training-price series after excluding delayed early-morning trade reports.
+fn parse_training_prices(contents: &str) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
+    // Locate required columns by name so their order remains explicit.
+    let mut reader = csv::Reader::from_reader(contents.as_bytes());
+    let headers = reader.headers()?;
+    let open_index = headers
+        .iter()
+        .position(|header| header == "open")
+        .ok_or("the CSV file must contain an open column")?;
+    let timestamp_index = headers
+        .iter()
+        .position(|header| header == "date")
+        .ok_or("the CSV file must contain a date column")?;
+
+    // Split retained prices whenever consecutive source timestamps are not one second apart.
+    let mut price_series = Vec::<Vec<f32>>::new();
+    let mut previous_timestamp: Option<i64> = None;
+    for (index, result) in reader.records().enumerate() {
+        let record = result?;
+        let line = index + 2;
+        let value = record
+            .get(timestamp_index)
+            .ok_or_else(|| format!("missing timestamp on line {line}"))?;
+        let timestamp = value
+            .parse::<i64>()
+            .map_err(|error| format!("invalid timestamp on line {line}: {error}"))?;
+        let datetime = OffsetDateTime::from_unix_timestamp(timestamp)
+            .map_err(|error| format!("invalid timestamp on line {line}: {error}"))?;
+        let eastern_time = datetime.to_timezone(NEW_YORK).time();
+        if eastern_time >= UNRELIABLE_DATA_START_TIME && eastern_time < UNRELIABLE_DATA_END_TIME {
+            continue;
+        }
+
+        // Attach line numbers to malformed values so input problems are actionable.
+        let value = record
+            .get(open_index)
+            .ok_or_else(|| format!("missing opening price on line {line}"))?;
+        let price: f32 = value
+            .parse()
+            .map_err(|error| format!("invalid opening price on line {line}: {error}"))?;
+        if !price.is_finite() || price <= 0.0_f32 {
+            return Err(format!("opening price on line {line} must be finite and positive").into());
+        }
+        if previous_timestamp.is_none_or(|previous| previous.checked_add(1) != Some(timestamp)) {
+            price_series.push(Vec::new());
+        }
+        price_series
+            .last_mut()
+            .ok_or("the price series must contain a current chunk")?
+            .push(price);
+        previous_timestamp = Some(timestamp);
+    }
+
+    Ok(price_series)
+}
+
+// Parse a strictly positive model dimension from the command line.
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    // Reject zero explicitly because empty tensor dimensions are not meaningful here.
+    let parsed = value.parse::<usize>().map_err(|error| error.to_string())?;
+    if parsed == 0 {
+        return Err("value must be greater than zero".to_string());
+    }
+
+    Ok(parsed)
+}
+
+// Parse a finite positive floating-point parameter from the command line.
+fn parse_positive_f64(value: &str) -> Result<f64, String> {
+    // Reject values that would make optimizer updates invalid or ineffective.
+    let parsed = value.parse::<f64>().map_err(|error| error.to_string())?;
+    if !parsed.is_finite() || parsed <= 0.0_f64 {
+        return Err("value must be finite and greater than zero".to_string());
+    }
+
+    Ok(parsed)
+}
+
+// Parse a finite dropout probability that leaves some activations enabled.
+fn parse_dropout(value: &str) -> Result<f64, String> {
+    // Permit disabled dropout while preventing Burn's scaling from dividing by zero.
+    let parsed = value.parse::<f64>().map_err(|error| error.to_string())?;
+    if !parsed.is_finite() || !(0.0_f64..1.0_f64).contains(&parsed) {
+        return Err("value must be finite, nonnegative, and less than one".to_string());
+    }
+
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -613,7 +602,7 @@ mod tests {
         assert_eq!(args.outputs, 60);
         assert_eq!(args.batch_size, 64);
         assert_eq!(args.epochs, 5);
-        assert!((args.learning_rate - 1e-3).abs() < f64::EPSILON);
+        assert!((args.learning_rate - 1e-3_f64).abs() < f64::EPSILON);
         assert!(args.dropout.abs() < f64::EPSILON);
         assert_eq!(args.seed, 42);
         assert_eq!(args.model_directory, PathBuf::from("model"));
@@ -640,12 +629,12 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(prices, vec![100.0, 101.5, 99.0]);
+        assert_eq!(prices, vec![100.0_f32, 101.5_f32, 99.0_f32]);
     }
 
     #[test]
     fn discard_unreliable_training_prices_across_eastern_time_offsets() {
-        // Filter the shared window and separate surrounding prices across Eastern offsets.
+        // Filter the shared window, split surrounding prices, and select the latest for inference.
         for start in [1_784_016_000_i64, 1_767_949_200_i64] {
             let contents = format!(
                 concat!(
@@ -663,8 +652,9 @@ mod tests {
 
             assert_eq!(
                 parse_training_prices(&contents).unwrap(),
-                vec![vec![99.0], vec![100.0]],
+                vec![vec![99.0_f32], vec![100.0_f32]],
             );
+            assert_eq!(parse_prices(&contents).unwrap(), vec![100.0_f32]);
         }
     }
 
@@ -683,7 +673,11 @@ mod tests {
 
         assert_eq!(
             prices,
-            vec![vec![100.0, 101.0], vec![102.0, 103.0], vec![104.0]],
+            vec![
+                vec![100.0_f32, 101.0_f32],
+                vec![102.0_f32, 103.0_f32],
+                vec![104.0_f32],
+            ],
         );
     }
 
@@ -715,7 +709,7 @@ mod tests {
             targets: vec![10_000.0_f32, 1.0_f32],
         }];
 
-        assert!((baseline_loss(&items, 0.0, 1.0) - 50_000_000.5_f64).abs() < f64::EPSILON);
+        assert!((baseline_loss(&items, 0.0_f32, 1.0_f32) - 50_000_000.5_f64).abs() < f64::EPSILON);
     }
 
     #[test]
