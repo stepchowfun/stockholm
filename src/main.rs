@@ -14,7 +14,7 @@ use env_logger::{Builder, fmt::style::Effects};
 use log::LevelFilter;
 use std::{env, error::Error, io::Write, str::FromStr};
 
-// This symbol is used when the user does not select an instrument.
+// These defaults select the instrument and operational log verbosity.
 const DEFAULT_SYMBOL: &str = "SOXL";
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Debug;
 

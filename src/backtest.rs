@@ -37,7 +37,7 @@ pub struct Args {
     #[arg(long, required = true, num_args = 1..)]
     data_paths: Vec<PathBuf>,
 
-    /// Starting cash used by market-maker and market-maker-grid.
+    /// Starting cash used by every strategy.
     #[arg(long, default_value_t = 1_000_000.0, value_parser = parse_positive_f64)]
     initial_cash: f64,
 
@@ -177,7 +177,7 @@ struct GridResult {
 
 // Backtest a trading strategy.
 pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
-    // Sort by filename so every strategy receives the data in chronological order.
+    // Sort by filename so every strategy receives data in one deterministic order.
     let mut data_paths = args.data_paths.iter().collect::<Vec<_>>();
     data_paths.sort();
 
@@ -673,7 +673,7 @@ fn print_config_fields(config: MarketMakerConfig) {
     println!("  Bet size: {}%", config.bet_size);
 }
 
-// Parse the low, high, and closing prices from every input file as one trading day.
+// Parse the timestamped bars needed to simulate each input file as one trading day.
 fn parse_days(files: &[(PathBuf, String)]) -> Result<Vec<Day>, Box<dyn Error>> {
     // Preserve sorted day and record order while validating each price.
     let mut days = Vec::with_capacity(files.len());
@@ -770,7 +770,7 @@ fn is_liquidating(timestamp: OffsetDateTime) -> bool {
     eastern_time >= LIQUIDATION_START_TIME && eastern_time < LIQUIDATION_END_TIME
 }
 
-// Locate one required CSV price column.
+// Locate one required CSV column.
 fn column_index(
     headers: &csv::StringRecord,
     path: &std::path::Path,

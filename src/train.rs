@@ -196,7 +196,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// Load opening prices while preserving every parsed segment as an independent series.
+// Load opening prices while preserving every contiguous segment as an independent series.
 fn load_series(paths: &[PathBuf]) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
     paths.iter().try_fold(Vec::new(), |mut series, path| {
         // Parse and append every independent segment produced by this file.
@@ -356,7 +356,7 @@ fn validation_loss<B: Backend>(
     total_loss / usize_to_f32(total_items)
 }
 
-// Parse finite positive opening prices without filtering a single inference window.
+// Parse the latest contiguous opening-price series without training-time filtering.
 pub fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
     let prices = parse_prices_internal(contents, false)?;
     Ok(prices
@@ -365,12 +365,12 @@ pub fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
         .ok_or("`parse_prices_internal` returned no data")?)
 }
 
-// Parse training prices after excluding delayed early-morning trade reports.
+// Parse contiguous training-price series after excluding delayed early-morning trade reports.
 fn parse_training_prices(contents: &str) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
     parse_prices_internal(contents, true)
 }
 
-// Parse opening prices with optional filtering based on each row's Eastern time.
+// Parse opening prices into contiguous series with optional Eastern-time filtering.
 fn parse_prices_internal(
     contents: &str,
     exclude_unreliable_data: bool,
@@ -465,7 +465,7 @@ fn parse_dropout(value: &str) -> Result<f64, String> {
     Ok(parsed)
 }
 
-// Convert raw prices into stationary relative changes.
+// Convert raw prices into successive logarithmic returns.
 pub fn log_returns(prices: &[f32]) -> Vec<f32> {
     prices
         .windows(2)
@@ -645,7 +645,7 @@ mod tests {
 
     #[test]
     fn discard_unreliable_training_prices_across_eastern_time_offsets() {
-        // Apply the shared inclusive start and exclusive end in daylight and standard time.
+        // Filter the shared window and separate surrounding prices across Eastern offsets.
         for start in [1_784_016_000_i64, 1_767_949_200_i64] {
             let contents = format!(
                 concat!(
@@ -689,7 +689,7 @@ mod tests {
 
     #[test]
     fn reject_nonpositive_prices() {
-        // Confirm logarithmic preprocessing rejects values outside its domain.
+        // Confirm price parsing rejects values outside the logarithmic return domain.
         let error = parse_prices("date,open\n1,100\n2,0\n").unwrap_err();
 
         assert!(error.to_string().contains("finite and positive"));
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn create_separate_training_and_validation_windows() {
-        // Confirm complete files contribute only to their selected dataset.
+        // Confirm raw price series contribute only to their selected dataset.
         let prices = (1_u16..=101).map(f32::from).collect::<Vec<_>>();
         let series = std::slice::from_ref(&prices);
         let data = prepare_data(series, series, 4, 2).unwrap();
