@@ -36,19 +36,6 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
         .map_err(|error| format!("failed to read {}: {error}", args.input_path.display()))?;
     let prices = parse_prices(&contents)
         .map_err(|error| format!("failed to parse {}: {error}", args.input_path.display()))?;
-    let expected_prices = config.inputs + 1;
-    if prices.len() != expected_prices {
-        return Err(format!(
-            concat!(
-                "inference input must contain exactly {} prices to produce {} returns, ",
-                "but found {}",
-            ),
-            expected_prices,
-            config.inputs,
-            prices.len(),
-        )
-        .into());
-    }
     let normalized = log_returns(&prices)
         .into_iter()
         .map(|value| (value - config.return_mean) / config.return_deviation)
