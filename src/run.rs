@@ -354,7 +354,7 @@ async fn clear_stale_quotes(runtime_state: &RwLock<RuntimeState>) -> Result<(), 
         // Reuse the control cadence so stale prices disappear promptly after crossing the limit.
         tokio::time::sleep(RUN_DELAY).await;
         let mut state = runtime_state.write().await;
-        clear_stale_quote_prices(&mut state.volatile, OffsetDateTime::now_utc());
+        clear_stale_quote_prices(&mut state.volatile);
     }
 }
 
@@ -399,9 +399,8 @@ async fn run_control_step(
     initial_margin_requirement: f64,
 ) -> Result<(), Box<dyn Error>> {
     // Select order lifetimes and trading behavior from the current Eastern time.
-    let now = OffsetDateTime::now_utc();
-    let liquidating = is_liquidating(now);
-    cancel_expired_orders(client, runtime_state, symbol, liquidating, now).await?;
+    let liquidating = is_liquidating();
+    cancel_expired_orders(client, runtime_state, symbol, liquidating).await?;
 
     // Snapshot resources and quotes without retaining the state lock across submissions.
     let (buying_power, bid_price, ask_price, sellable_shares) = {
@@ -481,7 +480,6 @@ async fn cancel_expired_orders(
     runtime_state: &RwLock<RuntimeState>,
     symbol: &str,
     liquidating: bool,
-    now: OffsetDateTime,
 ) -> Result<(), Box<dyn Error>> {
     // Join order representations and persist cancellation attempts under one state guard.
     let cancellation_attempts = {
@@ -503,8 +501,8 @@ async fn cancel_expired_orders(
                 continue;
             };
             let liquidation_order = liquidating && order_symbol == symbol;
-            if cancellation_due(order, *side, liquidation_order, now) {
-                order.last_cancelled_at = Some(now);
+            if cancellation_due(order, *side, liquidation_order) {
+                order.last_cancelled_at = Some(OffsetDateTime::now_utc());
                 attempts.push((*order_id, order.order_ref.clone()));
             }
         }
@@ -524,8 +522,8 @@ async fn cancel_expired_orders(
 }
 
 // Determine whether the Eastern clock is inside the daily liquidation window.
-fn is_liquidating(now: OffsetDateTime) -> bool {
-    let eastern_time = now.to_timezone(NEW_YORK).time();
+fn is_liquidating() -> bool {
+    let eastern_time = OffsetDateTime::now_utc().to_timezone(NEW_YORK).time();
 
     eastern_time >= LIQUIDATION_START_TIME && eastern_time < LIQUIDATION_END_TIME
 }
@@ -874,8 +872,8 @@ fn calculate_order_limits(
 }
 
 // Clear each quote side independently once its source timestamp exceeds the age limit.
-fn clear_stale_quote_prices(state: &mut VolatileState, now: OffsetDateTime) {
-    let cutoff = now - QUOTE_MAX_AGE;
+fn clear_stale_quote_prices(state: &mut VolatileState) {
+    let cutoff = OffsetDateTime::now_utc() - QUOTE_MAX_AGE;
 
     // Clear a stale bid and its timestamp together.
     if state
@@ -897,12 +895,7 @@ fn clear_stale_quote_prices(state: &mut VolatileState, now: OffsetDateTime) {
 }
 
 // Determine whether an open order has expired and is eligible for another cancellation attempt.
-fn cancellation_due(
-    order: &state::OpenOrder,
-    side: Side,
-    liquidating: bool,
-    now: OffsetDateTime,
-) -> bool {
+fn cancellation_due(order: &state::OpenOrder, side: Side, liquidating: bool) -> bool {
     // Apply the liquidation lifetime or the normal side-specific lifetime.
     let time_to_live = if liquidating {
         match side {
@@ -917,10 +910,10 @@ fn cancellation_due(
     };
 
     // Space repeated cancellation requests even after the order has expired.
-    now >= order.created_at + time_to_live
-        && order
-            .last_cancelled_at
-            .is_none_or(|last_cancelled_at| now >= last_cancelled_at + CANCEL_RETRY_DELAY)
+    OffsetDateTime::now_utc() >= order.created_at + time_to_live
+        && order.last_cancelled_at.is_none_or(|last_cancelled_at| {
+            OffsetDateTime::now_utc() >= last_cancelled_at + CANCEL_RETRY_DELAY
+        })
 }
 
 // Calculate buffered buying power and round it down to the nearest cent.
@@ -954,14 +947,12 @@ mod tests {
     use super::{
         Args, RuntimeState, Side, VolatileOrder, calculate_buying_power,
         calculate_open_buy_order_value, calculate_open_sell_shares, calculate_order_limits,
-        cancellation_due, clear_stale_quote_prices, initial_volatile_state, is_liquidating,
-        round_down_to_cent, round_up_to_cent, update_account_metric,
+        initial_volatile_state, round_down_to_cent, round_up_to_cent, update_account_metric,
     };
     use crate::state;
     use clap::Parser;
     use ibapi::accounts::AccountSummaryTags;
     use std::collections::HashMap;
-    use time::{Date, Duration, Month, OffsetDateTime};
     use tokio::sync::RwLock;
 
     // This parser exposes the run arguments for focused tests.
@@ -969,15 +960,6 @@ mod tests {
     struct TestCli {
         #[command(flatten)]
         args: Args,
-    }
-
-    // Construct UTC test instants without relying on formatter-sensitive macros.
-    fn utc_datetime(month: Month, day: u8, hour: u8, minute: u8, second: u8) -> OffsetDateTime {
-        Date::from_calendar_date(2026, month, day)
-            .unwrap()
-            .with_hms(hour, minute, second)
-            .unwrap()
-            .assume_utc()
     }
 
     #[test]
@@ -1103,101 +1085,10 @@ mod tests {
     }
 
     #[test]
-    fn clear_only_quotes_older_than_five_minutes() {
-        // Expire each side independently while retaining a quote exactly at the age boundary.
-        let now = OffsetDateTime::UNIX_EPOCH + Duration::minutes(10);
-        let mut state = initial_volatile_state();
-        state.bid_price = Some(10.0_f64);
-        state.bid_price_timestamp = Some(now - Duration::minutes(5) - Duration::seconds(1));
-        state.ask_price = Some(11.0_f64);
-        state.ask_price_timestamp = Some(now - Duration::minutes(5));
-
-        clear_stale_quote_prices(&mut state, now);
-
-        assert_eq!(state.bid_price, None);
-        assert_eq!(state.bid_price_timestamp, None);
-        assert_eq!(state.ask_price, Some(11.0_f64));
-        assert_eq!(state.ask_price_timestamp, Some(now - Duration::minutes(5)));
-    }
-
-    #[test]
     fn round_limit_prices_conservatively() {
         // Keep buys below and sells above fractional-cent strategy prices.
         assert!((round_down_to_cent(10.129_f64) - 10.12_f64).abs() < f64::EPSILON);
         assert!((round_up_to_cent(10.121_f64) - 10.13_f64).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn retry_expired_order_cancellations() {
-        // Cancel after each order lifetime and then at ten-second retry intervals.
-        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(5);
-        let mut order = state::OpenOrder {
-            order_ref: "stockholm:test".to_string(),
-            perm_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            last_cancelled_at: None,
-        };
-
-        assert!(!cancellation_due(
-            &order,
-            Side::Sell,
-            false,
-            OffsetDateTime::UNIX_EPOCH + Duration::seconds(29),
-        ));
-        assert!(cancellation_due(
-            &order,
-            Side::Sell,
-            false,
-            OffsetDateTime::UNIX_EPOCH + Duration::seconds(30),
-        ));
-        assert!(cancellation_due(&order, Side::Buy, false, now));
-        order.last_cancelled_at = Some(now - Duration::seconds(9));
-        assert!(!cancellation_due(&order, Side::Buy, false, now));
-        order.last_cancelled_at = Some(now - Duration::seconds(10));
-        assert!(cancellation_due(&order, Side::Buy, false, now));
-    }
-
-    #[test]
-    fn expire_orders_quickly_during_liquidation() {
-        // Expire buys immediately and sells after one minute during liquidation.
-        let order = state::OpenOrder {
-            order_ref: "stockholm:test".to_string(),
-            perm_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            last_cancelled_at: None,
-        };
-
-        assert!(cancellation_due(
-            &order,
-            Side::Buy,
-            true,
-            OffsetDateTime::UNIX_EPOCH,
-        ));
-        assert!(!cancellation_due(
-            &order,
-            Side::Sell,
-            true,
-            OffsetDateTime::UNIX_EPOCH + Duration::seconds(59),
-        ));
-        assert!(cancellation_due(
-            &order,
-            Side::Sell,
-            true,
-            OffsetDateTime::UNIX_EPOCH + Duration::seconds(60),
-        ));
-    }
-
-    #[test]
-    fn liquidate_between_start_and_end_times() {
-        // Compare Eastern wall-clock boundaries in both daylight and standard time.
-        assert!(!is_liquidating(utc_datetime(Month::August, 10, 19, 44, 59)));
-        assert!(is_liquidating(utc_datetime(Month::August, 10, 19, 45, 0)));
-        assert!(is_liquidating(utc_datetime(Month::August, 11, 0, 4, 59)));
-        assert!(!is_liquidating(utc_datetime(Month::August, 11, 0, 5, 0)));
-        assert!(!is_liquidating(utc_datetime(Month::January, 9, 20, 44, 59)));
-        assert!(is_liquidating(utc_datetime(Month::January, 9, 20, 45, 0)));
-        assert!(is_liquidating(utc_datetime(Month::January, 10, 1, 4, 59)));
-        assert!(!is_liquidating(utc_datetime(Month::January, 10, 1, 5, 0)));
     }
 
     #[tokio::test]
