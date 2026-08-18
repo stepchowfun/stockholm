@@ -424,6 +424,7 @@ async fn run_control_step(
         let sellable_shares = state
             .position_shares
             .map(|shares| (shares - reserved_sell_shares).max(0.0_f64).floor());
+        let open_orders = format_open_orders(&state.open_orders);
         info!(
             concat!(
                 "Equity: {}; buying power: {}; open orders: {}; ",
@@ -433,7 +434,7 @@ async fn run_control_step(
                 .equity_with_loan_value
                 .map_or_else(|| "unavailable".to_string(), |equity| equity.to_string()),
             buying_power.map_or_else(|| "unavailable".to_string(), |power| power.to_string()),
-            state.open_orders.len(),
+            open_orders,
             state
                 .bid_price
                 .map_or_else(|| "unavailable".to_string(), |price| price.to_string()),
@@ -472,6 +473,31 @@ async fn run_control_step(
     }
 
     Ok(())
+}
+
+// Format open orders consistently for the control-loop status log.
+fn format_open_orders(open_orders: &HashMap<i32, VolatileOrder>) -> String {
+    // Sort by broker order ID so repeated status lines remain easy to compare.
+    let mut open_orders = open_orders.iter().collect::<Vec<_>>();
+    open_orders.sort_unstable_by_key(|(order_id, _)| *order_id);
+
+    // Include the execution progress needed to understand reserved cash and shares.
+    let open_orders = open_orders
+        .into_iter()
+        .map(|(_, order)| {
+            let side = match order.side {
+                Side::Buy => "buy",
+                Side::Sell => "sell",
+            };
+            format!(
+                "{} @ ${:.2} ({side}, {} filled, {} remaining)",
+                order.symbol, order.price, order.filled_shares, order.remaining_shares,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!("[{open_orders}]")
 }
 
 // Cancel expired orders whose most recent cancellation attempt is old enough to retry.
