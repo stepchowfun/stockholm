@@ -490,7 +490,7 @@ fn format_open_orders(open_orders: &HashMap<i32, VolatileOrder>) -> String {
                 Side::Sell => "sell",
             };
             format!(
-                "{} @ ${:.2} ({side}, {} filled, {} remaining)",
+                "{side} {} @ ${:.2} ({} filled, {} remaining)",
                 order.symbol,
                 order.price,
                 order.filled_shares,
