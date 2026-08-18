@@ -491,7 +491,10 @@ fn format_open_orders(open_orders: &HashMap<i32, VolatileOrder>) -> String {
             };
             format!(
                 "{} @ ${:.2} ({side}, {} filled, {} remaining)",
-                order.symbol, order.price, order.filled_shares, order.remaining_shares,
+                order.symbol,
+                order.price,
+                order.filled_shares,
+                order.remaining_shares,
             )
         })
         .collect::<Vec<_>>()
