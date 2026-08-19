@@ -66,7 +66,7 @@ pub struct Args {
     learning_rate: f64,
 
     /// Probability of dropping each hidden activation during training.
-    #[arg(long, default_value_t = 0.0_f64, value_parser = parse_dropout)]
+    #[arg(long, default_value_t = 0.2_f64, value_parser = parse_dropout)]
     dropout: f64,
 
     /// Seed used for model initialization and training-data shuffling.
@@ -687,7 +687,7 @@ mod tests {
         assert_eq!(args.batch_size, 512);
         assert_eq!(args.epochs, 5);
         assert!((args.learning_rate - 1e-3_f64).abs() < f64::EPSILON);
-        assert!(args.dropout.abs() < f64::EPSILON);
+        assert!((args.dropout - 0.2_f64).abs() < f64::EPSILON);
         assert_eq!(args.seed, 42);
         assert_eq!(args.model_directory, PathBuf::from("model"));
     }
