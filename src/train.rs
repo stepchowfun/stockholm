@@ -452,10 +452,16 @@ fn windows(
             let future_prices = &window[inputs + 1..];
             let target = future_prices
                 .iter()
-                .any(|future_price| *future_price > upper_target)
-                && future_prices
-                    .iter()
-                    .all(|future_price| *future_price >= lower_limit);
+                .find_map(|future_price| {
+                    if *future_price > upper_target {
+                        Some(true)
+                    } else if *future_price < lower_limit {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(false);
 
             // Normalize only the returns presented to the model, leaving the price label exact.
             let inputs = log_returns(&window[..=inputs])
@@ -787,15 +793,17 @@ mod tests {
 
     #[test]
     fn label_future_price_crossings() {
-        // Require a strict 0.5% gain without a strict 0.4% loss during the future window.
+        // Require the strict 0.5% gain to occur before any strict 0.4% loss.
         let crossing = windows(&[90.0_f32, 95.0, 100.0, 99.6, 100.6], 2, 2, 0.0, 1.0);
         let no_gain = windows(&[90.0_f32, 95.0, 100.0, 100.5, 100.5], 2, 2, 0.0, 1.0);
-        let excessive_loss = windows(&[90.0_f32, 95.0, 100.0, 99.5, 100.6], 2, 2, 0.0, 1.0);
+        let loss_before_gain = windows(&[90.0_f32, 95.0, 100.0, 99.5, 100.6], 2, 2, 0.0, 1.0);
+        let loss_after_gain = windows(&[90.0_f32, 95.0, 100.0, 100.6, 99.5], 2, 2, 0.0, 1.0);
 
         assert_eq!(crossing[0].inputs.len(), 2);
         assert!(crossing[0].target);
         assert!(!no_gain[0].target);
-        assert!(!excessive_loss[0].target);
+        assert!(!loss_before_gain[0].target);
+        assert!(loss_after_gain[0].target);
     }
 
     #[test]
