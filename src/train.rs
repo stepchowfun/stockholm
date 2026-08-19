@@ -8,7 +8,8 @@ use burn::{
     module::AutodiffModule,
     nn::{
         Dropout, DropoutConfig, Linear, LinearConfig, Relu,
-        loss::{MseLoss, Reduction::Mean},
+        loss::BinaryCrossEntropyLossConfig,
+        pool::{AvgPool1d, AvgPool1dConfig},
     },
     optim::{AdamConfig, GradientsParams, Optimizer},
     prelude::*,
@@ -20,9 +21,19 @@ use std::{error::Error, fs, marker::PhantomData, path::PathBuf, sync::Arc};
 use time::OffsetDateTime;
 use time_tz::{OffsetDateTimeExt, timezones::db::america::NEW_YORK};
 
-// Fix the forecasting horizon and the amount of history supplied to the model.
-const INPUTS: usize = 56;
-const OUTPUTS: usize = 64;
+// Fix the price history supplied to the model and the future crossing horizon.
+pub const INPUTS: usize = 256;
+const OUTPUTS: usize = 512;
+
+// Require a future price to exceed the last observed price by this relative amount.
+const TARGET_INCREASE: f32 = 0.005_f32;
+
+// Reject windows where a future price falls this far below the last observed price.
+const MAXIMUM_DECREASE: f32 = 0.004_f32;
+
+// Reduce adjacent returns to a compact representation before the learned layers.
+const POOL_SIZE: usize = 4;
+const POOLED_INPUTS: usize = INPUTS / POOL_SIZE;
 
 // These arguments configure a time-series training run.
 #[derive(ClapArgs)]
@@ -64,14 +75,14 @@ pub struct Args {
 #[derive(Clone, Debug)]
 struct SeriesItem {
     inputs: Vec<f32>,
-    targets: Vec<f32>,
+    target: bool,
 }
 
 // This batch stores the tensors consumed and predicted by the model.
 #[derive(Clone, Debug)]
 struct SeriesBatch<B: Backend> {
     inputs: Tensor<B, 2>,
-    targets: Tensor<B, 2>,
+    targets: Tensor<B, 2, Int>,
 }
 
 // This batcher converts in-memory windows to backend tensors.
@@ -99,10 +110,12 @@ impl<B: Backend> Batcher<B, SeriesItem, SeriesBatch<B>> for SeriesBatcher<B> {
             .collect();
         let inputs = Tensor::cat(inputs, 0);
 
-        // Convert every target window using the same layout as the inputs.
+        // Convert every crossing label into a single-column target tensor.
         let targets = items
             .iter()
-            .map(|item| Tensor::<B, 1>::from_floats(item.targets.as_slice(), device).unsqueeze())
+            .map(|item| {
+                Tensor::<B, 1, Int>::from_ints([i32::from(item.target)], device).unsqueeze()
+            })
             .collect();
         let targets = Tensor::cat(targets, 0);
 
@@ -110,9 +123,10 @@ impl<B: Backend> Batcher<B, SeriesItem, SeriesBatch<B>> for SeriesBatcher<B> {
     }
 }
 
-// This model predicts several future returns directly from a fixed input window.
+// This model predicts whether a future price will cross the target increase.
 #[derive(Module, Debug)]
 pub struct Model<B: Backend> {
+    downsampling: AvgPool1d,
     input: Linear<B>,
     output: Linear<B>,
     activation: Relu,
@@ -135,8 +149,9 @@ impl ModelConfig {
     // Initialize every model layer on the selected device.
     pub fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
         Model {
-            input: LinearConfig::new(INPUTS, 128).init(device),
-            output: LinearConfig::new(128, OUTPUTS).init(device),
+            downsampling: AvgPool1dConfig::new(POOL_SIZE).init(),
+            input: LinearConfig::new(POOLED_INPUTS, 128).init(device),
+            output: LinearConfig::new(128, 1).init(device),
             activation: Relu::new(),
             dropout: DropoutConfig::new(self.dropout).init(),
         }
@@ -144,9 +159,13 @@ impl ModelConfig {
 }
 
 impl<B: Backend> Model<B> {
-    // Apply the hidden transformation and output projection.
+    // Downsample adjacent returns before the hidden transformation and output projection.
     pub fn forward(&self, inputs: Tensor<B, 2>) -> Tensor<B, 2> {
-        let values = self.activation.forward(self.input.forward(inputs));
+        let values = self
+            .downsampling
+            .forward(inputs.unsqueeze_dim::<3>(1))
+            .squeeze_dim::<2>(1);
+        let values = self.activation.forward(self.input.forward(values));
         let values = self.dropout.forward(values);
         self.output.forward(values)
     }
@@ -233,24 +252,29 @@ fn train<B: AutodiffBackend>(
         data.validation.len(),
     );
 
-    // Establish the validation target by predicting no future price movement.
-    let baseline_loss = baseline_loss(&data.validation, data.mean, data.deviation);
+    // Establish the classification baseline from the validation label distribution.
+    let positive_count = data.validation.iter().filter(|item| item.target).count();
+    let positive_rate = usize_to_f32(positive_count) / usize_to_f32(data.validation.len());
+    let baseline_accuracy = positive_rate.max(1.0_f32 - positive_rate);
     println!(
-        "No-change baseline RMSE: {:.2} bps",
-        baseline_loss.sqrt() * f64::from(data.deviation) * 10_000.0_f64,
+        "Validation positive rate: {:.2}%, majority baseline accuracy: {:.2}%",
+        positive_rate * 100.0_f32,
+        baseline_accuracy * 100.0_f32,
     );
 
-    // Report the initialized model's error before applying any optimizer steps.
+    // Report the initialized model's classification quality before optimizer steps.
     let initial_model = model.valid();
-    let initial_training_loss = validation_loss(&initial_model, &training_evaluation_loader);
-    let initial_validation_loss = validation_loss(&initial_model, &validation_loader);
+    let initial_training = validation_metrics(&initial_model, &training_evaluation_loader);
+    let initial_validation = validation_metrics(&initial_model, &validation_loader);
     println!(
-        "Initial RMSE: train {:.2} bps, validation {:.2} bps",
-        initial_training_loss.sqrt() * data.deviation * 10_000.0_f32,
-        initial_validation_loss.sqrt() * data.deviation * 10_000.0_f32,
+        "Initial: train loss {:.4}, accuracy {:.2}%; validation loss {:.4}, accuracy {:.2}%",
+        initial_training.loss,
+        initial_training.accuracy() * 100.0_f32,
+        initial_validation.loss,
+        initial_validation.accuracy() * 100.0_f32,
     );
 
-    // Optimize mean-squared error and display validation progress each epoch.
+    // Optimize binary cross-entropy and display validation progress each epoch.
     for epoch in 1..=config.epochs {
         train_epoch(
             &mut model,
@@ -261,14 +285,21 @@ fn train<B: AutodiffBackend>(
 
         // Evaluate the fully updated model on both splits for comparable epoch metrics.
         let valid_model = model.valid();
-        let training_loss = validation_loss(&valid_model, &training_evaluation_loader);
-        let validation_loss = validation_loss(&valid_model, &validation_loader);
+        let training = validation_metrics(&valid_model, &training_evaluation_loader);
+        let validation = validation_metrics(&valid_model, &validation_loader);
         println!(
-            "Epoch {:>2}/{}: train RMSE {:.2} bps, validation RMSE {:.2} bps",
+            concat!(
+                "Epoch {:>2}/{}: train loss {:.4}, accuracy {:.2}%; ",
+                "validation loss {:.4}, accuracy {:.2}%, precision {:.2}%, recall {:.2}%",
+            ),
             epoch,
             config.epochs,
-            training_loss.sqrt() * data.deviation * 10_000.0_f32,
-            validation_loss.sqrt() * data.deviation * 10_000.0_f32,
+            training.loss,
+            training.accuracy() * 100.0_f32,
+            validation.loss,
+            validation.accuracy() * 100.0_f32,
+            validation.precision() * 100.0_f32,
+            validation.recall() * 100.0_f32,
         );
     }
 
@@ -296,7 +327,10 @@ fn train_epoch<B: AutodiffBackend, O>(
     // Apply one gradient update for every shuffled batch.
     for batch in loader.iter() {
         let predictions = model.forward(batch.inputs);
-        let loss = MseLoss::new().forward(predictions, batch.targets, Mean);
+        let loss = BinaryCrossEntropyLossConfig::new()
+            .with_logits(true)
+            .init(&model.devices()[0])
+            .forward(predictions, batch.targets);
 
         // Associate gradients with model parameters before applying Adam.
         let gradients = GradientsParams::from_grads(loss.backward(), model);
@@ -311,7 +345,7 @@ fn prepare_data(
     inputs: usize,
     outputs: usize,
 ) -> Result<PreparedData, Box<dyn Error>> {
-    // Convert each price series independently so returns never cross a timestamp gap.
+    // Convert each price series independently so normalization never crosses a timestamp gap.
     let training_series = training_prices
         .iter()
         .map(|prices| log_returns(prices))
@@ -355,20 +389,16 @@ fn prepare_data(
         return Err("training returns must have nonzero finite variance".into());
     }
 
-    // Normalize and window each series separately so no example crosses a timestamp gap.
+    // Normalize and label each price window separately so no example crosses a timestamp gap.
     let prepare = |series: &[Vec<f32>]| {
         let mut items = Vec::new();
-        for returns in series {
-            let normalized = returns
-                .iter()
-                .map(|value| (value - mean) / deviation)
-                .collect::<Vec<_>>();
-            items.extend(windows(&normalized, inputs, outputs));
+        for prices in series {
+            items.extend(windows(prices, inputs, outputs, mean, deviation));
         }
         items
     };
-    let training = prepare(&training_series);
-    let validation = prepare(&validation_series);
+    let training = prepare(training_prices);
+    let validation = prepare(validation_prices);
 
     Ok(PreparedData {
         training,
@@ -378,48 +408,112 @@ fn prepare_data(
     })
 }
 
-// Create every overlapping direct multi-horizon example in chronological order.
-fn windows(values: &[f32], inputs: usize, outputs: usize) -> Vec<SeriesItem> {
-    values
-        .windows(inputs + outputs)
-        .map(|window| SeriesItem {
-            inputs: window[..inputs].to_vec(),
-            targets: window[inputs..].to_vec(),
+// Create chronological examples labeled by future crossings of the target price.
+fn windows(
+    prices: &[f32],
+    inputs: usize,
+    outputs: usize,
+    mean: f32,
+    deviation: f32,
+) -> Vec<SeriesItem> {
+    prices
+        .windows(inputs + outputs + 1)
+        .map(|window| {
+            // Calculate both barriers from the final price observed by the model.
+            let reference_price = window[inputs];
+            let upper_target = reference_price * (1.0_f32 + TARGET_INCREASE);
+            let lower_limit = reference_price * (1.0_f32 - MAXIMUM_DECREASE);
+            let future_prices = &window[inputs + 1..];
+            let target = future_prices
+                .iter()
+                .any(|future_price| *future_price > upper_target)
+                && future_prices
+                    .iter()
+                    .all(|future_price| *future_price >= lower_limit);
+
+            // Normalize only the returns presented to the model, leaving the price label exact.
+            let inputs = log_returns(&window[..=inputs])
+                .into_iter()
+                .map(|value| (value - mean) / deviation)
+                .collect();
+
+            SeriesItem { inputs, target }
         })
         .collect()
 }
 
-// Measure mean-squared error without constructing an autodiff graph.
-fn validation_loss<B: Backend>(
+// These metrics summarize binary predictions at the conventional 0.5 threshold.
+struct ClassificationMetrics {
+    loss: f32,
+    correct: usize,
+    total: usize,
+    true_positives: usize,
+    predicted_positives: usize,
+    actual_positives: usize,
+}
+
+impl ClassificationMetrics {
+    // Calculate the share of labels classified correctly.
+    fn accuracy(&self) -> f32 {
+        usize_to_f32(self.correct) / usize_to_f32(self.total)
+    }
+
+    // Calculate positive predictive value, defining an empty prediction set as zero.
+    fn precision(&self) -> f32 {
+        if self.predicted_positives == 0 {
+            return 0.0_f32;
+        }
+        usize_to_f32(self.true_positives) / usize_to_f32(self.predicted_positives)
+    }
+
+    // Calculate the share of actual positives detected, defining an empty class as zero.
+    fn recall(&self) -> f32 {
+        if self.actual_positives == 0 {
+            return 0.0_f32;
+        }
+        usize_to_f32(self.true_positives) / usize_to_f32(self.actual_positives)
+    }
+}
+
+// Measure binary loss and thresholded classification quality without autodiff.
+fn validation_metrics<B: Backend>(
     model: &Model<B>,
     loader: &Arc<dyn DataLoader<B, SeriesBatch<B>>>,
-) -> f32 {
-    // Accumulate sample-weighted loss across the ordered validation windows.
+) -> ClassificationMetrics {
+    // Accumulate sample-weighted loss and confusion counts across ordered windows.
     let mut total_loss = 0.0_f32;
-    let mut total_items = 0_usize;
+    let mut metrics = ClassificationMetrics {
+        loss: 0.0_f32,
+        correct: 0,
+        total: 0,
+        true_positives: 0,
+        predicted_positives: 0,
+        actual_positives: 0,
+    };
     for batch in loader.iter() {
         let item_count = batch.targets.dims()[0];
         let predictions = model.forward(batch.inputs);
-        let loss = MseLoss::new().forward(predictions, batch.targets, Mean);
+        let loss = BinaryCrossEntropyLossConfig::new()
+            .with_logits(true)
+            .init(&model.devices()[0])
+            .forward(predictions.clone(), batch.targets.clone());
         total_loss += loss.into_scalar().elem::<f32>() * usize_to_f32(item_count);
-        total_items += item_count;
+        let logits = predictions.into_data().to_vec::<f32>().unwrap();
+        let targets = batch.targets.into_data().to_vec::<i64>().unwrap();
+
+        // Count classifications directly so the reporting logic remains easy to inspect.
+        for (logit, target) in logits.into_iter().zip(targets) {
+            let prediction = i64::from(logit >= 0.0_f32);
+            metrics.correct += usize::from(prediction == target);
+            metrics.true_positives += usize::from(prediction == 1_i64 && target == 1_i64);
+            metrics.predicted_positives += usize::from(prediction == 1_i64);
+            metrics.actual_positives += usize::from(target == 1_i64);
+            metrics.total += 1;
+        }
     }
 
-    total_loss / usize_to_f32(total_items)
-}
-
-// Measure the normalized error from predicting zero return at every horizon.
-fn baseline_loss(items: &[SeriesItem], mean: f32, deviation: f32) -> f64 {
-    // Accumulate normalized errors in double precision across the large target set.
-    let prediction = -f64::from(mean) / f64::from(deviation);
-    let (squared_error, target_count) = items.iter().flat_map(|item| item.targets.iter()).fold(
-        (0.0_f64, 0.0_f64),
-        |(squared_error, count), target| {
-            let error = f64::from(*target) - prediction;
-            (squared_error + error.powi(2), count + 1.0_f64)
-        },
-    );
-    squared_error / target_count
+    metrics.loss = total_loss / usize_to_f32(metrics.total);
+    metrics
 }
 
 // Convert raw prices into successive logarithmic returns.
@@ -536,9 +630,7 @@ fn parse_dropout(value: &str) -> Result<f64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        SeriesItem, baseline_loss, parse_dropout, parse_prices, parse_training_prices, prepare_data,
-    };
+    use super::{parse_dropout, parse_prices, parse_training_prices, prepare_data, windows};
     use crate::{Cli, Subcommand};
     use clap::Parser;
     use std::path::PathBuf;
@@ -663,18 +755,20 @@ mod tests {
 
         assert_eq!(data.training.len(), 95);
         assert_eq!(data.validation.len(), 95);
-        assert!(baseline_loss(&data.validation, data.mean, data.deviation).is_finite());
+        assert!(data.training.iter().all(|item| item.target));
     }
 
     #[test]
-    fn calculate_baseline_loss_in_double_precision() {
-        // Preserve errors too small to affect a much larger term in single precision.
-        let items = [SeriesItem {
-            inputs: Vec::new(),
-            targets: vec![10_000.0_f32, 1.0_f32],
-        }];
+    fn label_future_price_crossings() {
+        // Require a strict 0.5% gain without a strict 0.4% loss during the future window.
+        let crossing = windows(&[90.0_f32, 95.0, 100.0, 99.6, 100.6], 2, 2, 0.0, 1.0);
+        let no_gain = windows(&[90.0_f32, 95.0, 100.0, 100.5, 100.5], 2, 2, 0.0, 1.0);
+        let excessive_loss = windows(&[90.0_f32, 95.0, 100.0, 99.5, 100.6], 2, 2, 0.0, 1.0);
 
-        assert!((baseline_loss(&items, 0.0_f32, 1.0_f32) - 50_000_000.5_f64).abs() < f64::EPSILON);
+        assert_eq!(crossing[0].inputs.len(), 2);
+        assert!(crossing[0].target);
+        assert!(!no_gain[0].target);
+        assert!(!excessive_loss[0].target);
     }
 
     #[test]

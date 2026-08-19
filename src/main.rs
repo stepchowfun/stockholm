@@ -84,7 +84,7 @@ enum Subcommand {
     #[command(about = "Fetch historical market data as CSV")]
     Historical(historical::Args),
 
-    #[command(about = "Run one inference with a trained neural network")]
+    #[command(about = "Run inference with a trained neural network")]
     Infer(infer::Args),
 
     #[command(about = "Train a neural network on historical stock data")]

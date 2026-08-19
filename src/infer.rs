@@ -1,4 +1,4 @@
-use crate::train::{ModelConfig, log_returns, parse_prices};
+use crate::train::{INPUTS, ModelConfig, log_returns, parse_prices};
 use burn::{
     backend::{NdArray, ndarray::NdArrayDevice},
     module::Module,
@@ -6,21 +6,28 @@ use burn::{
     record::CompactRecorder,
 };
 use clap::Args as ClapArgs;
-use std::{error::Error, fs, io, path::PathBuf};
+use std::{error::Error, fs, path::PathBuf};
 
-// These arguments configure a single model inference.
+// Bound memory use while evaluating every overlapping input window.
+const BATCH_SIZE: usize = 1_024;
+
+// These arguments configure inference over a historical price series.
 #[derive(ClapArgs)]
 pub struct Args {
     /// Directory containing the trained model and its configuration.
     #[arg(long, default_value = "model")]
     model_directory: PathBuf,
 
-    /// CSV file whose latest contiguous series contains exactly one input window.
-    #[arg(long, default_value = "data/inference-sample.csv")]
+    /// CSV file whose latest contiguous series contains at least one input window.
+    #[arg(long, default_value = "data/validation/SOXL-2026-07-22.csv")]
     input_path: PathBuf,
+
+    /// CSV file where timestamped prediction probabilities will be saved.
+    #[arg(long, default_value = "data/inference/inference-output.csv")]
+    output_path: PathBuf,
 }
 
-// Load a trained model and print one forecast as CSV.
+// Load a trained model and save a prediction for every complete input window.
 pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     // Load the architecture and normalization values saved by the train subcommand.
     let config = ModelConfig::load(args.model_directory.join("model.json"))?;
@@ -31,91 +38,131 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
         return Err("model configuration contains invalid normalization values".into());
     }
 
-    // Parse the latest raw price series and transform it exactly like a training window.
+    // Parse the latest reliable price series and align its ending timestamps.
     let contents = fs::read_to_string(&args.input_path)
         .map_err(|error| format!("failed to read {}: {error}", args.input_path.display()))?;
     let prices = parse_prices(&contents)
         .map_err(|error| format!("failed to parse {}: {error}", args.input_path.display()))?;
-    let normalized = log_returns(&prices)
-        .into_iter()
-        .map(|value| (value - config.return_mean) / config.return_deviation)
-        .collect::<Vec<_>>();
+    if prices.len() <= INPUTS {
+        return Err(format!("inference requires at least {} prices", INPUTS + 1).into());
+    }
+    let timestamps = parse_timestamps(&contents)
+        .map_err(|error| format!("failed to parse {}: {error}", args.input_path.display()))?;
+    let timestamp_start = timestamps
+        .len()
+        .checked_sub(prices.len())
+        .ok_or("price series contains more values than the timestamp column")?;
+    let timestamps = &timestamps[timestamp_start..];
 
-    // Restore the trained parameters and evaluate the single normalized input window.
+    // Restore the trained parameters and prepare the output destination.
     let device = NdArrayDevice::Cpu;
     let model = config.init::<NdArray>(&device).load_file(
         args.model_directory.join("model"),
         &CompactRecorder::new(),
         &device,
     )?;
-    let inputs = Tensor::<NdArray, 1>::from_floats(normalized.as_slice(), &device).unsqueeze();
-    let normalized_predictions = model.forward(inputs).into_data().to_vec::<f32>()?;
-    let predicted_returns = normalized_predictions
-        .into_iter()
-        .map(|value| value * config.return_deviation + config.return_mean);
-    let predicted_prices = forecast_prices(*prices.last().unwrap(), predicted_returns);
+    if let Some(parent) = args.output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let mut writer = csv::Writer::from_path(&args.output_path)?;
+    writer.write_record(["timestamp", "probability"])?;
 
-    // Emit the predicted opening prices without mixing diagnostics into standard output.
-    write_predictions(io::stdout().lock(), &predicted_prices)?;
+    // Normalize and evaluate overlapping windows in bounded batches.
+    let window_count = prices.len() - INPUTS;
+    for batch_start in (0..window_count).step_by(BATCH_SIZE) {
+        let batch_end = (batch_start + BATCH_SIZE).min(window_count);
+        let mut normalized = Vec::with_capacity((batch_end - batch_start) * INPUTS);
+        for index in batch_start..batch_end {
+            normalized.extend(
+                log_returns(&prices[index..=index + INPUTS])
+                    .into_iter()
+                    .map(|value| (value - config.return_mean) / config.return_deviation),
+            );
+        }
+
+        // Pair each model probability with the timestamp ending its input window.
+        let inputs = Tensor::<NdArray, 1>::from_floats(normalized.as_slice(), &device)
+            .reshape([batch_end - batch_start, INPUTS]);
+        let logits = model.forward(inputs).into_data().to_vec::<f32>()?;
+        for (offset, logit) in logits.into_iter().enumerate() {
+            let timestamp = timestamps[batch_start + offset + INPUTS];
+            writer.write_record([timestamp.to_string(), sigmoid(logit).to_string()])?;
+        }
+    }
+    writer.flush()?;
+
+    // Report the generated artifact without mixing it into the CSV itself.
+    println!("Saved predictions to {}.", args.output_path.display());
 
     Ok(())
 }
 
-// Convert predicted log returns into successive opening-price forecasts.
-fn forecast_prices(
-    initial_price: f32,
-    predicted_returns: impl IntoIterator<Item = f32>,
-) -> Vec<f32> {
-    // Apply each return to the preceding observed or predicted price.
-    let mut price = initial_price;
-    predicted_returns
-        .into_iter()
-        .map(|predicted_return| {
-            price *= predicted_return.exp();
-            price
+// Parse source timestamps so predictions can retain their input-window endpoints.
+fn parse_timestamps(contents: &str) -> Result<Vec<i64>, Box<dyn Error>> {
+    // Locate the timestamp column by name to remain independent of CSV column order.
+    let mut reader = csv::Reader::from_reader(contents.as_bytes());
+    let timestamp_index = reader
+        .headers()?
+        .iter()
+        .position(|header| header == "date")
+        .ok_or("the CSV file must contain a date column")?;
+
+    // Retain every timestamp because the latest price series is an aligned CSV suffix.
+    reader
+        .records()
+        .enumerate()
+        .map(|(index, record)| {
+            let line = index + 2;
+            record?
+                .get(timestamp_index)
+                .ok_or_else(|| format!("missing timestamp on line {line}"))?
+                .parse::<i64>()
+                .map_err(|error| format!("invalid timestamp on line {line}: {error}").into())
         })
         .collect()
 }
 
-// Serialize predicted prices as a one-column CSV stream.
-fn write_predictions(writer: impl io::Write, prices: &[f32]) -> Result<(), Box<dyn Error>> {
-    // Write a header and one chronological forecast per record.
-    let mut writer = csv::Writer::from_writer(writer);
-    writer.write_record(["open"])?;
-    for price in prices {
-        writer.write_record([price.to_string()])?;
+// Convert one raw model logit into a probability without overflowing the exponential.
+fn sigmoid(logit: f32) -> f32 {
+    if logit >= 0.0_f32 {
+        1.0_f32 / (1.0_f32 + (-logit).exp())
+    } else {
+        let exponential = logit.exp();
+        exponential / (1.0_f32 + exponential)
     }
-    writer.flush()?;
-
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{forecast_prices, write_predictions};
+    use super::sigmoid;
     use crate::{Cli, Subcommand};
     use clap::Parser;
     use std::path::PathBuf;
 
     #[test]
     fn parse_infer_subcommand() {
-        // Confirm inference supplies the conventional artifact and input paths by default.
+        // Confirm inference supplies conventional model, input, and output paths by default.
         let cli = Cli::try_parse_from(["stockholm", "infer"]).unwrap();
 
         let Some(Subcommand::Infer(args)) = cli.command else {
             panic!("expected infer subcommand");
         };
         assert_eq!(args.model_directory, PathBuf::from("model"));
-        assert_eq!(args.input_path, PathBuf::from("data/inference-sample.csv"));
+        assert_eq!(
+            args.input_path,
+            PathBuf::from("data/validation/SOXL-2026-07-22.csv"),
+        );
+        assert_eq!(
+            args.output_path,
+            PathBuf::from("data/inference/inference-output.csv"),
+        );
     }
 
     #[test]
-    fn reconstruct_and_write_predictions() {
-        // Confirm predicted log returns become chronological price records.
-        let prices = forecast_prices(100.0, [0.0, 2.0_f32.ln()]);
-        let mut output = Vec::new();
-        write_predictions(&mut output, &prices).unwrap();
-
-        assert_eq!(String::from_utf8(output).unwrap(), "open\n100\n200\n");
+    fn convert_neutral_logit() {
+        // Confirm a neutral logit has an even predicted probability.
+        assert!((sigmoid(0.0_f32) - 0.5_f32).abs() < f32::EPSILON);
     }
 }
