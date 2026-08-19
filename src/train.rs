@@ -7,7 +7,8 @@ use burn::{
     },
     module::AutodiffModule,
     nn::{
-        Dropout, DropoutConfig, Linear, LinearConfig, Relu,
+        Dropout, DropoutConfig, Linear, LinearConfig, PaddingConfig1d, Relu,
+        conv::{Conv1d, Conv1dConfig},
         loss::BinaryCrossEntropyLossConfig,
         pool::{AvgPool1d, AvgPool1dConfig},
     },
@@ -33,7 +34,13 @@ const MAXIMUM_DECREASE: f32 = 0.004_f32;
 
 // Reduce adjacent returns to a compact representation before the learned layers.
 const POOL_SIZE: usize = 4;
-const POOLED_INPUTS: usize = INPUTS / POOL_SIZE;
+
+// Configure the temporal convolutions and flattened pooled representation.
+const KERNEL_SIZE: usize = 5;
+const FIRST_CHANNELS: usize = 16;
+const SECOND_CHANNELS: usize = 32;
+const POOLED_LENGTH: usize = INPUTS / POOL_SIZE;
+const LINEAR_INPUTS: usize = SECOND_CHANNELS * POOLED_LENGTH;
 
 // These arguments configure a time-series training run.
 #[derive(ClapArgs)]
@@ -126,11 +133,16 @@ impl<B: Backend> Batcher<B, SeriesItem, SeriesBatch<B>> for SeriesBatcher<B> {
 // This model predicts whether a future price will cross the target increase.
 #[derive(Module, Debug)]
 pub struct Model<B: Backend> {
-    downsampling: AvgPool1d,
-    input: Linear<B>,
-    output: Linear<B>,
-    activation: Relu,
-    dropout: Dropout,
+    first_convolution: Conv1d<B>,
+    first_dropout: Dropout,
+    second_convolution: Conv1d<B>,
+    second_dropout: Dropout,
+    first_activation: Relu,
+    pooling: AvgPool1d,
+    first_linear: Linear<B>,
+    third_dropout: Dropout,
+    second_activation: Relu,
+    second_linear: Linear<B>,
 }
 
 // This configuration records the model, training, and preprocessing settings.
@@ -149,25 +161,39 @@ impl ModelConfig {
     // Initialize every model layer on the selected device.
     pub fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
         Model {
-            downsampling: AvgPool1dConfig::new(POOL_SIZE).init(),
-            input: LinearConfig::new(POOLED_INPUTS, 128).init(device),
-            output: LinearConfig::new(128, 1).init(device),
-            activation: Relu::new(),
-            dropout: DropoutConfig::new(self.dropout).init(),
+            first_convolution: Conv1dConfig::new(1, FIRST_CHANNELS, KERNEL_SIZE)
+                .with_padding(PaddingConfig1d::Same)
+                .init(device),
+            first_dropout: DropoutConfig::new(self.dropout).init(),
+            second_convolution: Conv1dConfig::new(FIRST_CHANNELS, SECOND_CHANNELS, KERNEL_SIZE)
+                .with_padding(PaddingConfig1d::Same)
+                .init(device),
+            second_dropout: DropoutConfig::new(self.dropout).init(),
+            first_activation: Relu::new(),
+            pooling: AvgPool1dConfig::new(POOL_SIZE).init(),
+            first_linear: LinearConfig::new(LINEAR_INPUTS, 128).init(device),
+            third_dropout: DropoutConfig::new(self.dropout).init(),
+            second_activation: Relu::new(),
+            second_linear: LinearConfig::new(128, 1).init(device),
         }
     }
 }
 
 impl<B: Backend> Model<B> {
-    // Downsample adjacent returns before the hidden transformation and output projection.
+    // Extract and downsample temporal features before producing the output logit.
     pub fn forward(&self, inputs: Tensor<B, 2>) -> Tensor<B, 2> {
         let values = self
-            .downsampling
-            .forward(inputs.unsqueeze_dim::<3>(1))
-            .squeeze_dim::<2>(1);
-        let values = self.activation.forward(self.input.forward(values));
-        let values = self.dropout.forward(values);
-        self.output.forward(values)
+            .first_dropout
+            .forward(self.first_convolution.forward(inputs.unsqueeze_dim::<3>(1)));
+        let values = self
+            .second_dropout
+            .forward(self.second_convolution.forward(values));
+        let values = self.first_activation.forward(values);
+        let values = self.pooling.forward(values).flatten(1_usize, 2_usize);
+        let values = self.first_linear.forward(values);
+        let values = self.third_dropout.forward(values);
+        let values = self.second_activation.forward(values);
+        self.second_linear.forward(values)
     }
 }
 
