@@ -19,7 +19,15 @@ use burn::{
 };
 use chrono::Local;
 use clap::Args as ClapArgs;
-use std::{error::Error, fs, marker::PhantomData, path::PathBuf, sync::Arc};
+use std::{
+    error::Error,
+    fs,
+    io::{self, Write},
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tempfile::{NamedTempFile, tempdir_in};
 use time::{OffsetDateTime, Time};
 use time_tz::{OffsetDateTimeExt, timezones::db::america::NEW_YORK};
 
@@ -318,10 +326,6 @@ fn train<B: AutodiffBackend>(
         initial_validation.accuracy() * 100.0_f32,
     );
 
-    // Save the static configuration before producing replaceable epoch checkpoints.
-    fs::create_dir_all(&args.model_directory)?;
-    config.save(args.model_directory.join("model.json"))?;
-
     // Optimize binary cross-entropy and display validation progress each epoch.
     for epoch in 1..=config.epochs {
         train_epoch(
@@ -357,15 +361,56 @@ fn train<B: AutodiffBackend>(
             "Saving model after epoch {epoch} to {}…",
             args.model_directory.display(),
         );
-        model
-            .clone()
-            .save_file(args.model_directory.join("model"), &CompactRecorder::new())?;
+        save_checkpoint(model.clone(), &config, &args.model_directory)?;
         let saved_at = Local::now().to_rfc3339();
         println!(
             "Saved model after epoch {epoch} to {} at {saved_at}.",
             args.model_directory.display(),
         );
     }
+
+    Ok(())
+}
+
+// Stage a complete checkpoint before atomically replacing its final files.
+fn save_checkpoint<B: Backend>(
+    model: Model<B>,
+    config: &ModelConfig,
+    directory: &Path,
+) -> Result<(), Box<dyn Error>> {
+    // Keep temporary and final files on the same filesystem so persistence stays atomic.
+    let parent = directory.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    fs::create_dir_all(directory)?;
+    let staging_directory = tempdir_in(parent)?;
+
+    // Finish serializing both artifacts before exposing either one to inference.
+    let staged_config = staging_directory.path().join("model.json");
+    let staged_model = staging_directory.path().join("model.mpk");
+    config.save(&staged_config)?;
+    model.save_file(
+        staging_directory.path().join("model"),
+        &CompactRecorder::new(),
+    )?;
+
+    // Replace the model last so an interruption during serialization preserves the prior model.
+    persist_file(&staged_config, &directory.join("model.json"))?;
+    persist_file(&staged_model, &directory.join("model.mpk"))?;
+
+    Ok(())
+}
+
+// Copy one staged artifact into a temporary file and atomically persist it at its destination.
+fn persist_file(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
+    // Follow the state-file persistence pattern while accommodating Burn-managed file names.
+    let parent = destination
+        .parent()
+        .ok_or("the checkpoint destination must have a parent directory")?;
+    let mut source = fs::File::open(source)?;
+    let mut temp_file = NamedTempFile::new_in(parent)?;
+    io::copy(&mut source, &mut temp_file)?;
+    temp_file.flush()?;
+    temp_file.persist(destination)?;
 
     Ok(())
 }
