@@ -17,6 +17,7 @@ use burn::{
     record::CompactRecorder,
     tensor::backend::AutodiffBackend,
 };
+use chrono::Local;
 use clap::Args as ClapArgs;
 use std::{error::Error, fs, marker::PhantomData, path::PathBuf, sync::Arc};
 use time::{OffsetDateTime, Time};
@@ -359,8 +360,9 @@ fn train<B: AutodiffBackend>(
         model
             .clone()
             .save_file(args.model_directory.join("model"), &CompactRecorder::new())?;
+        let saved_at = Local::now().to_rfc3339();
         println!(
-            "Saved model after epoch {epoch} to {}.",
+            "Saved model after epoch {epoch} to {} at {saved_at}.",
             args.model_directory.display(),
         );
     }
