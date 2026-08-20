@@ -74,7 +74,7 @@ pub struct Args {
     epochs: usize,
 
     /// Step size used by the Adam optimizer.
-    #[arg(long, default_value_t = 1e-3_f64, value_parser = parse_positive_f64)]
+    #[arg(long, default_value_t = 1e-4_f64, value_parser = parse_positive_f64)]
     learning_rate: f64,
 
     /// Probability of dropping each hidden activation during training.
@@ -731,7 +731,7 @@ mod tests {
         );
         assert_eq!(args.validation_paths, vec![PathBuf::from("wednesday.csv")]);
         assert_eq!(args.epochs, 5);
-        assert!((args.learning_rate - 1e-3_f64).abs() < f64::EPSILON);
+        assert!((args.learning_rate - 1e-4_f64).abs() < f64::EPSILON);
         assert!((args.dropout - 0.5_f64).abs() < f64::EPSILON);
         assert_eq!(args.seed, 42);
         assert_eq!(args.model_directory, PathBuf::from("model"));
