@@ -317,6 +317,10 @@ fn train<B: AutodiffBackend>(
         initial_validation.accuracy() * 100.0_f32,
     );
 
+    // Save the static configuration before producing replaceable epoch checkpoints.
+    fs::create_dir_all(&args.model_directory)?;
+    config.save(args.model_directory.join("model.json"))?;
+
     // Optimize binary cross-entropy and display validation progress each epoch.
     for epoch in 1..=config.epochs {
         train_epoch(
@@ -346,16 +350,20 @@ fn train<B: AutodiffBackend>(
             validation.recall() * 100.0_f32,
             validation.high_confidence_precision() * 100.0_f32,
         );
-    }
 
-    // Save the Burn parameters and their complete reconstruction configuration.
-    fs::create_dir_all(&args.model_directory)?;
-    model.save_file(args.model_directory.join("model"), &CompactRecorder::new())?;
-    config.save(args.model_directory.join("model.json"))?;
-    println!(
-        "Saved training artifacts to {}.",
-        args.model_directory.display(),
-    );
+        // Persist the latest completed epoch so interrupted runs retain usable parameters.
+        println!(
+            "Saving model after epoch {epoch} to {}…",
+            args.model_directory.display(),
+        );
+        model
+            .clone()
+            .save_file(args.model_directory.join("model"), &CompactRecorder::new())?;
+        println!(
+            "Saved model after epoch {epoch} to {}.",
+            args.model_directory.display(),
+        );
+    }
 
     Ok(())
 }
