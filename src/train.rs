@@ -267,7 +267,7 @@ fn train<B: AutodiffBackend>(
     data: &PreparedData,
 ) -> Result<(), Box<dyn Error>> {
     // Collect every reproducibility setting into the model's saved configuration.
-    let config = ModelConfig::new(
+    let mut config = ModelConfig::new(
         args.epochs,
         args.learning_rate,
         args.dropout,
@@ -326,8 +326,9 @@ fn train<B: AutodiffBackend>(
         initial_validation.accuracy() * 100.0_f32,
     );
 
-    // Optimize binary cross-entropy and display validation progress each epoch.
-    for epoch in 1..=config.epochs {
+    // Retain the requested duration while the saved configuration tracks completed work.
+    let requested_epochs = config.epochs;
+    for epoch in 1..=requested_epochs {
         train_epoch(
             &mut model,
             &mut optimizer,
@@ -346,7 +347,7 @@ fn train<B: AutodiffBackend>(
                 "precision@0.8 {:.2}%",
             ),
             epoch,
-            config.epochs,
+            requested_epochs,
             training.loss,
             training.accuracy() * 100.0_f32,
             validation.loss,
@@ -357,6 +358,7 @@ fn train<B: AutodiffBackend>(
         );
 
         // Persist the latest completed epoch so interrupted runs retain usable parameters.
+        config.epochs = epoch;
         println!(
             "Saving model after epoch {epoch} to {}…",
             args.model_directory.display(),
