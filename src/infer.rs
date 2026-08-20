@@ -1,6 +1,6 @@
 use crate::train::{BATCH_SIZE, INPUTS, ModelConfig, log_returns, parse_price_series};
 use burn::{
-    backend::{NdArray, ndarray::NdArrayDevice},
+    backend::{Flex, flex::FlexDevice},
     module::Module,
     prelude::*,
     record::CompactRecorder,
@@ -49,8 +49,8 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     }
 
     // Restore the trained parameters and prepare the output destination.
-    let device = NdArrayDevice::Cpu;
-    let model = config.init::<NdArray>(&device).load_file(
+    let device = FlexDevice;
+    let model = config.init::<Flex>(&device).load_file(
         args.model_directory.join("model"),
         &CompactRecorder::new(),
         &device,
@@ -77,7 +77,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
         }
 
         // Pair each model probability with the timestamp ending its input window.
-        let inputs = Tensor::<NdArray, 1>::from_floats(normalized.as_slice(), &device)
+        let inputs = Tensor::<Flex, 1>::from_floats(normalized.as_slice(), &device)
             .reshape([batch_end - batch_start, INPUTS]);
         let logits = model.forward(inputs).into_data().to_vec::<f32>()?;
         for (offset, logit) in logits.into_iter().enumerate() {

@@ -1,6 +1,6 @@
 use crate::backtest::{UNRELIABLE_DATA_END_TIME, UNRELIABLE_DATA_START_TIME};
 use burn::{
-    backend::{Autodiff, NdArray, ndarray::NdArrayDevice},
+    backend::{Autodiff, Flex, flex::FlexDevice},
     data::{
         dataloader::{DataLoader, DataLoaderBuilder, batcher::Batcher},
         dataset::InMemDataset,
@@ -231,8 +231,8 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     let data = prepare_data(&training_series, &validation_series, INPUTS, OUTPUTS)?;
 
     // Use Burn's CPU backend for consistent training and inference calculations.
-    let device = NdArrayDevice::Cpu;
-    train::<Autodiff<NdArray>>(&device, args, &data)?;
+    let device = FlexDevice;
+    train::<Autodiff<Flex>>(&device, args, &data)?;
 
     Ok(())
 }
