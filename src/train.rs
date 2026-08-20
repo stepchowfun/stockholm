@@ -794,10 +794,48 @@ mod tests {
     #[test]
     fn label_future_price_crossings() {
         // Require the strict 0.5% gain to occur before any strict 0.4% loss.
-        let crossing = windows(&[90.0_f32, 95.0, 100.0, 99.6, 100.6], 2, 2, 0.0, 1.0);
-        let no_gain = windows(&[90.0_f32, 95.0, 100.0, 100.5, 100.5], 2, 2, 0.0, 1.0);
-        let loss_before_gain = windows(&[90.0_f32, 95.0, 100.0, 99.5, 100.6], 2, 2, 0.0, 1.0);
-        let loss_after_gain = windows(&[90.0_f32, 95.0, 100.0, 100.6, 99.5], 2, 2, 0.0, 1.0);
+        let upper_target = 100.0_f32 * (1.0_f32 + super::TARGET_INCREASE);
+        let lower_limit = 100.0_f32 * (1.0_f32 - super::MAXIMUM_DECREASE);
+        let crossing = windows(
+            &[90.0_f32, 95.0, 100.0, lower_limit, upper_target + 0.1_f32],
+            2,
+            2,
+            0.0,
+            1.0,
+        );
+        let no_gain = windows(
+            &[90.0_f32, 95.0, 100.0, upper_target, upper_target],
+            2,
+            2,
+            0.0,
+            1.0,
+        );
+        let loss_before_gain = windows(
+            &[
+                90.0_f32,
+                95.0,
+                100.0,
+                lower_limit - 0.1_f32,
+                upper_target + 0.1_f32,
+            ],
+            2,
+            2,
+            0.0,
+            1.0,
+        );
+        let loss_after_gain = windows(
+            &[
+                90.0_f32,
+                95.0,
+                100.0,
+                upper_target + 0.1_f32,
+                lower_limit - 0.1_f32,
+            ],
+            2,
+            2,
+            0.0,
+            1.0,
+        );
 
         assert_eq!(crossing[0].inputs.len(), 2);
         assert!(crossing[0].target);
