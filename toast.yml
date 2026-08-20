@@ -145,6 +145,7 @@ tasks:
 
       # [tag:excluded_input_paths] Keep this in sync with [file:.gitignore].
       - artifacts
+      - data/inference
       - model
       - target
     command: |

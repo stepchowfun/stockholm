@@ -1,28 +1,71 @@
 use crate::backtest::{UNRELIABLE_DATA_END_TIME, UNRELIABLE_DATA_START_TIME};
 use burn::{
-    backend::{Autodiff, NdArray, ndarray::NdArrayDevice},
+    backend::{Autodiff, Flex, flex::FlexDevice},
     data::{
         dataloader::{DataLoader, DataLoaderBuilder, batcher::Batcher},
         dataset::InMemDataset,
     },
     module::AutodiffModule,
     nn::{
-        Dropout, DropoutConfig, Linear, LinearConfig, Relu,
-        loss::{MseLoss, Reduction::Mean},
+        Dropout, DropoutConfig, Linear, LinearConfig, PaddingConfig1d, Relu,
+        conv::{Conv1d, Conv1dConfig},
+        loss::BinaryCrossEntropyLossConfig,
+        pool::{AvgPool1d, AvgPool1dConfig},
     },
     optim::{AdamConfig, GradientsParams, Optimizer},
     prelude::*,
     record::CompactRecorder,
     tensor::backend::AutodiffBackend,
 };
+use chrono::Local;
 use clap::Args as ClapArgs;
-use std::{error::Error, fs, marker::PhantomData, path::PathBuf, sync::Arc};
-use time::OffsetDateTime;
+use std::{
+    error::Error,
+    fs,
+    io::{self, Write},
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tempfile::{NamedTempFile, tempdir_in};
+use time::{OffsetDateTime, Time};
 use time_tz::{OffsetDateTimeExt, timezones::db::america::NEW_YORK};
 
-// Fix the forecasting horizon and the amount of history supplied to the model.
-const INPUTS: usize = 56;
-const OUTPUTS: usize = 64;
+// Fix the price history supplied to the model and the future crossing horizon.
+pub const INPUTS: usize = 128;
+const OUTPUTS: usize = 128;
+
+// Bound memory use and keep optimizer updates frequent enough for this overlapping dataset.
+pub const BATCH_SIZE: usize = 64;
+
+// Require a future price to exceed the last observed price by this relative amount.
+const TARGET_INCREASE: f32 = 0.002_f32;
+
+// Reject windows where a future price falls this far below the last observed price.
+const MAXIMUM_DECREASE: f32 = 0.002_f32;
+
+// Highlight precision among predictions confident enough to support selective action.
+const HIGH_CONFIDENCE_PROBABILITY: f32 = 0.8_f32;
+
+// Reduce adjacent returns to a compact representation before the learned layers.
+const POOL_SIZE: usize = 4;
+
+// Configure the temporal convolutions and flattened pooled representation.
+const KERNEL_SIZE: usize = 5;
+const FIRST_CHANNELS: usize = 8;
+const SECOND_CHANNELS: usize = 16;
+const POOLED_LENGTH: usize = INPUTS / POOL_SIZE;
+const LINEAR_INPUTS: usize = SECOND_CHANNELS * POOLED_LENGTH;
+
+// These Eastern times bound the regular market session used by the model.
+const MARKET_OPEN_TIME: Time = match Time::from_hms(9, 30, 0) {
+    Ok(time) => time,
+    Err(_) => panic!("The market open time must be valid."),
+};
+const MARKET_CLOSE_TIME: Time = match Time::from_hms(16, 0, 0) {
+    Ok(time) => time,
+    Err(_) => panic!("The market close time must be valid."),
+};
 
 // These arguments configure a time-series training run.
 #[derive(ClapArgs)]
@@ -35,20 +78,16 @@ pub struct Args {
     #[arg(long, required = true, num_args = 1..)]
     validation_paths: Vec<PathBuf>,
 
-    /// Number of examples processed in each optimization step.
-    #[arg(long, default_value_t = 64, value_parser = parse_positive_usize)]
-    batch_size: usize,
-
     /// Number of complete passes through the training dataset.
     #[arg(long, default_value_t = 5, value_parser = parse_positive_usize)]
     epochs: usize,
 
     /// Step size used by the Adam optimizer.
-    #[arg(long, default_value_t = 1e-3_f64, value_parser = parse_positive_f64)]
+    #[arg(long, default_value_t = 1e-4_f64, value_parser = parse_positive_f64)]
     learning_rate: f64,
 
     /// Probability of dropping each hidden activation during training.
-    #[arg(long, default_value_t = 0.0_f64, value_parser = parse_dropout)]
+    #[arg(long, default_value_t = 0.5_f64, value_parser = parse_dropout)]
     dropout: f64,
 
     /// Seed used for model initialization and training-data shuffling.
@@ -64,14 +103,14 @@ pub struct Args {
 #[derive(Clone, Debug)]
 struct SeriesItem {
     inputs: Vec<f32>,
-    targets: Vec<f32>,
+    target: bool,
 }
 
 // This batch stores the tensors consumed and predicted by the model.
 #[derive(Clone, Debug)]
 struct SeriesBatch<B: Backend> {
     inputs: Tensor<B, 2>,
-    targets: Tensor<B, 2>,
+    targets: Tensor<B, 2, Int>,
 }
 
 // This batcher converts in-memory windows to backend tensors.
@@ -99,10 +138,12 @@ impl<B: Backend> Batcher<B, SeriesItem, SeriesBatch<B>> for SeriesBatcher<B> {
             .collect();
         let inputs = Tensor::cat(inputs, 0);
 
-        // Convert every target window using the same layout as the inputs.
+        // Convert every crossing label into a single-column target tensor.
         let targets = items
             .iter()
-            .map(|item| Tensor::<B, 1>::from_floats(item.targets.as_slice(), device).unsqueeze())
+            .map(|item| {
+                Tensor::<B, 1, Int>::from_ints([i32::from(item.target)], device).unsqueeze()
+            })
             .collect();
         let targets = Tensor::cat(targets, 0);
 
@@ -110,19 +151,24 @@ impl<B: Backend> Batcher<B, SeriesItem, SeriesBatch<B>> for SeriesBatcher<B> {
     }
 }
 
-// This model predicts several future returns directly from a fixed input window.
+// This model predicts whether a future price will cross the target increase.
 #[derive(Module, Debug)]
 pub struct Model<B: Backend> {
-    input: Linear<B>,
-    output: Linear<B>,
-    activation: Relu,
-    dropout: Dropout,
+    first_convolution: Conv1d<B>,
+    first_dropout: Dropout,
+    second_convolution: Conv1d<B>,
+    second_dropout: Dropout,
+    first_activation: Relu,
+    pooling: AvgPool1d,
+    first_linear: Linear<B>,
+    third_dropout: Dropout,
+    second_activation: Relu,
+    second_linear: Linear<B>,
 }
 
 // This configuration records the model, training, and preprocessing settings.
 #[derive(Config, Debug)]
 pub struct ModelConfig {
-    batch_size: usize,
     epochs: usize,
     learning_rate: f64,
     dropout: f64,
@@ -135,20 +181,39 @@ impl ModelConfig {
     // Initialize every model layer on the selected device.
     pub fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
         Model {
-            input: LinearConfig::new(INPUTS, 128).init(device),
-            output: LinearConfig::new(128, OUTPUTS).init(device),
-            activation: Relu::new(),
-            dropout: DropoutConfig::new(self.dropout).init(),
+            first_convolution: Conv1dConfig::new(1, FIRST_CHANNELS, KERNEL_SIZE)
+                .with_padding(PaddingConfig1d::Same)
+                .init(device),
+            first_dropout: DropoutConfig::new(self.dropout).init(),
+            second_convolution: Conv1dConfig::new(FIRST_CHANNELS, SECOND_CHANNELS, KERNEL_SIZE)
+                .with_padding(PaddingConfig1d::Same)
+                .init(device),
+            second_dropout: DropoutConfig::new(self.dropout).init(),
+            first_activation: Relu::new(),
+            pooling: AvgPool1dConfig::new(POOL_SIZE).init(),
+            first_linear: LinearConfig::new(LINEAR_INPUTS, 128).init(device),
+            third_dropout: DropoutConfig::new(self.dropout).init(),
+            second_activation: Relu::new(),
+            second_linear: LinearConfig::new(128, 1).init(device),
         }
     }
 }
 
 impl<B: Backend> Model<B> {
-    // Apply the hidden transformation and output projection.
+    // Extract and downsample temporal features before producing the output logit.
     pub fn forward(&self, inputs: Tensor<B, 2>) -> Tensor<B, 2> {
-        let values = self.activation.forward(self.input.forward(inputs));
-        let values = self.dropout.forward(values);
-        self.output.forward(values)
+        let values = self
+            .first_dropout
+            .forward(self.first_convolution.forward(inputs.unsqueeze_dim::<3>(1)));
+        let values = self
+            .second_dropout
+            .forward(self.second_convolution.forward(values));
+        let values = self.first_activation.forward(values);
+        let values = self.pooling.forward(values).flatten(1_usize, 2_usize);
+        let values = self.first_linear.forward(values);
+        let values = self.third_dropout.forward(values);
+        let values = self.second_activation.forward(values);
+        self.second_linear.forward(values)
     }
 }
 
@@ -160,6 +225,13 @@ struct PreparedData {
     deviation: f32,
 }
 
+// Keep each parsed price attached to its source timestamp for aligned inference output.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TimestampedPrice {
+    pub timestamp: i64,
+    pub price: f32,
+}
+
 // Read the price history and train a forecasting model.
 pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     // Load the two file groups independently so validation data never enters training.
@@ -167,9 +239,9 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     let validation_series = load_series(&args.validation_paths)?;
     let data = prepare_data(&training_series, &validation_series, INPUTS, OUTPUTS)?;
 
-    // Use Burn's portable CPU backend for deterministic local training.
-    let device = NdArrayDevice::Cpu;
-    train::<Autodiff<NdArray>>(&device, args, &data)?;
+    // Use Burn's CPU backend for consistent training and inference calculations.
+    let device = FlexDevice;
+    train::<Autodiff<Flex>>(&device, args, &data)?;
 
     Ok(())
 }
@@ -195,8 +267,7 @@ fn train<B: AutodiffBackend>(
     data: &PreparedData,
 ) -> Result<(), Box<dyn Error>> {
     // Collect every reproducibility setting into the model's saved configuration.
-    let config = ModelConfig::new(
-        args.batch_size,
+    let mut config = ModelConfig::new(
         args.epochs,
         args.learning_rate,
         args.dropout,
@@ -212,17 +283,17 @@ fn train<B: AutodiffBackend>(
 
     // Scan all windows while shuffling only the training order each epoch.
     let training_loader = DataLoaderBuilder::new(SeriesBatcher::<B>::new())
-        .batch_size(config.batch_size)
+        .batch_size(BATCH_SIZE)
         .shuffle(config.seed)
         .num_workers(1)
         .build(InMemDataset::new(data.training.clone()));
     let training_evaluation_loader =
         DataLoaderBuilder::new(SeriesBatcher::<B::InnerBackend>::new())
-            .batch_size(config.batch_size)
+            .batch_size(BATCH_SIZE)
             .num_workers(1)
             .build(InMemDataset::new(data.training.clone()));
     let validation_loader = DataLoaderBuilder::new(SeriesBatcher::<B::InnerBackend>::new())
-        .batch_size(config.batch_size)
+        .batch_size(BATCH_SIZE)
         .num_workers(1)
         .build(InMemDataset::new(data.validation.clone()));
 
@@ -233,25 +304,31 @@ fn train<B: AutodiffBackend>(
         data.validation.len(),
     );
 
-    // Establish the validation target by predicting no future price movement.
-    let baseline_loss = baseline_loss(&data.validation, data.mean, data.deviation);
+    // Establish the classification baseline from the validation label distribution.
+    let positive_count = data.validation.iter().filter(|item| item.target).count();
+    let positive_rate = usize_to_f32(positive_count) / usize_to_f32(data.validation.len());
+    let baseline_accuracy = positive_rate.max(1.0_f32 - positive_rate);
     println!(
-        "No-change baseline RMSE: {:.2} bps",
-        baseline_loss.sqrt() * f64::from(data.deviation) * 10_000.0_f64,
+        "Validation positive rate: {:.2}%, majority baseline accuracy: {:.2}%",
+        positive_rate * 100.0_f32,
+        baseline_accuracy * 100.0_f32,
     );
 
-    // Report the initialized model's error before applying any optimizer steps.
+    // Report the initialized model's classification quality before optimizer steps.
     let initial_model = model.valid();
-    let initial_training_loss = validation_loss(&initial_model, &training_evaluation_loader);
-    let initial_validation_loss = validation_loss(&initial_model, &validation_loader);
+    let initial_training = validation_metrics(&initial_model, &training_evaluation_loader);
+    let initial_validation = validation_metrics(&initial_model, &validation_loader);
     println!(
-        "Initial RMSE: train {:.2} bps, validation {:.2} bps",
-        initial_training_loss.sqrt() * data.deviation * 10_000.0_f32,
-        initial_validation_loss.sqrt() * data.deviation * 10_000.0_f32,
+        "Initial: train loss {:.4}, accuracy {:.2}%; validation loss {:.4}, accuracy {:.2}%",
+        initial_training.loss,
+        initial_training.accuracy() * 100.0_f32,
+        initial_validation.loss,
+        initial_validation.accuracy() * 100.0_f32,
     );
 
-    // Optimize mean-squared error and display validation progress each epoch.
-    for epoch in 1..=config.epochs {
+    // Retain the requested duration while the saved configuration tracks completed work.
+    let requested_epochs = config.epochs;
+    for epoch in 1..=requested_epochs {
         train_epoch(
             &mut model,
             &mut optimizer,
@@ -261,25 +338,83 @@ fn train<B: AutodiffBackend>(
 
         // Evaluate the fully updated model on both splits for comparable epoch metrics.
         let valid_model = model.valid();
-        let training_loss = validation_loss(&valid_model, &training_evaluation_loader);
-        let validation_loss = validation_loss(&valid_model, &validation_loader);
+        let training = validation_metrics(&valid_model, &training_evaluation_loader);
+        let validation = validation_metrics(&valid_model, &validation_loader);
         println!(
-            "Epoch {:>2}/{}: train RMSE {:.2} bps, validation RMSE {:.2} bps",
+            concat!(
+                "Epoch {:>2}/{}: train loss {:.4}, accuracy {:.2}%; ",
+                "validation loss {:.4}, accuracy {:.2}%, precision {:.2}%, recall {:.2}%, ",
+                "precision@0.8 {:.2}%",
+            ),
             epoch,
-            config.epochs,
-            training_loss.sqrt() * data.deviation * 10_000.0_f32,
-            validation_loss.sqrt() * data.deviation * 10_000.0_f32,
+            requested_epochs,
+            training.loss,
+            training.accuracy() * 100.0_f32,
+            validation.loss,
+            validation.accuracy() * 100.0_f32,
+            validation.precision() * 100.0_f32,
+            validation.recall() * 100.0_f32,
+            validation.high_confidence_precision() * 100.0_f32,
+        );
+
+        // Persist the latest completed epoch so interrupted runs retain usable parameters.
+        config.epochs = epoch;
+        println!(
+            "Saving model after epoch {epoch} to {}…",
+            args.model_directory.display(),
+        );
+        save_checkpoint(model.clone(), &config, &args.model_directory)?;
+        let saved_at = Local::now().to_rfc3339();
+        println!(
+            "Saved model after epoch {epoch} to {} at {saved_at}.",
+            args.model_directory.display(),
         );
     }
 
-    // Save the Burn parameters and their complete reconstruction configuration.
-    fs::create_dir_all(&args.model_directory)?;
-    model.save_file(args.model_directory.join("model"), &CompactRecorder::new())?;
-    config.save(args.model_directory.join("model.json"))?;
-    println!(
-        "Saved training artifacts to {}.",
-        args.model_directory.display(),
-    );
+    Ok(())
+}
+
+// Stage a complete checkpoint before atomically replacing its final files.
+fn save_checkpoint<B: Backend>(
+    model: Model<B>,
+    config: &ModelConfig,
+    directory: &Path,
+) -> Result<(), Box<dyn Error>> {
+    // Keep temporary and final files on the same filesystem so persistence stays atomic.
+    fs::create_dir_all(directory)?;
+    let parent = directory
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staging_directory = tempdir_in(parent)?;
+
+    // Finish serializing both artifacts before exposing either one to inference.
+    let staged_config = staging_directory.path().join("model.json");
+    let staged_model = staging_directory.path().join("model.mpk");
+    config.save(&staged_config)?;
+    model.save_file(
+        staging_directory.path().join("model"),
+        &CompactRecorder::new(),
+    )?;
+
+    // Replace the model last so an interruption during serialization preserves the prior model.
+    persist_file(&staged_config, &directory.join("model.json"))?;
+    persist_file(&staged_model, &directory.join("model.mpk"))?;
+
+    Ok(())
+}
+
+// Copy one staged artifact into a temporary file and atomically persist it at its destination.
+fn persist_file(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
+    // Follow the state-file persistence pattern while accommodating Burn-managed file names.
+    let parent = destination
+        .parent()
+        .ok_or("the checkpoint destination must have a parent directory")?;
+    let mut source = fs::File::open(source)?;
+    let mut temp_file = NamedTempFile::new_in(parent)?;
+    io::copy(&mut source, &mut temp_file)?;
+    temp_file.flush()?;
+    temp_file.persist(destination)?;
 
     Ok(())
 }
@@ -296,7 +431,10 @@ fn train_epoch<B: AutodiffBackend, O>(
     // Apply one gradient update for every shuffled batch.
     for batch in loader.iter() {
         let predictions = model.forward(batch.inputs);
-        let loss = MseLoss::new().forward(predictions, batch.targets, Mean);
+        let loss = BinaryCrossEntropyLossConfig::new()
+            .with_logits(true)
+            .init(&model.devices()[0])
+            .forward(predictions, batch.targets);
 
         // Associate gradients with model parameters before applying Adam.
         let gradients = GradientsParams::from_grads(loss.backward(), model);
@@ -311,7 +449,7 @@ fn prepare_data(
     inputs: usize,
     outputs: usize,
 ) -> Result<PreparedData, Box<dyn Error>> {
-    // Convert each price series independently so returns never cross a timestamp gap.
+    // Convert each price series independently so normalization never crosses a timestamp gap.
     let training_series = training_prices
         .iter()
         .map(|prices| log_returns(prices))
@@ -355,20 +493,16 @@ fn prepare_data(
         return Err("training returns must have nonzero finite variance".into());
     }
 
-    // Normalize and window each series separately so no example crosses a timestamp gap.
+    // Normalize and label each price window separately so no example crosses a timestamp gap.
     let prepare = |series: &[Vec<f32>]| {
         let mut items = Vec::new();
-        for returns in series {
-            let normalized = returns
-                .iter()
-                .map(|value| (value - mean) / deviation)
-                .collect::<Vec<_>>();
-            items.extend(windows(&normalized, inputs, outputs));
+        for prices in series {
+            items.extend(windows(prices, inputs, outputs, mean, deviation));
         }
         items
     };
-    let training = prepare(&training_series);
-    let validation = prepare(&validation_series);
+    let training = prepare(training_prices);
+    let validation = prepare(validation_prices);
 
     Ok(PreparedData {
         training,
@@ -378,48 +512,138 @@ fn prepare_data(
     })
 }
 
-// Create every overlapping direct multi-horizon example in chronological order.
-fn windows(values: &[f32], inputs: usize, outputs: usize) -> Vec<SeriesItem> {
-    values
-        .windows(inputs + outputs)
-        .map(|window| SeriesItem {
-            inputs: window[..inputs].to_vec(),
-            targets: window[inputs..].to_vec(),
+// Create chronological examples labeled by future crossings of the target price.
+fn windows(
+    prices: &[f32],
+    inputs: usize,
+    outputs: usize,
+    mean: f32,
+    deviation: f32,
+) -> Vec<SeriesItem> {
+    prices
+        .windows(inputs + outputs + 1)
+        .map(|window| {
+            // Calculate both barriers from the final price observed by the model.
+            let reference_price = window[inputs];
+            let upper_target = reference_price * (1.0_f32 + TARGET_INCREASE);
+            let lower_limit = reference_price * (1.0_f32 - MAXIMUM_DECREASE);
+            let future_prices = &window[inputs + 1..];
+            let target = future_prices
+                .iter()
+                .find_map(|future_price| {
+                    if *future_price > upper_target {
+                        Some(true)
+                    } else if *future_price < lower_limit {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(false);
+
+            // Normalize only the returns presented to the model, leaving the price label exact.
+            let inputs = log_returns(&window[..=inputs])
+                .into_iter()
+                .map(|value| (value - mean) / deviation)
+                .collect();
+
+            SeriesItem { inputs, target }
         })
         .collect()
 }
 
-// Measure mean-squared error without constructing an autodiff graph.
-fn validation_loss<B: Backend>(
+// These metrics summarize binary predictions at the conventional 0.5 threshold.
+struct ClassificationMetrics {
+    loss: f32,
+    correct: usize,
+    total: usize,
+    true_positives: usize,
+    predicted_positives: usize,
+    actual_positives: usize,
+    high_confidence_true_positives: usize,
+    high_confidence_predicted_positives: usize,
+}
+
+impl ClassificationMetrics {
+    // Calculate the share of labels classified correctly.
+    fn accuracy(&self) -> f32 {
+        usize_to_f32(self.correct) / usize_to_f32(self.total)
+    }
+
+    // Calculate positive predictive value, defining an empty prediction set as zero.
+    fn precision(&self) -> f32 {
+        if self.predicted_positives == 0 {
+            return 0.0_f32;
+        }
+        usize_to_f32(self.true_positives) / usize_to_f32(self.predicted_positives)
+    }
+
+    // Calculate the share of actual positives detected, defining an empty class as zero.
+    fn recall(&self) -> f32 {
+        if self.actual_positives == 0 {
+            return 0.0_f32;
+        }
+        usize_to_f32(self.true_positives) / usize_to_f32(self.actual_positives)
+    }
+
+    // Calculate precision among predictions at or above the high-confidence threshold.
+    fn high_confidence_precision(&self) -> f32 {
+        if self.high_confidence_predicted_positives == 0 {
+            return 0.0_f32;
+        }
+        usize_to_f32(self.high_confidence_true_positives)
+            / usize_to_f32(self.high_confidence_predicted_positives)
+    }
+}
+
+// Measure binary loss and thresholded classification quality without autodiff.
+fn validation_metrics<B: Backend>(
     model: &Model<B>,
     loader: &Arc<dyn DataLoader<B, SeriesBatch<B>>>,
-) -> f32 {
-    // Accumulate sample-weighted loss across the ordered validation windows.
+) -> ClassificationMetrics {
+    // Accumulate sample-weighted loss and confusion counts across ordered windows.
     let mut total_loss = 0.0_f32;
-    let mut total_items = 0_usize;
+    let mut metrics = ClassificationMetrics {
+        loss: 0.0_f32,
+        correct: 0,
+        total: 0,
+        true_positives: 0,
+        predicted_positives: 0,
+        actual_positives: 0,
+        high_confidence_true_positives: 0,
+        high_confidence_predicted_positives: 0,
+    };
+    let high_confidence_logit =
+        (HIGH_CONFIDENCE_PROBABILITY / (1.0_f32 - HIGH_CONFIDENCE_PROBABILITY)).ln();
     for batch in loader.iter() {
         let item_count = batch.targets.dims()[0];
         let predictions = model.forward(batch.inputs);
-        let loss = MseLoss::new().forward(predictions, batch.targets, Mean);
+        let loss = BinaryCrossEntropyLossConfig::new()
+            .with_logits(true)
+            .init(&model.devices()[0])
+            .forward(predictions.clone(), batch.targets.clone());
         total_loss += loss.into_scalar().elem::<f32>() * usize_to_f32(item_count);
-        total_items += item_count;
+        let logits = predictions.into_data().to_vec::<f32>().unwrap();
+        let targets = batch.targets.float().into_data().to_vec::<f32>().unwrap();
+
+        // Count classifications directly so the reporting logic remains easy to inspect.
+        for (logit, target) in logits.into_iter().zip(targets) {
+            let prediction = logit >= 0.0_f32;
+            let high_confidence_prediction = logit >= high_confidence_logit;
+            let target = target >= 0.5_f32;
+            metrics.correct += usize::from(prediction == target);
+            metrics.true_positives += usize::from(prediction && target);
+            metrics.predicted_positives += usize::from(prediction);
+            metrics.actual_positives += usize::from(target);
+            metrics.high_confidence_true_positives +=
+                usize::from(high_confidence_prediction && target);
+            metrics.high_confidence_predicted_positives += usize::from(high_confidence_prediction);
+            metrics.total += 1;
+        }
     }
 
-    total_loss / usize_to_f32(total_items)
-}
-
-// Measure the normalized error from predicting zero return at every horizon.
-fn baseline_loss(items: &[SeriesItem], mean: f32, deviation: f32) -> f64 {
-    // Accumulate normalized errors in double precision across the large target set.
-    let prediction = -f64::from(mean) / f64::from(deviation);
-    let (squared_error, target_count) = items.iter().flat_map(|item| item.targets.iter()).fold(
-        (0.0_f64, 0.0_f64),
-        |(squared_error, count), target| {
-            let error = f64::from(*target) - prediction;
-            (squared_error + error.powi(2), count + 1.0_f64)
-        },
-    );
-    squared_error / target_count
+    metrics.loss = total_loss / usize_to_f32(metrics.total);
+    metrics
 }
 
 // Convert raw prices into successive logarithmic returns.
@@ -436,17 +660,8 @@ fn usize_to_f32(value: usize) -> f32 {
     value as f32
 }
 
-// Parse the latest contiguous opening-price series after excluding unreliable reports.
-pub fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
-    let prices = parse_training_prices(contents)?;
-    Ok(prices
-        .last()
-        .cloned()
-        .ok_or("the CSV file contains no reliable price data")?)
-}
-
-// Parse contiguous training-price series after excluding delayed early-morning trade reports.
-fn parse_training_prices(contents: &str) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
+// Parse contiguous market-hours series while retaining timestamps beside their prices.
+pub fn parse_price_series(contents: &str) -> Result<Vec<Vec<TimestampedPrice>>, Box<dyn Error>> {
     // Locate required columns by name so their order remains explicit.
     let mut reader = csv::Reader::from_reader(contents.as_bytes());
     let headers = reader.headers()?;
@@ -460,7 +675,7 @@ fn parse_training_prices(contents: &str) -> Result<Vec<Vec<f32>>, Box<dyn Error>
         .ok_or("the CSV file must contain a date column")?;
 
     // Split retained prices whenever consecutive source timestamps are not one second apart.
-    let mut price_series = Vec::<Vec<f32>>::new();
+    let mut price_series = Vec::<Vec<TimestampedPrice>>::new();
     let mut previous_timestamp: Option<i64> = None;
     for (index, result) in reader.records().enumerate() {
         let record = result?;
@@ -474,7 +689,10 @@ fn parse_training_prices(contents: &str) -> Result<Vec<Vec<f32>>, Box<dyn Error>
         let datetime = OffsetDateTime::from_unix_timestamp(timestamp)
             .map_err(|error| format!("invalid timestamp on line {line}: {error}"))?;
         let eastern_time = datetime.to_timezone(NEW_YORK).time();
-        if eastern_time >= UNRELIABLE_DATA_START_TIME && eastern_time < UNRELIABLE_DATA_END_TIME {
+        let unreliable =
+            eastern_time >= UNRELIABLE_DATA_START_TIME && eastern_time < UNRELIABLE_DATA_END_TIME;
+        let outside_market = eastern_time < MARKET_OPEN_TIME || eastern_time >= MARKET_CLOSE_TIME;
+        if unreliable || outside_market {
             continue;
         }
 
@@ -494,11 +712,19 @@ fn parse_training_prices(contents: &str) -> Result<Vec<Vec<f32>>, Box<dyn Error>
         price_series
             .last_mut()
             .ok_or("the price series must contain a current chunk")?
-            .push(price);
+            .push(TimestampedPrice { timestamp, price });
         previous_timestamp = Some(timestamp);
     }
 
     Ok(price_series)
+}
+
+// Discard timestamps after parsing because training consumes only price values.
+fn parse_training_prices(contents: &str) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
+    Ok(parse_price_series(contents)?
+        .into_iter()
+        .map(|series| series.into_iter().map(|price| price.price).collect())
+        .collect())
 }
 
 // Parse a strictly positive model dimension from the command line.
@@ -536,9 +762,7 @@ fn parse_dropout(value: &str) -> Result<f64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        SeriesItem, baseline_loss, parse_dropout, parse_prices, parse_training_prices, prepare_data,
-    };
+    use super::{parse_dropout, parse_price_series, parse_training_prices, prepare_data, windows};
     use crate::{Cli, Subcommand};
     use clap::Parser;
     use std::path::PathBuf;
@@ -565,10 +789,9 @@ mod tests {
             vec![PathBuf::from("monday.csv"), PathBuf::from("tuesday.csv")],
         );
         assert_eq!(args.validation_paths, vec![PathBuf::from("wednesday.csv")]);
-        assert_eq!(args.batch_size, 64);
         assert_eq!(args.epochs, 5);
-        assert!((args.learning_rate - 1e-3_f64).abs() < f64::EPSILON);
-        assert!(args.dropout.abs() < f64::EPSILON);
+        assert!((args.learning_rate - 1e-4_f64).abs() < f64::EPSILON);
+        assert!((args.dropout - 0.5_f64).abs() < f64::EPSILON);
         assert_eq!(args.seed, 42);
         assert_eq!(args.model_directory, PathBuf::from("model"));
     }
@@ -586,40 +809,50 @@ mod tests {
     #[test]
     fn parse_price_lines() {
         // Confirm the header and unused historical columns do not alter opening prices.
-        let prices = parse_prices(concat!(
+        let prices = parse_training_prices(concat!(
             "date,open,high,low,close,volume,wap,count\n",
-            "1,100,900,1,2,3,4,5\n",
-            "2,101.5,800,1,2,3,4,5\n",
-            "3,99,700,1,2,3,4,5\n",
+            "1784035800,100,900,1,2,3,4,5\n",
+            "1784035801,101.5,800,1,2,3,4,5\n",
+            "1784035802,99,700,1,2,3,4,5\n",
         ))
         .unwrap();
 
-        assert_eq!(prices, vec![100.0_f32, 101.5_f32, 99.0_f32]);
+        assert_eq!(prices, vec![vec![100.0_f32, 101.5_f32, 99.0_f32]]);
     }
 
     #[test]
     fn discard_unreliable_training_prices_across_eastern_time_offsets() {
-        // Filter the shared window, split surrounding prices, and select the latest for inference.
+        // Ignore premarket, unreliable, and closing rows while retaining the regular session.
         for start in [1_784_016_000_i64, 1_767_949_200_i64] {
             let contents = format!(
                 concat!(
                     "date,open\n",
+                    "{},invalid\n",
+                    "{},invalid\n",
+                    "{},invalid\n",
                     "{},99\n",
-                    "{},invalid\n",
-                    "{},invalid\n",
                     "{},100\n",
+                    "{},invalid\n",
                 ),
                 start - 1,
                 start,
                 start + 899,
-                start + 900,
+                start + 19_800,
+                start + 19_801,
+                start + 43_200,
             );
 
             assert_eq!(
                 parse_training_prices(&contents).unwrap(),
-                vec![vec![99.0_f32], vec![100.0_f32]],
+                vec![vec![99.0_f32, 100.0_f32]],
             );
-            assert_eq!(parse_prices(&contents).unwrap(), vec![100.0_f32]);
+            assert_eq!(
+                parse_price_series(&contents).unwrap()[0]
+                    .iter()
+                    .map(|price| price.timestamp)
+                    .collect::<Vec<_>>(),
+                vec![start + 19_800, start + 19_801],
+            );
         }
     }
 
@@ -628,11 +861,11 @@ mod tests {
         // Keep one-second observations together while separating gaps and reversed timestamps.
         let prices = parse_training_prices(concat!(
             "date,open\n",
-            "1784030400,100\n",
-            "1784030401,101\n",
-            "1784030403,102\n",
-            "1784030404,103\n",
-            "1784030402,104\n",
+            "1784035800,100\n",
+            "1784035801,101\n",
+            "1784035803,102\n",
+            "1784035804,103\n",
+            "1784035802,104\n",
         ))
         .unwrap();
 
@@ -649,7 +882,7 @@ mod tests {
     #[test]
     fn reject_nonpositive_prices() {
         // Confirm price parsing rejects values outside the logarithmic return domain.
-        let error = parse_prices("date,open\n1,100\n2,0\n").unwrap_err();
+        let error = parse_training_prices("date,open\n1784035800,100\n1784035801,0\n").unwrap_err();
 
         assert!(error.to_string().contains("finite and positive"));
     }
@@ -663,18 +896,60 @@ mod tests {
 
         assert_eq!(data.training.len(), 95);
         assert_eq!(data.validation.len(), 95);
-        assert!(baseline_loss(&data.validation, data.mean, data.deviation).is_finite());
+        assert!(data.training.iter().all(|item| item.target));
     }
 
     #[test]
-    fn calculate_baseline_loss_in_double_precision() {
-        // Preserve errors too small to affect a much larger term in single precision.
-        let items = [SeriesItem {
-            inputs: Vec::new(),
-            targets: vec![10_000.0_f32, 1.0_f32],
-        }];
+    fn label_future_price_crossings() {
+        // Require the strict 0.5% gain to occur before any strict 0.4% loss.
+        let upper_target = 100.0_f32 * (1.0_f32 + super::TARGET_INCREASE);
+        let lower_limit = 100.0_f32 * (1.0_f32 - super::MAXIMUM_DECREASE);
+        let crossing = windows(
+            &[90.0_f32, 95.0, 100.0, lower_limit, upper_target + 0.1_f32],
+            2,
+            2,
+            0.0,
+            1.0,
+        );
+        let no_gain = windows(
+            &[90.0_f32, 95.0, 100.0, upper_target, upper_target],
+            2,
+            2,
+            0.0,
+            1.0,
+        );
+        let loss_before_gain = windows(
+            &[
+                90.0_f32,
+                95.0,
+                100.0,
+                lower_limit - 0.1_f32,
+                upper_target + 0.1_f32,
+            ],
+            2,
+            2,
+            0.0,
+            1.0,
+        );
+        let loss_after_gain = windows(
+            &[
+                90.0_f32,
+                95.0,
+                100.0,
+                upper_target + 0.1_f32,
+                lower_limit - 0.1_f32,
+            ],
+            2,
+            2,
+            0.0,
+            1.0,
+        );
 
-        assert!((baseline_loss(&items, 0.0_f32, 1.0_f32) - 50_000_000.5_f64).abs() < f64::EPSILON);
+        assert_eq!(crossing[0].inputs.len(), 2);
+        assert!(crossing[0].target);
+        assert!(!no_gain[0].target);
+        assert!(!loss_before_gain[0].target);
+        assert!(loss_after_gain[0].target);
     }
 
     #[test]
