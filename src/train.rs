@@ -215,6 +215,13 @@ struct PreparedData {
     deviation: f32,
 }
 
+// Keep each parsed price attached to its source timestamp for aligned inference output.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TimestampedPrice {
+    pub timestamp: i64,
+    pub price: f32,
+}
+
 // Read the price history and train a forecasting model.
 pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     // Load the two file groups independently so validation data never enters training.
@@ -573,17 +580,8 @@ fn usize_to_f32(value: usize) -> f32 {
     value as f32
 }
 
-// Parse the latest contiguous market-hours opening-price series after excluding unreliable reports.
-pub fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
-    let prices = parse_training_prices(contents)?;
-    Ok(prices
-        .last()
-        .cloned()
-        .ok_or("the CSV file contains no reliable market-hours price data")?)
-}
-
-// Parse contiguous market-hours series after excluding delayed early-morning trade reports.
-fn parse_training_prices(contents: &str) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
+// Parse contiguous market-hours series while retaining timestamps beside their prices.
+pub fn parse_price_series(contents: &str) -> Result<Vec<Vec<TimestampedPrice>>, Box<dyn Error>> {
     // Locate required columns by name so their order remains explicit.
     let mut reader = csv::Reader::from_reader(contents.as_bytes());
     let headers = reader.headers()?;
@@ -597,7 +595,7 @@ fn parse_training_prices(contents: &str) -> Result<Vec<Vec<f32>>, Box<dyn Error>
         .ok_or("the CSV file must contain a date column")?;
 
     // Split retained prices whenever consecutive source timestamps are not one second apart.
-    let mut price_series = Vec::<Vec<f32>>::new();
+    let mut price_series = Vec::<Vec<TimestampedPrice>>::new();
     let mut previous_timestamp: Option<i64> = None;
     for (index, result) in reader.records().enumerate() {
         let record = result?;
@@ -634,11 +632,19 @@ fn parse_training_prices(contents: &str) -> Result<Vec<Vec<f32>>, Box<dyn Error>
         price_series
             .last_mut()
             .ok_or("the price series must contain a current chunk")?
-            .push(price);
+            .push(TimestampedPrice { timestamp, price });
         previous_timestamp = Some(timestamp);
     }
 
     Ok(price_series)
+}
+
+// Discard timestamps after parsing because training consumes only price values.
+fn parse_training_prices(contents: &str) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
+    Ok(parse_price_series(contents)?
+        .into_iter()
+        .map(|series| series.into_iter().map(|price| price.price).collect())
+        .collect())
 }
 
 // Parse a strictly positive model dimension from the command line.
@@ -676,7 +682,7 @@ fn parse_dropout(value: &str) -> Result<f64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_dropout, parse_prices, parse_training_prices, prepare_data, windows};
+    use super::{parse_dropout, parse_price_series, parse_training_prices, prepare_data, windows};
     use crate::{Cli, Subcommand};
     use clap::Parser;
     use std::path::PathBuf;
@@ -724,7 +730,7 @@ mod tests {
     #[test]
     fn parse_price_lines() {
         // Confirm the header and unused historical columns do not alter opening prices.
-        let prices = parse_prices(concat!(
+        let prices = parse_training_prices(concat!(
             "date,open,high,low,close,volume,wap,count\n",
             "1784035800,100,900,1,2,3,4,5\n",
             "1784035801,101.5,800,1,2,3,4,5\n",
@@ -732,7 +738,7 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(prices, vec![100.0_f32, 101.5_f32, 99.0_f32]);
+        assert_eq!(prices, vec![vec![100.0_f32, 101.5_f32, 99.0_f32]]);
     }
 
     #[test]
@@ -761,7 +767,13 @@ mod tests {
                 parse_training_prices(&contents).unwrap(),
                 vec![vec![99.0_f32, 100.0_f32]],
             );
-            assert_eq!(parse_prices(&contents).unwrap(), vec![99.0_f32, 100.0_f32]);
+            assert_eq!(
+                parse_price_series(&contents).unwrap()[0]
+                    .iter()
+                    .map(|price| price.timestamp)
+                    .collect::<Vec<_>>(),
+                vec![start + 19_800, start + 19_801],
+            );
         }
     }
 
@@ -791,7 +803,7 @@ mod tests {
     #[test]
     fn reject_nonpositive_prices() {
         // Confirm price parsing rejects values outside the logarithmic return domain.
-        let error = parse_prices("date,open\n1784035800,100\n1784035801,0\n").unwrap_err();
+        let error = parse_training_prices("date,open\n1784035800,100\n1784035801,0\n").unwrap_err();
 
         assert!(error.to_string().contains("finite and positive"));
     }

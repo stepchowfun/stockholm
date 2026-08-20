@@ -1,4 +1,4 @@
-use crate::train::{INPUTS, ModelConfig, log_returns, parse_prices};
+use crate::train::{INPUTS, ModelConfig, log_returns, parse_price_series};
 use burn::{
     backend::{NdArray, ndarray::NdArrayDevice},
     module::Module,
@@ -38,21 +38,18 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
         return Err("model configuration contains invalid normalization values".into());
     }
 
-    // Parse the latest reliable price series and align its ending timestamps.
+    // Parse the latest reliable series with each price attached to its source timestamp.
     let contents = fs::read_to_string(&args.input_path)
         .map_err(|error| format!("failed to read {}: {error}", args.input_path.display()))?;
-    let prices = parse_prices(&contents)
+    let series = parse_price_series(&contents)
         .map_err(|error| format!("failed to parse {}: {error}", args.input_path.display()))?;
+    let series = series
+        .last()
+        .ok_or("the CSV file contains no reliable market-hours price data")?;
+    let prices = series.iter().map(|price| price.price).collect::<Vec<_>>();
     if prices.len() <= INPUTS {
         return Err(format!("inference requires at least {} prices", INPUTS + 1).into());
     }
-    let timestamps = parse_timestamps(&contents)
-        .map_err(|error| format!("failed to parse {}: {error}", args.input_path.display()))?;
-    let timestamp_start = timestamps
-        .len()
-        .checked_sub(prices.len())
-        .ok_or("price series contains more values than the timestamp column")?;
-    let timestamps = &timestamps[timestamp_start..];
 
     // Restore the trained parameters and prepare the output destination.
     let device = NdArrayDevice::Cpu;
@@ -87,7 +84,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
             .reshape([batch_end - batch_start, INPUTS]);
         let logits = model.forward(inputs).into_data().to_vec::<f32>()?;
         for (offset, logit) in logits.into_iter().enumerate() {
-            let timestamp = timestamps[batch_start + offset + INPUTS];
+            let timestamp = series[batch_start + offset + INPUTS].timestamp;
             writer.write_record([timestamp.to_string(), sigmoid(logit).to_string()])?;
         }
     }
@@ -97,31 +94,6 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     println!("Saved predictions to {}.", args.output_path.display());
 
     Ok(())
-}
-
-// Parse source timestamps so predictions can retain their input-window endpoints.
-fn parse_timestamps(contents: &str) -> Result<Vec<i64>, Box<dyn Error>> {
-    // Locate the timestamp column by name to remain independent of CSV column order.
-    let mut reader = csv::Reader::from_reader(contents.as_bytes());
-    let timestamp_index = reader
-        .headers()?
-        .iter()
-        .position(|header| header == "date")
-        .ok_or("the CSV file must contain a date column")?;
-
-    // Retain every timestamp because the latest price series is an aligned CSV suffix.
-    reader
-        .records()
-        .enumerate()
-        .map(|(index, record)| {
-            let line = index + 2;
-            record?
-                .get(timestamp_index)
-                .ok_or_else(|| format!("missing timestamp on line {line}"))?
-                .parse::<i64>()
-                .map_err(|error| format!("invalid timestamp on line {line}: {error}").into())
-        })
-        .collect()
 }
 
 // Convert one raw model logit into a probability without overflowing the exponential.
