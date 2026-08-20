@@ -23,11 +23,11 @@ use time::OffsetDateTime;
 use time_tz::{OffsetDateTimeExt, timezones::db::america::NEW_YORK};
 
 // Fix the price history supplied to the model and the future crossing horizon.
-pub const INPUTS: usize = 256;
-const OUTPUTS: usize = 512;
+pub const INPUTS: usize = 128;
+const OUTPUTS: usize = 128;
 
 // Require a future price to exceed the last observed price by this relative amount.
-const TARGET_INCREASE: f32 = 0.005_f32;
+const TARGET_INCREASE: f32 = 0.004_f32;
 
 // Reject windows where a future price falls this far below the last observed price.
 const MAXIMUM_DECREASE: f32 = 0.004_f32;
@@ -37,8 +37,8 @@ const POOL_SIZE: usize = 4;
 
 // Configure the temporal convolutions and flattened pooled representation.
 const KERNEL_SIZE: usize = 5;
-const FIRST_CHANNELS: usize = 16;
-const SECOND_CHANNELS: usize = 32;
+const FIRST_CHANNELS: usize = 8;
+const SECOND_CHANNELS: usize = 16;
 const POOLED_LENGTH: usize = INPUTS / POOL_SIZE;
 const LINEAR_INPUTS: usize = SECOND_CHANNELS * POOLED_LENGTH;
 
