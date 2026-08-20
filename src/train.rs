@@ -379,9 +379,11 @@ fn save_checkpoint<B: Backend>(
     directory: &Path,
 ) -> Result<(), Box<dyn Error>> {
     // Keep temporary and final files on the same filesystem so persistence stays atomic.
-    let parent = directory.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
     fs::create_dir_all(directory)?;
+    let parent = directory
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let staging_directory = tempdir_in(parent)?;
 
     // Finish serializing both artifacts before exposing either one to inference.
