@@ -27,10 +27,10 @@ pub const INPUTS: usize = 128;
 const OUTPUTS: usize = 128;
 
 // Require a future price to exceed the last observed price by this relative amount.
-const TARGET_INCREASE: f32 = 0.004_f32;
+const TARGET_INCREASE: f32 = 0.002_f32;
 
 // Reject windows where a future price falls this far below the last observed price.
-const MAXIMUM_DECREASE: f32 = 0.004_f32;
+const MAXIMUM_DECREASE: f32 = 0.002_f32;
 
 // Reduce adjacent returns to a compact representation before the learned layers.
 const POOL_SIZE: usize = 4;
