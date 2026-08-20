@@ -1,6 +1,3 @@
-// Allow Rust to evaluate Burn's deeply nested WGPU backend types at compile time.
-#![recursion_limit = "256"]
-
 mod backtest;
 mod historical;
 mod infer;

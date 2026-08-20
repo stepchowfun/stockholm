@@ -1,6 +1,6 @@
 use crate::backtest::{UNRELIABLE_DATA_END_TIME, UNRELIABLE_DATA_START_TIME};
 use burn::{
-    backend::{Autodiff, Wgpu, wgpu::WgpuDevice},
+    backend::{Autodiff, NdArray, ndarray::NdArrayDevice},
     data::{
         dataloader::{DataLoader, DataLoaderBuilder, batcher::Batcher},
         dataset::InMemDataset,
@@ -26,7 +26,7 @@ use time_tz::{OffsetDateTimeExt, timezones::db::america::NEW_YORK};
 pub const INPUTS: usize = 128;
 const OUTPUTS: usize = 128;
 
-// Avoid incorrect Burn 0.21 WGPU matrix multiplication results from larger batches on Metal.
+// Bound memory use and keep optimizer updates frequent enough for this overlapping dataset.
 pub const BATCH_SIZE: usize = 64;
 
 // Require a future price to exceed the last observed price by this relative amount.
@@ -230,9 +230,9 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     let validation_series = load_series(&args.validation_paths)?;
     let data = prepare_data(&training_series, &validation_series, INPUTS, OUTPUTS)?;
 
-    // Use Burn's non-fused WGPU backend on the system's default graphics processor.
-    let device = WgpuDevice::default();
-    train::<Autodiff<Wgpu>>(&device, args, &data)?;
+    // Use Burn's CPU backend for consistent training and inference calculations.
+    let device = NdArrayDevice::Cpu;
+    train::<Autodiff<NdArray>>(&device, args, &data)?;
 
     Ok(())
 }
