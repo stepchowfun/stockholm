@@ -67,7 +67,7 @@ pub struct Args {
     validation_paths: Vec<PathBuf>,
 
     /// Number of examples processed in each optimization step.
-    #[arg(long, default_value_t = 512, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = 64, value_parser = parse_positive_usize)]
     batch_size: usize,
 
     /// Number of complete passes through the training dataset.
@@ -733,7 +733,7 @@ mod tests {
             vec![PathBuf::from("monday.csv"), PathBuf::from("tuesday.csv")],
         );
         assert_eq!(args.validation_paths, vec![PathBuf::from("wednesday.csv")]);
-        assert_eq!(args.batch_size, 512);
+        assert_eq!(args.batch_size, 64);
         assert_eq!(args.epochs, 5);
         assert!((args.learning_rate - 1e-3_f64).abs() < f64::EPSILON);
         assert!((args.dropout - 0.5_f64).abs() < f64::EPSILON);
