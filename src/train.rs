@@ -32,6 +32,9 @@ const TARGET_INCREASE: f32 = 0.002_f32;
 // Reject windows where a future price falls this far below the last observed price.
 const MAXIMUM_DECREASE: f32 = 0.002_f32;
 
+// Highlight precision among predictions confident enough to support selective action.
+const HIGH_CONFIDENCE_PROBABILITY: f32 = 0.8_f32;
+
 // Reduce adjacent returns to a compact representation before the learned layers.
 const POOL_SIZE: usize = 4;
 
@@ -333,7 +336,8 @@ fn train<B: AutodiffBackend>(
         println!(
             concat!(
                 "Epoch {:>2}/{}: train loss {:.4}, accuracy {:.2}%; ",
-                "validation loss {:.4}, accuracy {:.2}%, precision {:.2}%, recall {:.2}%",
+                "validation loss {:.4}, accuracy {:.2}%, precision {:.2}%, recall {:.2}%, ",
+                "precision@0.8 {:.2}%",
             ),
             epoch,
             config.epochs,
@@ -343,6 +347,7 @@ fn train<B: AutodiffBackend>(
             validation.accuracy() * 100.0_f32,
             validation.precision() * 100.0_f32,
             validation.recall() * 100.0_f32,
+            validation.high_confidence_precision() * 100.0_f32,
         );
     }
 
@@ -499,6 +504,8 @@ struct ClassificationMetrics {
     true_positives: usize,
     predicted_positives: usize,
     actual_positives: usize,
+    high_confidence_true_positives: usize,
+    high_confidence_predicted_positives: usize,
 }
 
 impl ClassificationMetrics {
@@ -522,6 +529,15 @@ impl ClassificationMetrics {
         }
         usize_to_f32(self.true_positives) / usize_to_f32(self.actual_positives)
     }
+
+    // Calculate precision among predictions at or above the high-confidence threshold.
+    fn high_confidence_precision(&self) -> f32 {
+        if self.high_confidence_predicted_positives == 0 {
+            return 0.0_f32;
+        }
+        usize_to_f32(self.high_confidence_true_positives)
+            / usize_to_f32(self.high_confidence_predicted_positives)
+    }
 }
 
 // Measure binary loss and thresholded classification quality without autodiff.
@@ -538,7 +554,11 @@ fn validation_metrics<B: Backend>(
         true_positives: 0,
         predicted_positives: 0,
         actual_positives: 0,
+        high_confidence_true_positives: 0,
+        high_confidence_predicted_positives: 0,
     };
+    let high_confidence_logit =
+        (HIGH_CONFIDENCE_PROBABILITY / (1.0_f32 - HIGH_CONFIDENCE_PROBABILITY)).ln();
     for batch in loader.iter() {
         let item_count = batch.targets.dims()[0];
         let predictions = model.forward(batch.inputs);
@@ -553,11 +573,15 @@ fn validation_metrics<B: Backend>(
         // Count classifications directly so the reporting logic remains easy to inspect.
         for (logit, target) in logits.into_iter().zip(targets) {
             let prediction = logit >= 0.0_f32;
+            let high_confidence_prediction = logit >= high_confidence_logit;
             let target = target >= 0.5_f32;
             metrics.correct += usize::from(prediction == target);
             metrics.true_positives += usize::from(prediction && target);
             metrics.predicted_positives += usize::from(prediction);
             metrics.actual_positives += usize::from(target);
+            metrics.high_confidence_true_positives +=
+                usize::from(high_confidence_prediction && target);
+            metrics.high_confidence_predicted_positives += usize::from(high_confidence_prediction);
             metrics.total += 1;
         }
     }
