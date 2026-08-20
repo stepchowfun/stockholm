@@ -19,7 +19,7 @@ use burn::{
 };
 use clap::Args as ClapArgs;
 use std::{error::Error, fs, marker::PhantomData, path::PathBuf, sync::Arc};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, Time};
 use time_tz::{OffsetDateTimeExt, timezones::db::america::NEW_YORK};
 
 // Fix the price history supplied to the model and the future crossing horizon.
@@ -41,6 +41,16 @@ const FIRST_CHANNELS: usize = 8;
 const SECOND_CHANNELS: usize = 16;
 const POOLED_LENGTH: usize = INPUTS / POOL_SIZE;
 const LINEAR_INPUTS: usize = SECOND_CHANNELS * POOLED_LENGTH;
+
+// These Eastern times bound the regular market session used by the model.
+const MARKET_OPEN_TIME: Time = match Time::from_hms(9, 30, 0) {
+    Ok(time) => time,
+    Err(_) => panic!("The market open time must be valid."),
+};
+const MARKET_CLOSE_TIME: Time = match Time::from_hms(16, 0, 0) {
+    Ok(time) => time,
+    Err(_) => panic!("The market close time must be valid."),
+};
 
 // These arguments configure a time-series training run.
 #[derive(ClapArgs)]
@@ -563,16 +573,16 @@ fn usize_to_f32(value: usize) -> f32 {
     value as f32
 }
 
-// Parse the latest contiguous opening-price series after excluding unreliable reports.
+// Parse the latest contiguous market-hours opening-price series after excluding unreliable reports.
 pub fn parse_prices(contents: &str) -> Result<Vec<f32>, Box<dyn Error>> {
     let prices = parse_training_prices(contents)?;
     Ok(prices
         .last()
         .cloned()
-        .ok_or("the CSV file contains no reliable price data")?)
+        .ok_or("the CSV file contains no reliable market-hours price data")?)
 }
 
-// Parse contiguous training-price series after excluding delayed early-morning trade reports.
+// Parse contiguous market-hours series after excluding delayed early-morning trade reports.
 fn parse_training_prices(contents: &str) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
     // Locate required columns by name so their order remains explicit.
     let mut reader = csv::Reader::from_reader(contents.as_bytes());
@@ -601,7 +611,10 @@ fn parse_training_prices(contents: &str) -> Result<Vec<Vec<f32>>, Box<dyn Error>
         let datetime = OffsetDateTime::from_unix_timestamp(timestamp)
             .map_err(|error| format!("invalid timestamp on line {line}: {error}"))?;
         let eastern_time = datetime.to_timezone(NEW_YORK).time();
-        if eastern_time >= UNRELIABLE_DATA_START_TIME && eastern_time < UNRELIABLE_DATA_END_TIME {
+        let unreliable =
+            eastern_time >= UNRELIABLE_DATA_START_TIME && eastern_time < UNRELIABLE_DATA_END_TIME;
+        let outside_market = eastern_time < MARKET_OPEN_TIME || eastern_time >= MARKET_CLOSE_TIME;
+        if unreliable || outside_market {
             continue;
         }
 
@@ -713,9 +726,9 @@ mod tests {
         // Confirm the header and unused historical columns do not alter opening prices.
         let prices = parse_prices(concat!(
             "date,open,high,low,close,volume,wap,count\n",
-            "1,100,900,1,2,3,4,5\n",
-            "2,101.5,800,1,2,3,4,5\n",
-            "3,99,700,1,2,3,4,5\n",
+            "1784035800,100,900,1,2,3,4,5\n",
+            "1784035801,101.5,800,1,2,3,4,5\n",
+            "1784035802,99,700,1,2,3,4,5\n",
         ))
         .unwrap();
 
@@ -724,27 +737,31 @@ mod tests {
 
     #[test]
     fn discard_unreliable_training_prices_across_eastern_time_offsets() {
-        // Filter the shared window, split surrounding prices, and select the latest for inference.
+        // Ignore premarket, unreliable, and closing rows while retaining the regular session.
         for start in [1_784_016_000_i64, 1_767_949_200_i64] {
             let contents = format!(
                 concat!(
                     "date,open\n",
+                    "{},invalid\n",
+                    "{},invalid\n",
+                    "{},invalid\n",
                     "{},99\n",
-                    "{},invalid\n",
-                    "{},invalid\n",
                     "{},100\n",
+                    "{},invalid\n",
                 ),
                 start - 1,
                 start,
                 start + 899,
-                start + 900,
+                start + 19_800,
+                start + 19_801,
+                start + 43_200,
             );
 
             assert_eq!(
                 parse_training_prices(&contents).unwrap(),
-                vec![vec![99.0_f32], vec![100.0_f32]],
+                vec![vec![99.0_f32, 100.0_f32]],
             );
-            assert_eq!(parse_prices(&contents).unwrap(), vec![100.0_f32]);
+            assert_eq!(parse_prices(&contents).unwrap(), vec![99.0_f32, 100.0_f32]);
         }
     }
 
@@ -753,11 +770,11 @@ mod tests {
         // Keep one-second observations together while separating gaps and reversed timestamps.
         let prices = parse_training_prices(concat!(
             "date,open\n",
-            "1784030400,100\n",
-            "1784030401,101\n",
-            "1784030403,102\n",
-            "1784030404,103\n",
-            "1784030402,104\n",
+            "1784035800,100\n",
+            "1784035801,101\n",
+            "1784035803,102\n",
+            "1784035804,103\n",
+            "1784035802,104\n",
         ))
         .unwrap();
 
@@ -774,7 +791,7 @@ mod tests {
     #[test]
     fn reject_nonpositive_prices() {
         // Confirm price parsing rejects values outside the logarithmic return domain.
-        let error = parse_prices("date,open\n1,100\n2,0\n").unwrap_err();
+        let error = parse_prices("date,open\n1784035800,100\n1784035801,0\n").unwrap_err();
 
         assert!(error.to_string().contains("finite and positive"));
     }
