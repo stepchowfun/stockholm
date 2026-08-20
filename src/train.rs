@@ -67,6 +67,7 @@ pub struct Args {
     validation_paths: Vec<PathBuf>,
 
     /// Number of examples processed in each optimization step.
+    // Avoid incorrect Burn 0.21 WGPU matrix multiplication results from larger batches on Metal.
     #[arg(long, default_value_t = 64, value_parser = parse_positive_usize)]
     batch_size: usize,
 

@@ -8,7 +8,7 @@ use burn::{
 use clap::Args as ClapArgs;
 use std::{error::Error, fs, path::PathBuf};
 
-// Keep WGPU matrix multiplication within its reliable batch-size range on Metal.
+// Avoid incorrect Burn 0.21 WGPU matrix multiplication results from larger batches on Metal.
 const BATCH_SIZE: usize = 64;
 
 // These arguments configure inference over a historical price series.
