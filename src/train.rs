@@ -26,6 +26,9 @@ use time_tz::{OffsetDateTimeExt, timezones::db::america::NEW_YORK};
 pub const INPUTS: usize = 128;
 const OUTPUTS: usize = 128;
 
+// Avoid incorrect Burn 0.21 WGPU matrix multiplication results from larger batches on Metal.
+pub const BATCH_SIZE: usize = 64;
+
 // Require a future price to exceed the last observed price by this relative amount.
 const TARGET_INCREASE: f32 = 0.002_f32;
 
@@ -65,11 +68,6 @@ pub struct Args {
     /// CSV files used only to validate the model.
     #[arg(long, required = true, num_args = 1..)]
     validation_paths: Vec<PathBuf>,
-
-    /// Number of examples processed in each optimization step.
-    // Avoid incorrect Burn 0.21 WGPU matrix multiplication results from larger batches on Metal.
-    #[arg(long, default_value_t = 64, value_parser = parse_positive_usize)]
-    batch_size: usize,
 
     /// Number of complete passes through the training dataset.
     #[arg(long, default_value_t = 5, value_parser = parse_positive_usize)]
@@ -162,7 +160,6 @@ pub struct Model<B: Backend> {
 // This configuration records the model, training, and preprocessing settings.
 #[derive(Config, Debug)]
 pub struct ModelConfig {
-    batch_size: usize,
     epochs: usize,
     learning_rate: f64,
     dropout: f64,
@@ -262,7 +259,6 @@ fn train<B: AutodiffBackend>(
 ) -> Result<(), Box<dyn Error>> {
     // Collect every reproducibility setting into the model's saved configuration.
     let config = ModelConfig::new(
-        args.batch_size,
         args.epochs,
         args.learning_rate,
         args.dropout,
@@ -278,17 +274,17 @@ fn train<B: AutodiffBackend>(
 
     // Scan all windows while shuffling only the training order each epoch.
     let training_loader = DataLoaderBuilder::new(SeriesBatcher::<B>::new())
-        .batch_size(config.batch_size)
+        .batch_size(BATCH_SIZE)
         .shuffle(config.seed)
         .num_workers(1)
         .build(InMemDataset::new(data.training.clone()));
     let training_evaluation_loader =
         DataLoaderBuilder::new(SeriesBatcher::<B::InnerBackend>::new())
-            .batch_size(config.batch_size)
+            .batch_size(BATCH_SIZE)
             .num_workers(1)
             .build(InMemDataset::new(data.training.clone()));
     let validation_loader = DataLoaderBuilder::new(SeriesBatcher::<B::InnerBackend>::new())
-        .batch_size(config.batch_size)
+        .batch_size(BATCH_SIZE)
         .num_workers(1)
         .build(InMemDataset::new(data.validation.clone()));
 
@@ -734,7 +730,6 @@ mod tests {
             vec![PathBuf::from("monday.csv"), PathBuf::from("tuesday.csv")],
         );
         assert_eq!(args.validation_paths, vec![PathBuf::from("wednesday.csv")]);
-        assert_eq!(args.batch_size, 64);
         assert_eq!(args.epochs, 5);
         assert!((args.learning_rate - 1e-3_f64).abs() < f64::EPSILON);
         assert!((args.dropout - 0.5_f64).abs() < f64::EPSILON);

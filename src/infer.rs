@@ -1,4 +1,4 @@
-use crate::train::{INPUTS, ModelConfig, log_returns, parse_price_series};
+use crate::train::{BATCH_SIZE, INPUTS, ModelConfig, log_returns, parse_price_series};
 use burn::{
     backend::{Wgpu, wgpu::WgpuDevice},
     module::Module,
@@ -7,9 +7,6 @@ use burn::{
 };
 use clap::Args as ClapArgs;
 use std::{error::Error, fs, path::PathBuf};
-
-// Avoid incorrect Burn 0.21 WGPU matrix multiplication results from larger batches on Metal.
-const BATCH_SIZE: usize = 64;
 
 // These arguments configure inference over a historical price series.
 #[derive(ClapArgs)]
