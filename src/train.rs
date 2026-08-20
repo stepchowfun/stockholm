@@ -1,6 +1,6 @@
 use crate::backtest::{UNRELIABLE_DATA_END_TIME, UNRELIABLE_DATA_START_TIME};
 use burn::{
-    backend::{Autodiff, Wgpu, wgpu::WgpuDevice},
+    backend::{Autodiff, NdArray, ndarray::NdArrayDevice},
     data::{
         dataloader::{DataLoader, DataLoaderBuilder, batcher::Batcher},
         dataset::InMemDataset,
@@ -54,7 +54,7 @@ pub struct Args {
     validation_paths: Vec<PathBuf>,
 
     /// Number of examples processed in each optimization step.
-    #[arg(long, default_value_t = 512, value_parser = parse_positive_usize)]
+    #[arg(long, default_value_t = 64, value_parser = parse_positive_usize)]
     batch_size: usize,
 
     /// Number of complete passes through the training dataset.
@@ -212,9 +212,9 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     let validation_series = load_series(&args.validation_paths)?;
     let data = prepare_data(&training_series, &validation_series, INPUTS, OUTPUTS)?;
 
-    // Use Burn's WGPU backend to train on the system's default graphics processor.
-    let device = WgpuDevice::default();
-    train::<Autodiff<Wgpu>>(&device, args, &data)?;
+    // Use Burn's portable CPU backend for deterministic local training.
+    let device = NdArrayDevice::Cpu;
+    train::<Autodiff<NdArray>>(&device, args, &data)?;
 
     Ok(())
 }
@@ -690,7 +690,7 @@ mod tests {
             vec![PathBuf::from("monday.csv"), PathBuf::from("tuesday.csv")],
         );
         assert_eq!(args.validation_paths, vec![PathBuf::from("wednesday.csv")]);
-        assert_eq!(args.batch_size, 512);
+        assert_eq!(args.batch_size, 64);
         assert_eq!(args.epochs, 5);
         assert!((args.learning_rate - 1e-3_f64).abs() < f64::EPSILON);
         assert!((args.dropout - 0.3_f64).abs() < f64::EPSILON);
