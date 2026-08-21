@@ -52,7 +52,7 @@ Use the `historical` subcommand to fetch historical bars as CSV:
 stockholm historical --start 2026-07-31T13:30:00Z --end 2026-07-31T20:00:00Z --symbol SOXL --interval MIN5
 ```
 
-Use the `train` subcommand to train a forecasting model from separate training and validation datasets, then use `infer` to load the saved model and generate timestamped crossing probabilities. Run either subcommand with `--help` for its data and configuration options.
+Use the `train` subcommand to train a forecasting model from separate training and validation datasets, then use `infer` to load the saved model and generate timestamped probabilities for the lower barrier being reached first, the upper barrier being reached first, or neither barrier being reached. Run either subcommand with `--help` for its data and configuration options.
 
 ```sh
 stockholm train --training-paths monday.csv tuesday.csv --validation-paths wednesday.csv
