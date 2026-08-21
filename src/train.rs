@@ -7,9 +7,8 @@ use burn::{
     },
     module::AutodiffModule,
     nn::{
-        Dropout, DropoutConfig, Linear, LinearConfig, PaddingConfig1d, Relu,
-        conv::{Conv1d, Conv1dConfig},
-        loss::BinaryCrossEntropyLossConfig,
+        Dropout, DropoutConfig, Linear, LinearConfig, Relu,
+        loss::CrossEntropyLossConfig,
         pool::{AvgPool1d, AvgPool1dConfig},
     },
     optim::{AdamConfig, GradientsParams, Optimizer},
@@ -44,15 +43,21 @@ const TARGET_INCREASE: f32 = 0.002_f32;
 // Reject windows where a future price falls this far below the last observed price.
 const MAXIMUM_DECREASE: f32 = 0.002_f32;
 
-// Reduce adjacent returns to a compact representation before the learned layers.
-const POOL_SIZE: usize = 4;
-
-// Configure the temporal convolutions and flattened pooled representation.
-const KERNEL_SIZE: usize = 5;
-const FIRST_CHANNELS: usize = 8;
-const SECOND_CHANNELS: usize = 16;
+// Aggressively reduce adjacent returns before the learned layers.
+const POOL_SIZE: usize = 8;
 const POOLED_LENGTH: usize = INPUTS / POOL_SIZE;
-const LINEAR_INPUTS: usize = SECOND_CHANNELS * POOLED_LENGTH;
+
+// Configure the hidden linear layer.
+const LINEAR_OUTPUTS: usize = 128;
+
+// Assign stable indices to the mutually exclusive future price outcomes.
+pub const OUTCOME_COUNT: usize = 3;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PriceOutcome {
+    LowerFirst = 0,
+    UpperFirst = 1,
+    Neither = 2,
+}
 
 // These Eastern times bound the regular market session used by the model.
 const MARKET_OPEN_TIME: Time = match Time::from_hms(9, 30, 0) {
@@ -100,14 +105,14 @@ pub struct Args {
 #[derive(Clone, Debug)]
 struct SeriesItem {
     inputs: Vec<f32>,
-    target: bool,
+    target: PriceOutcome,
 }
 
 // This batch stores the tensors consumed and predicted by the model.
 #[derive(Clone, Debug)]
 struct SeriesBatch<B: Backend> {
     inputs: Tensor<B, 2>,
-    targets: Tensor<B, 2, Int>,
+    targets: Tensor<B, 1, Int>,
 }
 
 // This batcher converts in-memory windows to backend tensors.
@@ -135,12 +140,10 @@ impl<B: Backend> Batcher<B, SeriesItem, SeriesBatch<B>> for SeriesBatcher<B> {
             .collect();
         let inputs = Tensor::cat(inputs, 0);
 
-        // Convert every crossing label into a single-column target tensor.
+        // Convert every outcome into the class index expected by cross-entropy loss.
         let targets = items
             .iter()
-            .map(|item| {
-                Tensor::<B, 1, Int>::from_ints([i32::from(item.target)], device).unsqueeze()
-            })
+            .map(|item| Tensor::<B, 1, Int>::from_ints([item.target as i32], device))
             .collect();
         let targets = Tensor::cat(targets, 0);
 
@@ -148,18 +151,13 @@ impl<B: Backend> Batcher<B, SeriesItem, SeriesBatch<B>> for SeriesBatcher<B> {
     }
 }
 
-// This model predicts whether a future price will cross the target increase.
+// This model predicts which price barrier will be reached first, if either.
 #[derive(Module, Debug)]
 pub struct Model<B: Backend> {
-    first_convolution: Conv1d<B>,
-    first_dropout: Dropout,
-    second_convolution: Conv1d<B>,
-    second_dropout: Dropout,
-    first_activation: Relu,
     pooling: AvgPool1d,
     first_linear: Linear<B>,
-    third_dropout: Dropout,
-    second_activation: Relu,
+    dropout: Dropout,
+    activation: Relu,
     second_linear: Linear<B>,
 }
 
@@ -178,38 +176,25 @@ impl ModelConfig {
     // Initialize every model layer on the selected device.
     pub fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
         Model {
-            first_convolution: Conv1dConfig::new(1, FIRST_CHANNELS, KERNEL_SIZE)
-                .with_padding(PaddingConfig1d::Same)
-                .init(device),
-            first_dropout: DropoutConfig::new(self.dropout).init(),
-            second_convolution: Conv1dConfig::new(FIRST_CHANNELS, SECOND_CHANNELS, KERNEL_SIZE)
-                .with_padding(PaddingConfig1d::Same)
-                .init(device),
-            second_dropout: DropoutConfig::new(self.dropout).init(),
-            first_activation: Relu::new(),
             pooling: AvgPool1dConfig::new(POOL_SIZE).init(),
-            first_linear: LinearConfig::new(LINEAR_INPUTS, 128).init(device),
-            third_dropout: DropoutConfig::new(self.dropout).init(),
-            second_activation: Relu::new(),
-            second_linear: LinearConfig::new(128, 1).init(device),
+            first_linear: LinearConfig::new(POOLED_LENGTH, LINEAR_OUTPUTS).init(device),
+            dropout: DropoutConfig::new(self.dropout).init(),
+            activation: Relu::new(),
+            second_linear: LinearConfig::new(LINEAR_OUTPUTS, OUTCOME_COUNT).init(device),
         }
     }
 }
 
 impl<B: Backend> Model<B> {
-    // Extract and downsample temporal features before producing the output logit.
+    // Downsample each return window before producing the outcome logits.
     pub fn forward(&self, inputs: Tensor<B, 2>) -> Tensor<B, 2> {
         let values = self
-            .first_dropout
-            .forward(self.first_convolution.forward(inputs.unsqueeze_dim::<3>(1)));
-        let values = self
-            .second_dropout
-            .forward(self.second_convolution.forward(values));
-        let values = self.first_activation.forward(values);
-        let values = self.pooling.forward(values).flatten(1_usize, 2_usize);
+            .pooling
+            .forward(inputs.unsqueeze_dim::<3>(1))
+            .flatten(1_usize, 2_usize);
         let values = self.first_linear.forward(values);
-        let values = self.third_dropout.forward(values);
-        let values = self.second_activation.forward(values);
+        let values = self.dropout.forward(values);
+        let values = self.activation.forward(values);
         self.second_linear.forward(values)
     }
 }
@@ -302,12 +287,21 @@ fn train<B: AutodiffBackend>(
     );
 
     // Establish the classification baseline from the validation label distribution.
-    let positive_count = data.validation.iter().filter(|item| item.target).count();
-    let positive_rate = usize_to_f32(positive_count) / usize_to_f32(data.validation.len());
-    let baseline_accuracy = positive_rate.max(1.0_f32 - positive_rate);
+    let mut class_counts = [0_usize; OUTCOME_COUNT];
+    for item in &data.validation {
+        class_counts[item.target as usize] += 1;
+    }
+    let class_rates =
+        class_counts.map(|count| usize_to_f32(count) / usize_to_f32(data.validation.len()));
+    let baseline_accuracy = class_rates.into_iter().fold(0.0_f32, f32::max);
     println!(
-        "Validation positive rate: {:.2}%, majority baseline accuracy: {:.2}%",
-        positive_rate * 100.0_f32,
+        concat!(
+            "Validation rates: lower first {:.2}%, upper first {:.2}%, neither {:.2}%; ",
+            "majority baseline accuracy: {:.2}%",
+        ),
+        class_rates[PriceOutcome::LowerFirst as usize] * 100.0_f32,
+        class_rates[PriceOutcome::UpperFirst as usize] * 100.0_f32,
+        class_rates[PriceOutcome::Neither as usize] * 100.0_f32,
         baseline_accuracy * 100.0_f32,
     );
 
@@ -315,18 +309,7 @@ fn train<B: AutodiffBackend>(
     let initial_model = model.valid();
     let initial_training = validation_metrics(&initial_model, &training_evaluation_loader);
     let initial_validation = validation_metrics(&initial_model, &validation_loader);
-    println!(
-        concat!(
-            "Initial: train loss {:.4}, accuracy {:.2}%; ",
-            "validation loss {:.4}, accuracy {:.2}%, precision {:.2}%, recall {:.2}%",
-        ),
-        initial_training.loss,
-        initial_training.accuracy() * 100.0_f32,
-        initial_validation.loss,
-        initial_validation.accuracy() * 100.0_f32,
-        initial_validation.precision() * 100.0_f32,
-        initial_validation.recall() * 100.0_f32,
-    );
+    report_metrics("Initial", &initial_training, &initial_validation);
 
     // Retain the requested duration while the saved configuration tracks completed work.
     let requested_epochs = config.epochs;
@@ -342,20 +325,8 @@ fn train<B: AutodiffBackend>(
         let valid_model = model.valid();
         let training = validation_metrics(&valid_model, &training_evaluation_loader);
         let validation = validation_metrics(&valid_model, &validation_loader);
-        println!(
-            concat!(
-                "Epoch {:>2}/{}: train loss {:.4}, accuracy {:.2}%; ",
-                "validation loss {:.4}, accuracy {:.2}%, precision {:.2}%, recall {:.2}%",
-            ),
-            epoch,
-            requested_epochs,
-            training.loss,
-            training.accuracy() * 100.0_f32,
-            validation.loss,
-            validation.accuracy() * 100.0_f32,
-            validation.precision() * 100.0_f32,
-            validation.recall() * 100.0_f32,
-        );
+        let label = format!("Epoch {epoch:>2}/{requested_epochs}");
+        report_metrics(&label, &training, &validation);
 
         // Persist the latest completed epoch so interrupted runs retain usable parameters.
         config.epochs = epoch;
@@ -431,8 +402,7 @@ fn train_epoch<B: AutodiffBackend, O>(
     // Apply one gradient update for every shuffled batch.
     for batch in loader.iter() {
         let predictions = model.forward(batch.inputs);
-        let loss = BinaryCrossEntropyLossConfig::new()
-            .with_logits(true)
+        let loss = CrossEntropyLossConfig::new()
             .init(&model.devices()[0])
             .forward(predictions, batch.targets);
 
@@ -532,14 +502,14 @@ fn windows(
                 .iter()
                 .find_map(|future_price| {
                     if *future_price > upper_target {
-                        Some(true)
+                        Some(PriceOutcome::UpperFirst)
                     } else if *future_price < lower_limit {
-                        Some(false)
+                        Some(PriceOutcome::LowerFirst)
                     } else {
                         None
                     }
                 })
-                .unwrap_or(false);
+                .unwrap_or(PriceOutcome::Neither);
 
             // Normalize only the returns presented to the model, leaving the price label exact.
             let inputs = log_returns(&window[..=inputs])
@@ -552,14 +522,14 @@ fn windows(
         .collect()
 }
 
-// These metrics summarize binary predictions at the conventional 0.5 threshold.
+// These metrics summarize multiclass predictions and each outcome's retrieval quality.
 struct ClassificationMetrics {
     loss: f32,
     correct: usize,
     total: usize,
-    true_positives: usize,
-    predicted_positives: usize,
-    actual_positives: usize,
+    true_positives: [usize; OUTCOME_COUNT],
+    predicted_positives: [usize; OUTCOME_COUNT],
+    actual_positives: [usize; OUTCOME_COUNT],
 }
 
 impl ClassificationMetrics {
@@ -569,23 +539,51 @@ impl ClassificationMetrics {
     }
 
     // Calculate positive predictive value, defining an empty prediction set as zero.
-    fn precision(&self) -> f32 {
-        if self.predicted_positives == 0 {
+    fn precision(&self, outcome: PriceOutcome) -> f32 {
+        let class = outcome as usize;
+        if self.predicted_positives[class] == 0 {
             return 0.0_f32;
         }
-        usize_to_f32(self.true_positives) / usize_to_f32(self.predicted_positives)
+        usize_to_f32(self.true_positives[class]) / usize_to_f32(self.predicted_positives[class])
     }
 
     // Calculate the share of actual positives detected, defining an empty class as zero.
-    fn recall(&self) -> f32 {
-        if self.actual_positives == 0 {
+    fn recall(&self, outcome: PriceOutcome) -> f32 {
+        let class = outcome as usize;
+        if self.actual_positives[class] == 0 {
             return 0.0_f32;
         }
-        usize_to_f32(self.true_positives) / usize_to_f32(self.actual_positives)
+        usize_to_f32(self.true_positives[class]) / usize_to_f32(self.actual_positives[class])
     }
 }
 
-// Measure binary loss and thresholded classification quality without autodiff.
+// Report comparable training and validation metrics at one point in optimization.
+fn report_metrics(
+    label: &str,
+    training: &ClassificationMetrics,
+    validation: &ClassificationMetrics,
+) {
+    println!(
+        concat!(
+            "{}: train loss {:.4}, accuracy {:.2}%; validation loss {:.4}, accuracy {:.2}%; ",
+            "lower precision {:.2}%, recall {:.2}%; upper precision {:.2}%, recall {:.2}%; ",
+            "neither precision {:.2}%, recall {:.2}%",
+        ),
+        label,
+        training.loss,
+        training.accuracy() * 100.0_f32,
+        validation.loss,
+        validation.accuracy() * 100.0_f32,
+        validation.precision(PriceOutcome::LowerFirst) * 100.0_f32,
+        validation.recall(PriceOutcome::LowerFirst) * 100.0_f32,
+        validation.precision(PriceOutcome::UpperFirst) * 100.0_f32,
+        validation.recall(PriceOutcome::UpperFirst) * 100.0_f32,
+        validation.precision(PriceOutcome::Neither) * 100.0_f32,
+        validation.recall(PriceOutcome::Neither) * 100.0_f32,
+    );
+}
+
+// Measure multiclass loss and classification quality without autodiff.
 fn validation_metrics<B: Backend>(
     model: &Model<B>,
     loader: &Arc<dyn DataLoader<B, SeriesBatch<B>>>,
@@ -596,29 +594,33 @@ fn validation_metrics<B: Backend>(
         loss: 0.0_f32,
         correct: 0,
         total: 0,
-        true_positives: 0,
-        predicted_positives: 0,
-        actual_positives: 0,
+        true_positives: [0; OUTCOME_COUNT],
+        predicted_positives: [0; OUTCOME_COUNT],
+        actual_positives: [0; OUTCOME_COUNT],
     };
     for batch in loader.iter() {
         let item_count = batch.targets.dims()[0];
         let predictions = model.forward(batch.inputs);
-        let loss = BinaryCrossEntropyLossConfig::new()
-            .with_logits(true)
+        let loss = CrossEntropyLossConfig::new()
             .init(&model.devices()[0])
             .forward(predictions.clone(), batch.targets.clone());
         total_loss += loss.into_scalar().elem::<f32>() * usize_to_f32(item_count);
         let logits = predictions.into_data().to_vec::<f32>().unwrap();
-        let targets = batch.targets.float().into_data().to_vec::<f32>().unwrap();
+        let targets = batch.targets.into_data().to_vec::<i32>().unwrap();
 
         // Count classifications directly so the reporting logic remains easy to inspect.
-        for (logit, target) in logits.into_iter().zip(targets) {
-            let prediction = logit >= 0.0_f32;
-            let target = target >= 0.5_f32;
+        for (class_logits, target) in logits.chunks_exact(OUTCOME_COUNT).zip(targets) {
+            let prediction = class_logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(class, _)| class)
+                .unwrap();
+            let target = usize::try_from(target).unwrap();
             metrics.correct += usize::from(prediction == target);
-            metrics.true_positives += usize::from(prediction && target);
-            metrics.predicted_positives += usize::from(prediction);
-            metrics.actual_positives += usize::from(target);
+            metrics.true_positives[target] += usize::from(prediction == target);
+            metrics.predicted_positives[prediction] += 1;
+            metrics.actual_positives[target] += 1;
             metrics.total += 1;
         }
     }
@@ -743,7 +745,10 @@ fn parse_dropout(value: &str) -> Result<f64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_dropout, parse_price_series, parse_training_prices, prepare_data, windows};
+    use super::{
+        PriceOutcome, parse_dropout, parse_price_series, parse_training_prices, prepare_data,
+        windows,
+    };
     use crate::{Cli, Subcommand};
     use clap::Parser;
     use std::path::PathBuf;
@@ -877,12 +882,16 @@ mod tests {
 
         assert_eq!(data.training.len(), 95);
         assert_eq!(data.validation.len(), 95);
-        assert!(data.training.iter().all(|item| item.target));
+        assert!(
+            data.training
+                .iter()
+                .all(|item| item.target == PriceOutcome::UpperFirst),
+        );
     }
 
     #[test]
     fn label_future_price_crossings() {
-        // Require the strict 0.5% gain to occur before any strict 0.4% loss.
+        // Distinguish strict upper-first, lower-first, and unresolved future paths.
         let upper_target = 100.0_f32 * (1.0_f32 + super::TARGET_INCREASE);
         let lower_limit = 100.0_f32 * (1.0_f32 - super::MAXIMUM_DECREASE);
         let crossing = windows(
@@ -927,10 +936,10 @@ mod tests {
         );
 
         assert_eq!(crossing[0].inputs.len(), 2);
-        assert!(crossing[0].target);
-        assert!(!no_gain[0].target);
-        assert!(!loss_before_gain[0].target);
-        assert!(loss_after_gain[0].target);
+        assert_eq!(crossing[0].target, PriceOutcome::UpperFirst);
+        assert_eq!(no_gain[0].target, PriceOutcome::Neither);
+        assert_eq!(loss_before_gain[0].target, PriceOutcome::LowerFirst);
+        assert_eq!(loss_after_gain[0].target, PriceOutcome::UpperFirst);
     }
 
     #[test]

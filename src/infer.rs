@@ -1,9 +1,12 @@
-use crate::train::{BATCH_SIZE, INPUTS, ModelConfig, log_returns, parse_price_series};
+use crate::train::{
+    BATCH_SIZE, INPUTS, ModelConfig, OUTCOME_COUNT, log_returns, parse_price_series,
+};
 use burn::{
     backend::{Flex, flex::FlexDevice},
     module::Module,
     prelude::*,
     record::CompactRecorder,
+    tensor::activation::softmax,
 };
 use clap::Args as ClapArgs;
 use std::{error::Error, fs, path::PathBuf};
@@ -61,7 +64,12 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
         fs::create_dir_all(parent)?;
     }
     let mut writer = csv::Writer::from_path(&args.output_path)?;
-    writer.write_record(["timestamp", "probability"])?;
+    writer.write_record([
+        "timestamp",
+        "lower_probability",
+        "upper_probability",
+        "neither_probability",
+    ])?;
 
     // Normalize and evaluate overlapping windows in bounded batches.
     let window_count = prices.len() - INPUTS;
@@ -76,13 +84,20 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
             );
         }
 
-        // Pair each model probability with the timestamp ending its input window.
+        // Pair each outcome distribution with the timestamp ending its input window.
         let inputs = Tensor::<Flex, 1>::from_floats(normalized.as_slice(), &device)
             .reshape([batch_end - batch_start, INPUTS]);
-        let logits = model.forward(inputs).into_data().to_vec::<f32>()?;
-        for (offset, logit) in logits.into_iter().enumerate() {
+        let probabilities = softmax(model.forward(inputs), 1)
+            .into_data()
+            .to_vec::<f32>()?;
+        for (offset, outcomes) in probabilities.chunks_exact(OUTCOME_COUNT).enumerate() {
             let timestamp = series[batch_start + offset + INPUTS].timestamp;
-            writer.write_record([timestamp.to_string(), sigmoid(logit).to_string()])?;
+            writer.write_record([
+                timestamp.to_string(),
+                outcomes[0].to_string(),
+                outcomes[1].to_string(),
+                outcomes[2].to_string(),
+            ])?;
         }
     }
     writer.flush()?;
@@ -93,19 +108,8 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// Convert one raw model logit into a probability without overflowing the exponential.
-fn sigmoid(logit: f32) -> f32 {
-    if logit >= 0.0_f32 {
-        1.0_f32 / (1.0_f32 + (-logit).exp())
-    } else {
-        let exponential = logit.exp();
-        exponential / (1.0_f32 + exponential)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::sigmoid;
     use crate::{Cli, Subcommand};
     use clap::Parser;
     use std::path::PathBuf;
@@ -127,11 +131,5 @@ mod tests {
             args.output_path,
             PathBuf::from("data/inference/inference-output.csv"),
         );
-    }
-
-    #[test]
-    fn convert_neutral_logit() {
-        // Confirm a neutral logit has an even predicted probability.
-        assert!((sigmoid(0.0_f32) - 0.5_f32).abs() < f32::EPSILON);
     }
 }
