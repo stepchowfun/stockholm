@@ -26,7 +26,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tempfile::{NamedTempFile, tempdir_in};
+use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use time::{OffsetDateTime, Time};
 use time_tz::{OffsetDateTimeExt, timezones::db::america::NEW_YORK};
 
@@ -357,16 +357,18 @@ fn save_checkpoint<B: Backend>(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let staging_directory = tempdir_in(parent)?;
+    let staged_config = TempFileBuilder::new()
+        .suffix(".json")
+        .tempfile_in(parent)?
+        .into_temp_path();
+    let staged_model = TempFileBuilder::new()
+        .suffix(".mpk")
+        .tempfile_in(parent)?
+        .into_temp_path();
 
-    // Finish serializing both artifacts before exposing either one to inference.
-    let staged_config = staging_directory.path().join("model.json");
-    let staged_model = staging_directory.path().join("model.mpk");
+    // Finish serializing both temporary files before exposing either one to inference.
     config.save(&staged_config)?;
-    model.save_file(
-        staging_directory.path().join("model"),
-        &CompactRecorder::new(),
-    )?;
+    model.save_file(staged_model.with_extension(""), &CompactRecorder::new())?;
 
     // Replace the model last so an interruption during serialization preserves the prior model.
     persist_file(&staged_config, &directory.join("model.json"))?;
