@@ -265,12 +265,17 @@ async fn stream_account_summary(
                 if summary.currency.is_empty() {
                     debug!(
                         "Account summary for {}: {} = {}",
-                        summary.account, summary.tag, summary.value,
+                        summary.account,
+                        summary.tag,
+                        summary.value,
                     );
                 } else {
                     debug!(
                         "Account summary for {}: {} = {} {}",
-                        summary.account, summary.tag, summary.value, summary.currency,
+                        summary.account,
+                        summary.tag,
+                        summary.value,
+                        summary.currency,
                     );
                 }
             }
@@ -486,7 +491,10 @@ fn format_open_orders(open_orders: &HashMap<i32, VolatileOrder>) -> String {
             };
             format!(
                 "{side} {} @ ${:.2} ({} filled, {} remaining)",
-                order.symbol, order.price, order.filled_shares, order.remaining_shares,
+                order.symbol,
+                order.price,
+                order.filled_shares,
+                order.remaining_shares,
             )
         })
         .collect::<Vec<_>>()
