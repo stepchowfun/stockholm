@@ -609,7 +609,7 @@ fn validation_metrics<B: Backend>(
         let targets = batch.targets.into_data().to_vec::<i32>().unwrap();
 
         // Count classifications directly so the reporting logic remains easy to inspect.
-        for (class_logits, target) in logits.chunks_exact(OUTCOME_COUNT).zip(targets) {
+        for (class_logits, target) in logits.as_chunks::<OUTCOME_COUNT>().0.iter().zip(targets) {
             let prediction = class_logits
                 .iter()
                 .enumerate()

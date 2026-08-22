@@ -90,7 +90,12 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
         let probabilities = softmax(model.forward(inputs), 1)
             .into_data()
             .to_vec::<f32>()?;
-        for (offset, outcomes) in probabilities.chunks_exact(OUTCOME_COUNT).enumerate() {
+        for (offset, outcomes) in probabilities
+            .as_chunks::<OUTCOME_COUNT>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let timestamp = series[batch_start + offset + INPUTS].timestamp;
             writer.write_record([
                 timestamp.to_string(),
