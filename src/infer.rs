@@ -11,6 +11,74 @@ use burn::{
 use clap::Args as ClapArgs;
 use std::{error::Error, fs, path::PathBuf};
 
+// This distribution names the three probabilities emitted by the trained model.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OutcomeProbabilities {
+    pub lower: f32,
+    pub upper: f32,
+    pub neither: f32,
+}
+
+// This predictor retains one loaded model for repeated inference calls.
+pub struct Predictor {
+    model: crate::train::Model<Flex>,
+    config: ModelConfig,
+    device: FlexDevice,
+}
+
+impl Predictor {
+    // Load and validate one saved model and its normalization configuration.
+    pub fn load(model_directory: &std::path::Path) -> Result<Self, Box<dyn Error>> {
+        let config = ModelConfig::load(model_directory.join("model.json"))?;
+        if !config.return_mean.is_finite()
+            || !config.return_deviation.is_finite()
+            || config.return_deviation <= f32::EPSILON
+        {
+            return Err("model configuration contains invalid normalization values".into());
+        }
+
+        // Restore model parameters once so callers can evaluate many rolling windows cheaply.
+        let device = FlexDevice;
+        let model = config.init::<Flex>(&device).load_file(
+            model_directory.join("model"),
+            &CompactRecorder::new(),
+            &device,
+        )?;
+        Ok(Self {
+            model,
+            config,
+            device,
+        })
+    }
+
+    // Predict one outcome distribution from exactly one complete price window.
+    pub fn predict(&self, prices: &[f32]) -> Result<OutcomeProbabilities, Box<dyn Error>> {
+        if prices.len() != INPUTS + 1 {
+            return Err(format!("inference requires exactly {} prices", INPUTS + 1).into());
+        }
+
+        // Normalize returns exactly as they were normalized during training.
+        let normalized = log_returns(prices)
+            .into_iter()
+            .map(|value| (value - self.config.return_mean) / self.config.return_deviation)
+            .collect::<Vec<_>>();
+        let inputs = Tensor::<Flex, 1>::from_floats(normalized.as_slice(), &self.device)
+            .reshape([1, INPUTS]);
+        let values = softmax(self.model.forward(inputs), 1)
+            .into_data()
+            .to_vec::<f32>()?;
+        let [lower, upper, neither] = values.as_slice() else {
+            return Err("the model returned an unexpected number of outcomes".into());
+        };
+
+        Ok(OutcomeProbabilities {
+            lower: *lower,
+            upper: *upper,
+            neither: *neither,
+        })
+    }
+}
+
 // These arguments configure inference over a historical price series.
 #[derive(ClapArgs)]
 pub struct Args {
@@ -30,13 +98,7 @@ pub struct Args {
 // Load a trained model and save a prediction for every complete input window.
 pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     // Load the architecture and normalization values saved by the train subcommand.
-    let config = ModelConfig::load(args.model_directory.join("model.json"))?;
-    if !config.return_mean.is_finite()
-        || !config.return_deviation.is_finite()
-        || config.return_deviation <= f32::EPSILON
-    {
-        return Err("model configuration contains invalid normalization values".into());
-    }
+    let predictor = Predictor::load(&args.model_directory)?;
 
     // Parse the latest reliable series with each price attached to its source timestamp.
     let contents = fs::read_to_string(&args.input_path)
@@ -51,13 +113,8 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
         return Err(format!("inference requires at least {} prices", INPUTS + 1).into());
     }
 
-    // Restore the trained parameters and prepare the output destination.
-    let device = FlexDevice;
-    let model = config.init::<Flex>(&device).load_file(
-        args.model_directory.join("model"),
-        &CompactRecorder::new(),
-        &device,
-    )?;
+    // Prepare the output destination before evaluating every overlapping window.
+    let device = &predictor.device;
     if let Some(parent) = args.output_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -80,14 +137,16 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
             normalized.extend(
                 log_returns(&prices[index..=index + INPUTS])
                     .into_iter()
-                    .map(|value| (value - config.return_mean) / config.return_deviation),
+                    .map(|value| {
+                        (value - predictor.config.return_mean) / predictor.config.return_deviation
+                    }),
             );
         }
 
         // Pair each outcome distribution with the timestamp ending its input window.
-        let inputs = Tensor::<Flex, 1>::from_floats(normalized.as_slice(), &device)
+        let inputs = Tensor::<Flex, 1>::from_floats(normalized.as_slice(), device)
             .reshape([batch_end - batch_start, INPUTS]);
-        let probabilities = softmax(model.forward(inputs), 1)
+        let probabilities = softmax(predictor.model.forward(inputs), 1)
             .into_data()
             .to_vec::<f32>()?;
         for (offset, outcomes) in probabilities

@@ -1,4 +1,10 @@
-use crate::run::{LIQUIDATION_END_TIME, LIQUIDATION_START_TIME};
+use crate::{
+    infer::{OutcomeProbabilities, Predictor},
+    run::{LIQUIDATION_END_TIME, LIQUIDATION_START_TIME},
+    train::{
+        INPUTS, MARKET_CLOSE_TIME, MARKET_OPEN_TIME, MAXIMUM_DECREASE, TARGET_INCREASE,
+    },
+};
 use clap::{Args as ClapArgs, ValueEnum};
 use rayon::prelude::*;
 use std::{error::Error, fs, path::PathBuf, sync::Mutex};
@@ -24,6 +30,7 @@ pub enum Strategy {
     BuyAndHold,
     MarketMaker,
     MarketMakerGrid,
+    Model,
 }
 
 // These arguments configure a backtest run.
@@ -41,7 +48,7 @@ pub struct Args {
     #[arg(long, default_value_t = 1_000_000.0, value_parser = parse_positive_f64)]
     initial_cash: f64,
 
-    /// Maximum total shares filled per bar. Used by both market-maker strategies.
+    /// Maximum total shares filled per bar. Used by market-maker and model strategies.
     #[arg(long, default_value_t = 1_000.0, value_parser = parse_positive_f64)]
     bar_volume_limit: f64,
 
@@ -61,9 +68,17 @@ pub struct Args {
     #[arg(long, default_value_t = 0.25, value_parser = parse_nonnegative_f64)]
     markup_percent: f64,
 
-    /// Share of liquidation value available for buying. Used by market-maker.
+    /// Share of liquidation value available for buying. Used by market-maker and model.
     #[arg(long, default_value_t = 80.0, value_parser = parse_percent)]
     bet_size: f64,
+
+    /// Directory containing the trained model used by the model strategy.
+    #[arg(long, default_value = "model")]
+    model_directory: PathBuf,
+
+    /// Scales model confidence into order size. Used only by the model strategy.
+    #[arg(long, default_value_t = 1.0, value_parser = parse_nonnegative_f64)]
+    order_density: f64,
 
     /// Buy-order lifetimes in elapsed timestamp seconds searched by market-maker-grid.
     #[arg(
@@ -117,6 +132,7 @@ pub struct Args {
 // This bar contains the timestamp and prices needed to simulate order timing and fills.
 struct Bar {
     timestamp: i64,
+    open: f32,
     low: f64,
     high: f64,
     close: f64,
@@ -134,6 +150,35 @@ struct LimitOrder {
     placed_timestamp: i64,
     price: f64,
     remaining_shares: f64,
+}
+
+// This model buy order reserves cash until it fills or the trading day ends.
+struct ModelBuyOrder {
+    placed_timestamp: i64,
+    price: f64,
+    remaining_shares: f64,
+}
+
+// These categories distinguish ordinary exits from dynamically repriced protection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelSellKind {
+    ProfitTarget,
+    StopLoss,
+}
+
+// This model sell order retains the cost basis needed to enforce its stop loss.
+struct ModelSellOrder {
+    placed_timestamp: i64,
+    price: f64,
+    remaining_shares: f64,
+    purchase_price: f64,
+    kind: ModelSellKind,
+}
+
+// This newly filled lot remains unreserved until its first sell order is created.
+struct OwnedLot {
+    shares: f64,
+    purchase_price: f64,
 }
 
 // This logger adds source context to events from one market-maker trading day.
@@ -205,9 +250,257 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
             let result = market_maker_grid(&files, args)?;
             print_grid_result(&result);
         }
+        Strategy::Model => {
+            let result = model_strategy(&files, args)?;
+            print_model_result(&result, args);
+        }
     }
 
     Ok(())
+}
+
+// Backtest confidence-weighted orders produced by one saved model.
+fn model_strategy(
+    files: &[(PathBuf, String)],
+    args: &Args,
+) -> Result<MarketMakerResult, Box<dyn Error>> {
+    // Parse market data and restore the model only once for the complete simulation.
+    let days = parse_days(files)?;
+    let predictor = Predictor::load(&args.model_directory)?;
+    let mut final_value = args.initial_cash;
+    let mut daily_returns = Vec::with_capacity(days.len());
+    for day in &days {
+        let initial_value = final_value;
+        final_value = simulate_model_day(day, initial_value, args, &predictor)?;
+        daily_returns.push(final_value / initial_value - 1.0_f64);
+    }
+
+    Ok(MarketMakerResult {
+        final_value,
+        annualized_sharpe: annualized_sharpe_ratio(&daily_returns)?,
+        daily_returns,
+    })
+}
+
+// Simulate one day of model-driven entries, profit targets, and stop losses.
+fn simulate_model_day(
+    day: &Day,
+    initial_value: f64,
+    args: &Args,
+    predictor: &Predictor,
+) -> Result<f64, Box<dyn Error>> {
+    // Begin each day in cash because the shared liquidation window closes prior inventory.
+    let mut available_cash = initial_value;
+    let mut buy_orders = Vec::<ModelBuyOrder>::new();
+    let mut sell_orders = Vec::<ModelSellOrder>::new();
+    let mut owned_lots = Vec::<OwnedLot>::new();
+    let mut model_prices = Vec::<f32>::new();
+    let mut previous_model_timestamp = None::<i64>;
+    let mut liquidation_shares = 0.0_f64;
+
+    // Fill only previously placed orders before making decisions from the current close.
+    for bar in &day.bars {
+        if bar.liquidate {
+            available_cash += buy_orders
+                .drain(..)
+                .map(|order| order.remaining_shares * order.price)
+                .sum::<f64>();
+            liquidation_shares += sell_orders
+                .drain(..)
+                .map(|order| order.remaining_shares)
+                .sum::<f64>()
+                + owned_lots.drain(..).map(|lot| lot.shares).sum::<f64>();
+            let filled_shares = liquidation_shares.min(args.bar_volume_limit);
+            available_cash += filled_shares * bar.close;
+            liquidation_shares -= filled_shares;
+            continue;
+        }
+
+        // Share the configured fill capacity across model buys and sells on this bar.
+        fill_model_orders(
+            bar,
+            day,
+            args.bar_volume_limit,
+            &mut available_cash,
+            &mut buy_orders,
+            &mut sell_orders,
+            &mut owned_lots,
+        );
+
+        // Reprice breached orders and cover every lot filled during this bar.
+        reconcile_model_sell_orders(bar, &mut sell_orders, &mut owned_lots);
+
+        // Feed only regular-market opening prices to the model, matching its training data.
+        if !is_model_market_hours(bar.timestamp)? {
+            continue;
+        }
+        if previous_model_timestamp.is_none_or(|timestamp| timestamp + 1 != bar.timestamp) {
+            model_prices.clear();
+        }
+        model_prices.push(bar.open);
+        previous_model_timestamp = Some(bar.timestamp);
+        if model_prices.len() < INPUTS + 1 {
+            continue;
+        }
+        let window_start = model_prices.len() - INPUTS - 1;
+        let probabilities = predictor.predict(&model_prices[window_start..])?;
+
+        // Reserve a confidence-weighted portion of currently usable buying power.
+        if probabilities.upper > 0.5_f32 {
+            let reserved_cash = buy_orders
+                .iter()
+                .map(|order| order.remaining_shares * order.price)
+                .sum::<f64>();
+            let reserved_shares = sell_orders
+                .iter()
+                .map(|order| order.remaining_shares)
+                .sum::<f64>();
+            let liquidation_value = available_cash + reserved_cash + reserved_shares * bar.close;
+            let cash_floor = liquidation_value * (1.0_f64 - args.bet_size / 100.0_f64);
+            let cash_available_to_bet = (available_cash - cash_floor).max(0.0_f64);
+            let maximum_shares = (cash_available_to_bet / bar.close).floor();
+            let scale = model_order_scale(probabilities, args.order_density);
+            let shares = (maximum_shares * scale).floor();
+            if shares >= 1.0_f64 {
+                available_cash -= shares * bar.close;
+                buy_orders.push(ModelBuyOrder {
+                    placed_timestamp: bar.timestamp,
+                    price: bar.close,
+                    remaining_shares: shares,
+                });
+            }
+        }
+    }
+
+    // Mark all reserved cash and remaining shares to the final close.
+    let final_price = day
+        .bars
+        .last()
+        .ok_or("a trading day must contain bars")?
+        .close;
+    let reserved_cash = buy_orders
+        .iter()
+        .map(|order| order.remaining_shares * order.price)
+        .sum::<f64>();
+    let reserved_shares = sell_orders
+        .iter()
+        .map(|order| order.remaining_shares)
+        .sum::<f64>()
+        + owned_lots.iter().map(|lot| lot.shares).sum::<f64>()
+        + liquidation_shares;
+    Ok(available_cash + reserved_cash + reserved_shares * final_price)
+}
+
+// Fill previously placed model orders while sharing one bar-volume allowance.
+fn fill_model_orders(
+    bar: &Bar,
+    day: &Day,
+    bar_volume_limit: f64,
+    available_cash: &mut f64,
+    buy_orders: &mut Vec<ModelBuyOrder>,
+    sell_orders: &mut Vec<ModelSellOrder>,
+    owned_lots: &mut Vec<OwnedLot>,
+) {
+    // Fill eligible buys first and retain each partial fill as a cost-basis lot.
+    let mut remaining_bar_volume = bar_volume_limit;
+    for order in &mut *buy_orders {
+        if remaining_bar_volume <= 0.0_f64 {
+            break;
+        }
+        if bar.low <= order.price {
+            let filled_shares = order.remaining_shares.min(remaining_bar_volume);
+            owned_lots.push(OwnedLot {
+                shares: filled_shares,
+                purchase_price: order.price,
+            });
+            order.remaining_shares -= filled_shares;
+            remaining_bar_volume -= filled_shares;
+            info!(
+                "{} @ {}: Executed {} shares of model buy from timestamp {} @ ${:.2}",
+                day.filename,
+                bar.timestamp,
+                filled_shares,
+                order.placed_timestamp,
+                order.price,
+            );
+        }
+    }
+    buy_orders.retain(|order| order.remaining_shares > 0.0_f64);
+
+    // Spend only the remaining allowance on profit-target and stop-loss executions.
+    for order in &mut *sell_orders {
+        if remaining_bar_volume <= 0.0_f64 {
+            break;
+        }
+        if bar.high >= order.price {
+            let filled_shares = order.remaining_shares.min(remaining_bar_volume);
+            *available_cash += filled_shares * order.price;
+            order.remaining_shares -= filled_shares;
+            remaining_bar_volume -= filled_shares;
+            info!(
+                "{} @ {}: Executed {} shares of {:?} sell from timestamp {} @ ${:.2}",
+                day.filename,
+                bar.timestamp,
+                filled_shares,
+                order.kind,
+                order.placed_timestamp,
+                order.price,
+            );
+        }
+    }
+    sell_orders.retain(|order| order.remaining_shares > 0.0_f64);
+}
+
+// Maintain one exit order for every share acquired by the model strategy.
+fn reconcile_model_sell_orders(
+    bar: &Bar,
+    sell_orders: &mut Vec<ModelSellOrder>,
+    owned_lots: &mut Vec<OwnedLot>,
+) {
+    // Convert breached profit targets to stop losses and continuously reprice stopped lots.
+    for order in &mut *sell_orders {
+        let stop_price = order.purchase_price * (1.0_f64 - f64::from(MAXIMUM_DECREASE));
+        if bar.close <= stop_price {
+            order.kind = ModelSellKind::StopLoss;
+        }
+        if order.kind == ModelSellKind::StopLoss {
+            order.placed_timestamp = bar.timestamp;
+            order.price = bar.close;
+        }
+    }
+
+    // Cover every newly filled lot with either its stop loss or a profit-taking order.
+    for lot in owned_lots.drain(..) {
+        let stop_price = lot.purchase_price * (1.0_f64 - f64::from(MAXIMUM_DECREASE));
+        let (kind, price) = if bar.close <= stop_price {
+            (ModelSellKind::StopLoss, bar.close)
+        } else {
+            (
+                ModelSellKind::ProfitTarget,
+                bar.close * (1.0_f64 + f64::from(TARGET_INCREASE)),
+            )
+        };
+        sell_orders.push(ModelSellOrder {
+            placed_timestamp: bar.timestamp,
+            price,
+            remaining_shares: lot.shares,
+            purchase_price: lot.purchase_price,
+            kind,
+        });
+    }
+}
+
+// Scale an upper-outcome probability into the requested fraction of maximum shares.
+fn model_order_scale(probabilities: OutcomeProbabilities, order_density: f64) -> f64 {
+    ((f64::from(probabilities.upper) - 0.5_f64) * 2.0_f64 * order_density).clamp(0.0, 1.0)
+}
+
+// Identify bars whose opening prices belong to the model's regular-market input series.
+fn is_model_market_hours(timestamp: i64) -> Result<bool, Box<dyn Error>> {
+    let eastern_time = OffsetDateTime::from_unix_timestamp(timestamp)?
+        .to_timezone(NEW_YORK)
+        .time();
+    Ok(eastern_time >= MARKET_OPEN_TIME && eastern_time < MARKET_CLOSE_TIME)
 }
 
 // Simulate repeatedly buying below and selling above the current market price.
@@ -621,6 +914,23 @@ fn print_market_maker_result(
     print_config(config);
 }
 
+// Print model-strategy performance and the parameters that governed its orders.
+fn print_model_result(result: &MarketMakerResult, args: &Args) {
+    // Reuse the common performance report before listing model-specific settings.
+    println!("Final account value: {:.2}", result.final_value);
+    print_sharpe_ratio(result.annualized_sharpe);
+    println!("Daily returns:");
+    for (index, daily_return) in result.daily_returns.iter().enumerate() {
+        println!("  Day {}: {:.2}%", index + 1, 100.0_f64 * daily_return);
+    }
+    println!("Configuration:");
+    println!("  Initial cash: {:.2}", args.initial_cash);
+    println!("  Model directory: {}", args.model_directory.display());
+    println!("  Order density: {}", args.order_density);
+    println!("  Bet size: {}%", args.bet_size);
+    println!("  Bar volume limit: {}", args.bar_volume_limit);
+}
+
 // Print both winning grid candidates as a human-readable report.
 fn print_grid_result(result: &GridResult) {
     // Give each optimization criterion its own complete section.
@@ -681,6 +991,7 @@ fn parse_days(files: &[(PathBuf, String)]) -> Result<Vec<Day>, Box<dyn Error>> {
         let mut reader = csv::Reader::from_reader(contents.as_bytes());
         let headers = reader.headers()?;
         let timestamp_index = column_index(headers, path, "date")?;
+        let open_index = headers.iter().position(|header| header == "open");
         let low_index = column_index(headers, path, "low")?;
         let high_index = column_index(headers, path, "high")?;
         let close_index = column_index(headers, path, "close")?;
@@ -699,8 +1010,21 @@ fn parse_days(files: &[(PathBuf, String)]) -> Result<Vec<Day>, Box<dyn Error>> {
             if is_unreliable_early_data(timestamp) {
                 continue;
             }
+            let open = match open_index {
+                Some(open_index) => parse_model_price(
+                    record.get(open_index),
+                    path,
+                    &format!("open on line {line}"),
+                )?,
+                None => parse_model_price(
+                    record.get(close_index),
+                    path,
+                    &format!("close on line {line}"),
+                )?,
+            };
             bars.push(Bar {
                 timestamp: timestamp.unix_timestamp(),
+                open,
                 low: parse_price(record.get(low_index), path, &format!("low on line {line}"))?,
                 high: parse_price(
                     record.get(high_index),
@@ -859,6 +1183,29 @@ fn parse_price(
     Ok(price)
 }
 
+// Parse one model input price directly at the precision used during training.
+fn parse_model_price(
+    value: Option<&str>,
+    path: &std::path::Path,
+    description: &str,
+) -> Result<f32, Box<dyn Error>> {
+    // Apply the same finite-positive validation as the simulation price parser.
+    let value =
+        value.ok_or_else(|| format!("{} is missing its {description} price", path.display()))?;
+    let price = value
+        .parse::<f32>()
+        .map_err(|error| format!("invalid {description} price in {}: {error}", path.display()))?;
+    if !price.is_finite() || price <= 0.0_f32 {
+        return Err(format!(
+            "{description} price in {} must be finite and positive",
+            path.display(),
+        )
+        .into());
+    }
+
+    Ok(price)
+}
+
 // Parse a finite positive floating-point command-line argument.
 fn parse_positive_f64(value: &str) -> Result<f64, String> {
     // Reject values that cannot represent usable starting capital.
@@ -906,11 +1253,12 @@ fn parse_percent(value: &str) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, Bar, Day, MarketMakerConfig, Strategy, TRADING_DAYS_PER_YEAR,
-        annualized_sharpe_ratio, buy_and_hold, is_unreliable_early_data, market_maker,
-        market_maker_grid, parse_days, simulate_market_maker,
+        Args, Bar, Day, MarketMakerConfig, ModelSellKind, OwnedLot, Strategy,
+        TRADING_DAYS_PER_YEAR, annualized_sharpe_ratio, buy_and_hold, is_unreliable_early_data,
+        market_maker, market_maker_grid, model_order_scale, parse_days,
+        reconcile_model_sell_orders, simulate_market_maker,
     };
-    use crate::{Cli, Subcommand};
+    use crate::{Cli, Subcommand, infer::OutcomeProbabilities};
     use clap::Parser;
     use std::path::PathBuf;
     use time::OffsetDateTime;
@@ -943,6 +1291,8 @@ mod tests {
         assert!((args.discount_percent - 0.25).abs() < f64::EPSILON);
         assert!((args.markup_percent - 0.25).abs() < f64::EPSILON);
         assert!((args.bet_size - 80.0).abs() < f64::EPSILON);
+        assert_eq!(args.model_directory, PathBuf::from("model"));
+        assert!((args.order_density - 1.0).abs() < f64::EPSILON);
         assert_eq!(args.buy_ttls.len(), 12);
         assert_eq!(args.buy_ttls.first(), Some(&5));
         assert_eq!(args.buy_ttls.last(), Some(&86_400));
@@ -957,6 +1307,53 @@ mod tests {
         assert_eq!(args.markup_percentages.last(), Some(&10.0_f64));
         assert_eq!(args.bet_sizes, vec![80.0_f64, 90.0_f64, 100.0_f64]);
         assert!((args.bar_volume_limit - 1_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn scale_model_orders_by_confidence_and_density() {
+        // Map probabilities at, above, and far above the threshold into bounded order fractions.
+        let probabilities = |upper| OutcomeProbabilities {
+            lower: 0.0,
+            upper,
+            neither: 0.0,
+        };
+
+        assert!(model_order_scale(probabilities(0.5), 1.0).abs() < f64::EPSILON);
+        assert!((model_order_scale(probabilities(0.75), 1.0) - 0.5_f64).abs() < 1e-12_f64);
+        assert!((model_order_scale(probabilities(0.75), 2.0) - 1.0_f64).abs() < f64::EPSILON);
+        assert!((model_order_scale(probabilities(1.0), 10.0) - 1.0_f64).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn replace_profit_target_with_repriced_stop_loss() {
+        // Give a newly acquired lot an ordinary profit target while it remains above its stop.
+        let mut lots = vec![OwnedLot {
+            shares: 10.0,
+            purchase_price: 100.0,
+        }];
+        let mut orders = Vec::new();
+        let mut bar = Bar {
+            timestamp: 1_000,
+            open: 100.0,
+            low: 100.0,
+            high: 100.0,
+            close: 100.0,
+            liquidate: false,
+        };
+        reconcile_model_sell_orders(&bar, &mut orders, &mut lots);
+        assert_eq!(orders[0].kind, ModelSellKind::ProfitTarget);
+
+        // Cross the lot-specific stop and then follow the market down on the next iteration.
+        bar.timestamp = 1_001;
+        bar.close = 99.0_f64;
+        reconcile_model_sell_orders(&bar, &mut orders, &mut lots);
+        assert_eq!(orders[0].kind, ModelSellKind::StopLoss);
+        assert!((orders[0].price - 99.0_f64).abs() < f64::EPSILON);
+        bar.timestamp = 1_002;
+        bar.close = 98.0_f64;
+        reconcile_model_sell_orders(&bar, &mut orders, &mut lots);
+        assert!((orders[0].price - 98.0_f64).abs() < f64::EPSILON);
+        assert_eq!(orders[0].placed_timestamp, 1_002);
     }
 
     #[test]
@@ -1142,6 +1539,7 @@ mod tests {
         let bars = vec![
             Bar {
                 timestamp: 1_000,
+                open: 100.0,
                 low: 100.0,
                 high: 100.0,
                 close: 100.0,
@@ -1149,6 +1547,7 @@ mod tests {
             },
             Bar {
                 timestamp: 1_001,
+                open: 100.0,
                 low: 99.0,
                 high: 100.0,
                 close: 100.0,
@@ -1156,6 +1555,7 @@ mod tests {
             },
             Bar {
                 timestamp: 1_002,
+                open: 90.0,
                 low: 90.0,
                 high: 90.0,
                 close: 90.0,
@@ -1214,6 +1614,7 @@ mod tests {
         let bars = vec![
             Bar {
                 timestamp: 1_000,
+                open: 100.0,
                 low: 100.0,
                 high: 100.0,
                 close: 100.0,
@@ -1221,6 +1622,7 @@ mod tests {
             },
             Bar {
                 timestamp: 1_001,
+                open: 100.0,
                 low: 99.0,
                 high: 100.0,
                 close: 100.0,
@@ -1228,6 +1630,7 @@ mod tests {
             },
             Bar {
                 timestamp: 1_002,
+                open: 100.0,
                 low: 100.0,
                 high: 101.0,
                 close: 100.0,
@@ -1262,6 +1665,7 @@ mod tests {
         let bars = vec![
             Bar {
                 timestamp: 1_000,
+                open: 100.0,
                 low: 100.0,
                 high: 100.0,
                 close: 100.0,
@@ -1269,6 +1673,7 @@ mod tests {
             },
             Bar {
                 timestamp: 1_001,
+                open: 100.0,
                 low: 99.0,
                 high: 100.0,
                 close: 100.0,
@@ -1276,6 +1681,7 @@ mod tests {
             },
             Bar {
                 timestamp: 1_002,
+                open: 100.0,
                 low: 99.0,
                 high: 100.0,
                 close: 100.0,
@@ -1283,6 +1689,7 @@ mod tests {
             },
             Bar {
                 timestamp: 1_003,
+                open: 100.0,
                 low: 100.0,
                 high: 101.0,
                 close: 100.0,
@@ -1290,6 +1697,7 @@ mod tests {
             },
             Bar {
                 timestamp: 1_004,
+                open: 100.0,
                 low: 99.0,
                 high: 100.0,
                 close: 100.0,
@@ -1297,6 +1705,7 @@ mod tests {
             },
             Bar {
                 timestamp: 1_005,
+                open: 90.0,
                 low: 90.0,
                 high: 90.0,
                 close: 90.0,
@@ -1353,6 +1762,8 @@ mod tests {
             discount_percent: 1.0,
             markup_percent: 1.0,
             bet_size: 100.0,
+            model_directory: PathBuf::from("model"),
+            order_density: 1.0,
             buy_ttls: vec![
                 5, 15, 30, 60, 120, 300, 900, 3_600, 7_200, 14_400, 43_200, 86_400,
             ],

@@ -38,10 +38,10 @@ const OUTPUTS: usize = 128;
 pub const BATCH_SIZE: usize = 64;
 
 // Require a future price to exceed the last observed price by this relative amount.
-const TARGET_INCREASE: f32 = 0.002_f32;
+pub const TARGET_INCREASE: f32 = 0.005_f32;
 
 // Reject windows where a future price falls this far below the last observed price.
-const MAXIMUM_DECREASE: f32 = 0.002_f32;
+pub const MAXIMUM_DECREASE: f32 = 0.005_f32;
 
 // Aggressively reduce adjacent returns before the learned layers.
 const POOL_SIZE: usize = 8;
@@ -60,11 +60,11 @@ enum PriceOutcome {
 }
 
 // These Eastern times bound the regular market session used by the model.
-const MARKET_OPEN_TIME: Time = match Time::from_hms(9, 30, 0) {
+pub const MARKET_OPEN_TIME: Time = match Time::from_hms(9, 30, 0) {
     Ok(time) => time,
     Err(_) => panic!("The market open time must be valid."),
 };
-const MARKET_CLOSE_TIME: Time = match Time::from_hms(16, 0, 0) {
+pub const MARKET_CLOSE_TIME: Time = match Time::from_hms(16, 0, 0) {
     Ok(time) => time,
     Err(_) => panic!("The market close time must be valid."),
 };
