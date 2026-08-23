@@ -1,9 +1,7 @@
 use crate::{
     infer::{OutcomeProbabilities, Predictor},
     run::{LIQUIDATION_END_TIME, LIQUIDATION_START_TIME},
-    train::{
-        INPUTS, MARKET_CLOSE_TIME, MARKET_OPEN_TIME, MAXIMUM_DECREASE, TARGET_INCREASE,
-    },
+    train::{INPUTS, MARKET_CLOSE_TIME, MARKET_OPEN_TIME, MAXIMUM_DECREASE, TARGET_INCREASE},
 };
 use clap::{Args as ClapArgs, ValueEnum};
 use rayon::prelude::*;
