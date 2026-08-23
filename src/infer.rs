@@ -19,11 +19,11 @@ pub struct Args {
     model_directory: PathBuf,
 
     /// CSV file whose latest contiguous series contains at least one input window.
-    #[arg(long, default_value = "data/validation/SOXL-2026-07-22.csv")]
+    #[arg(long, default_value = "historical_data/validation/SOXL-2026-07-22.csv")]
     input_path: PathBuf,
 
     /// CSV file where timestamped prediction probabilities will be saved.
-    #[arg(long, default_value = "data/inference/inference-output.csv")]
+    #[arg(long, default_value = "inference/inference-output.csv")]
     output_path: PathBuf,
 }
 
@@ -130,11 +130,11 @@ mod tests {
         assert_eq!(args.model_directory, PathBuf::from("model"));
         assert_eq!(
             args.input_path,
-            PathBuf::from("data/validation/SOXL-2026-07-22.csv"),
+            PathBuf::from("historical_data/validation/SOXL-2026-07-22.csv"),
         );
         assert_eq!(
             args.output_path,
-            PathBuf::from("data/inference/inference-output.csv"),
+            PathBuf::from("inference/inference-output.csv"),
         );
     }
 }

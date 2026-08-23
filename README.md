@@ -35,9 +35,9 @@ Options:
 You can evaluate the buy-and-hold, market-maker, and market-maker grid-search strategies over historical CSV files with the `backtest` subcommand. Run `stockholm backtest --help` for the available strategy parameters.
 
 ```sh
-stockholm backtest --strategy buy-and-hold --data-paths data/validation/*.csv
-stockholm backtest --strategy market-maker --data-paths data/validation/*.csv
-stockholm backtest --strategy market-maker-grid --data-paths data/training/*.csv
+stockholm backtest --strategy buy-and-hold --data-paths historical_data/validation/*.csv
+stockholm backtest --strategy market-maker --data-paths historical_data/validation/*.csv
+stockholm backtest --strategy market-maker-grid --data-paths historical_data/training/*.csv
 ```
 
 Use the `run` subcommand to trade a symbol with the live strategy:
