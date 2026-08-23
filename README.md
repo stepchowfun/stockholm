@@ -38,6 +38,7 @@ You can evaluate the buy-and-hold, market-maker, and market-maker grid-search st
 stockholm backtest --strategy buy-and-hold --data-paths historical_data/validation/*.csv
 stockholm backtest --strategy market-maker --data-paths historical_data/validation/*.csv
 stockholm backtest --strategy market-maker-grid --data-paths historical_data/training/*.csv
+stockholm backtest --strategy model --data-paths historical_data/validation/*.csv
 ```
 
 Use the `run` subcommand to trade a symbol with the live strategy:
@@ -57,6 +58,13 @@ Use the `train` subcommand to train a forecasting model from separate training a
 ```sh
 stockholm train --training-paths monday.csv tuesday.csv --validation-paths wednesday.csv
 stockholm infer
+```
+
+Generate SVG overlays of the open price and `upper_probability - lower_probability` for every validation file with the plotting script. Pass one or more CSV paths to plot a different selection.
+
+```sh
+./plot-inference.rb
+./plot-inference.rb historical_data/training/SOXL-2026-06-15.csv
 ```
 
 You'll also need to start an Interactive Brokers Gateway that Stockholm can talk to. You can run that in a Docker container via the provided `run-ib-gateway.sh` script:
