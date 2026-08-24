@@ -143,15 +143,8 @@ struct Day {
     bars: Vec<Bar>,
 }
 
-// This order reserves either cash or shares until it fills or expires.
+// This order reserves either cash or shares until its strategy releases it.
 struct LimitOrder {
-    placed_timestamp: i64,
-    price: f64,
-    remaining_shares: f64,
-}
-
-// This model buy order reserves cash until it fills or the trading day ends.
-struct ModelBuyOrder {
     placed_timestamp: i64,
     price: f64,
     remaining_shares: f64,
@@ -289,7 +282,7 @@ fn simulate_model_day(
 ) -> Result<f64, Box<dyn Error>> {
     // Begin each day in cash because the shared liquidation window closes prior inventory.
     let mut available_cash = initial_value;
-    let mut buy_orders = Vec::<ModelBuyOrder>::new();
+    let mut buy_orders = Vec::<LimitOrder>::new();
     let mut sell_orders = Vec::<ModelSellOrder>::new();
     let mut owned_lots = Vec::<OwnedLot>::new();
     let mut model_prices = Vec::<f32>::new();
@@ -361,7 +354,7 @@ fn simulate_model_day(
             let shares = (maximum_shares * scale).floor();
             if shares >= 1.0_f64 {
                 available_cash -= shares * bar.close;
-                buy_orders.push(ModelBuyOrder {
+                buy_orders.push(LimitOrder {
                     placed_timestamp: bar.timestamp,
                     price: bar.close,
                     remaining_shares: shares,
@@ -395,7 +388,7 @@ fn fill_model_orders(
     day: &Day,
     bar_volume_limit: f64,
     available_cash: &mut f64,
-    buy_orders: &mut Vec<ModelBuyOrder>,
+    buy_orders: &mut Vec<LimitOrder>,
     sell_orders: &mut Vec<ModelSellOrder>,
     owned_lots: &mut Vec<OwnedLot>,
 ) {
