@@ -28,7 +28,7 @@ pub enum Strategy {
     BuyAndHold,
     MarketMaker,
     MarketMakerGrid,
-    Model,
+    NeuralNet,
 }
 
 // These arguments configure a backtest run.
@@ -70,11 +70,11 @@ pub struct Args {
     #[arg(long, default_value_t = 80.0, value_parser = parse_percent)]
     bet_size: f64,
 
-    /// Directory containing the trained model used by the model strategy.
+    /// Directory containing the trained model used by the neural-net strategy.
     #[arg(long, default_value = "model")]
     model_directory: PathBuf,
 
-    /// Scales model confidence into order size. Used only by the model strategy.
+    /// Scales model confidence into order size. Used only by the neural-net strategy.
     #[arg(long, default_value_t = 1.0, value_parser = parse_nonnegative_f64)]
     order_density: f64,
 
@@ -248,7 +248,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
             let result = market_maker_grid(&files, args)?;
             print_grid_result(&result);
         }
-        Strategy::Model => {
+        Strategy::NeuralNet => {
             let result = model_strategy(&files, args)?;
             print_model_result(&result, args);
         }
@@ -449,7 +449,7 @@ fn fill_model_orders(
     sell_orders.retain(|order| order.remaining_shares > 0.0_f64);
 }
 
-// Maintain one exit order for every share acquired by the model strategy.
+// Maintain one exit order for every share acquired by the neural-net strategy.
 fn reconcile_model_sell_orders(
     bar: &Bar,
     sell_orders: &mut Vec<ModelSellOrder>,

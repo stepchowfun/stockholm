@@ -38,7 +38,7 @@ You can evaluate the buy-and-hold, market-maker, and market-maker grid-search st
 stockholm backtest --strategy buy-and-hold --data-paths historical_data/validation/*.csv
 stockholm backtest --strategy market-maker --data-paths historical_data/validation/*.csv
 stockholm backtest --strategy market-maker-grid --data-paths historical_data/training/*.csv
-stockholm backtest --strategy model --data-paths historical_data/validation/*.csv
+stockholm backtest --strategy neural-net --data-paths historical_data/validation/*.csv
 ```
 
 Use the `run` subcommand to trade a symbol with the live strategy:
