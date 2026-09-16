@@ -310,6 +310,7 @@ async fn stream_order_updates(
                 update_order_status(runtime_state, status).await?;
             }
             OrderUpdate::OpenOrder(_)
+            | OrderUpdate::OrderBound(_)
             | OrderUpdate::ExecutionData(_)
             | OrderUpdate::CommissionReport(_) => {}
         }

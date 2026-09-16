@@ -19,11 +19,11 @@ rust.warnings = "deny"
 [dependencies]
 burn = { version = "0.21.0", features = ["autodiff", "dataset", "flex"] }
 chrono = "0.4.45"
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 csv = "1.4.0"
-dirs = "6.0.0"
+dirs = "7.0.0"
 env_logger = "0.11.11"
-ibapi = "3.3.0"
+ibapi = "4.1.0"
 log = "0.4.34"
 rayon = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -31,5 +31,5 @@ tempfile = "3.27.0"
 time = { version = "0.3.55", features = ["parsing", "serde"] }
 time-tz = "2.0.0"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
-uuid = { version = "1.26.0", features = ["v4"] }
+uuid = { version = "1.26.1", features = ["v4"] }
 yaml_serde = "0.10.7"
