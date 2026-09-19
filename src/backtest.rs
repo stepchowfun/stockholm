@@ -1040,14 +1040,14 @@ fn parse_days(files: &[(PathBuf, String)]) -> Result<Vec<Day>, Box<dyn Error>> {
             .into());
         }
 
-        days.push(Day {
-            filename: path
-                .file_name()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy()
-                .into_owned(),
-            bars,
-        });
+        let filename = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_str()
+            .ok_or_else(|| format!("{} is not a valid UTF-8 path", path.display()))?
+            .to_owned();
+
+        days.push(Day { filename, bars });
     }
     if days.is_empty() {
         return Err("at least one data file is required".into());
