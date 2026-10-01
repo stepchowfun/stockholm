@@ -1,3 +1,8 @@
+// Burn's `Config` derive generates struct literals with redundant field names, and Clippy 1.99
+// attributes them to the struct's own fields. See:
+//   https://github.com/rust-lang/rust-clippy/issues/17525
+#![allow(clippy::redundant_field_names)]
+
 use crate::backtest::{UNRELIABLE_DATA_END_TIME, UNRELIABLE_DATA_START_TIME};
 use burn::{
     backend::{Autodiff, Flex, flex::FlexDevice},
