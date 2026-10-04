@@ -54,6 +54,7 @@ fn set_up_logging() {
         env!("CARGO_PKG_HOMEPAGE"),
     ),
     version,
+    display_name = "Stockholm",
     disable_version_flag = true
 )]
 struct Cli {
