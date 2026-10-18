@@ -28,7 +28,7 @@ options = {
   output_directory: DEFAULT_OUTPUT_DIRECTORY,
 }
 OptionParser.new do |parser|
-  parser.banner = "Usage: ./plot-inference.rb [options] [CSV ...]"
+  parser.banner = "Usage: ./plot_inference.rb [options] [CSV ...]"
   parser.on("--model-directory PATH", "Model directory (default: model)") do |path|
     options[:model_directory] = File.expand_path(path)
   end
