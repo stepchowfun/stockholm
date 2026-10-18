@@ -63,14 +63,14 @@ stockholm infer
 Generate SVG overlays of the open price and `upper_probability - lower_probability` for every validation file with the plotting script. Pass one or more CSV paths to plot a different selection.
 
 ```sh
-./plot-inference.rb
-./plot-inference.rb historical_data/training/SOXL-2026-06-15.csv
+./plot_inference.rb
+./plot_inference.rb historical_data/training/SOXL-2026-06-15.csv
 ```
 
-You'll also need to start an Interactive Brokers Gateway that Stockholm can talk to. You can run that in a Docker container via the provided `run-ib-gateway.sh` script:
+You'll also need to start an Interactive Brokers Gateway that Stockholm can talk to. You can run that in a Docker container via the provided `run_ib_gateway.sh` script:
 
 ```sh
-./run-ib-gateway.sh
+./run_ib_gateway.sh
 ```
 
 The script expects the Interactive Brokers username to be in a file called `$HOME/ib-username`, and it looks for the password in `$HOME/ib-password`.
@@ -128,7 +128,7 @@ Stockholm depends on IB Gateway, so the repository provides sample service defin
 
 #### Creating launchd services on macOS
 
-On macOS, [launchd](https://www.launchd.info/) can be used to run Stockholm and IB Gateway as daemons. Copy [`local.stockholm.plist`](service_configs/local.stockholm.plist) and [`local.ib-gateway.plist`](service_configs/local.ib-gateway.plist) from the `service_configs` directory to `/Library/LaunchDaemons/`, copy [`run-ib-gateway.sh`](run-ib-gateway.sh) to `/usr/local/bin/`, and make sure all three files are owned by root.
+On macOS, [launchd](https://www.launchd.info/) can be used to run Stockholm and IB Gateway as daemons. Copy [`local.stockholm.plist`](service_configs/local.stockholm.plist) and [`local.ib-gateway.plist`](service_configs/local.ib-gateway.plist) from the `service_configs` directory to `/Library/LaunchDaemons/`, copy [`run_ib_gateway.sh`](run_ib_gateway.sh) to `/usr/local/bin/`, and make sure all three files are owned by root.
 
 Run the following commands to start the services:
 
@@ -141,6 +141,6 @@ You can view the logs with `tail -F /var/log/ib-gateway.log /var/log/stockholm.l
 
 #### Creating systemd services on Linux
 
-On most Linux distributions, [systemd](https://www.freedesktop.org/wiki/Software/systemd/) can be used to run Stockholm and IB Gateway as daemons. Copy [`stockholm.service`](service_configs/stockholm.service) and [`ib-gateway.service`](service_configs/ib-gateway.service) from the `service_configs` directory to `/etc/systemd/system/`, copy [`run-ib-gateway.sh`](run-ib-gateway.sh) to `/usr/local/bin/`, and make sure all three files are owned by root.
+On most Linux distributions, [systemd](https://www.freedesktop.org/wiki/Software/systemd/) can be used to run Stockholm and IB Gateway as daemons. Copy [`stockholm.service`](service_configs/stockholm.service) and [`ib-gateway.service`](service_configs/ib-gateway.service) from the `service_configs` directory to `/etc/systemd/system/`, copy [`run_ib_gateway.sh`](run_ib_gateway.sh) to `/usr/local/bin/`, and make sure all three files are owned by root.
 
 Run `sudo systemctl enable ib-gateway stockholm --now` to enable and start the services. You can view the logs with `sudo journalctl --follow --unit ib-gateway --unit stockholm`.
