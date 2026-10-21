@@ -1,25 +1,16 @@
-// Burn's `Config` derive generates struct literals with redundant field names, and Clippy 1.99
-// attributes them to the struct's own fields. See:
-//   https://github.com/rust-lang/rust-clippy/issues/17525
-#![allow(clippy::redundant_field_names)]
-
 use crate::backtest::{UNRELIABLE_DATA_END_TIME, UNRELIABLE_DATA_START_TIME};
 use burn::{
-    backend::{Autodiff, Flex, flex::FlexDevice},
     data::{
         dataloader::{DataLoader, DataLoaderBuilder, batcher::Batcher},
         dataset::InMemDataset,
     },
-    module::AutodiffModule,
     nn::{
         Dropout, DropoutConfig, Linear, LinearConfig, Relu,
         loss::CrossEntropyLossConfig,
         pool::{AvgPool1d, AvgPool1dConfig},
     },
-    optim::{AdamConfig, GradientsParams, Optimizer},
+    optim::{AdamConfig, GradientsParams, ModuleOptimizer},
     prelude::*,
-    record::CompactRecorder,
-    tensor::backend::AutodiffBackend,
 };
 use chrono::Local;
 use clap::Args as ClapArgs;
@@ -27,7 +18,6 @@ use std::{
     error::Error,
     fs,
     io::{self, Write},
-    marker::PhantomData,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -115,42 +105,31 @@ struct SeriesItem {
 
 // This batch stores the tensors consumed and predicted by the model.
 #[derive(Clone, Debug)]
-struct SeriesBatch<B: Backend> {
-    inputs: Tensor<B, 2>,
-    targets: Tensor<B, 1, Int>,
+struct SeriesBatch {
+    inputs: Tensor<2>,
+    targets: Tensor<1, Int>,
 }
 
-// This batcher converts in-memory windows to backend tensors.
+// This batcher converts in-memory windows to device tensors.
 #[derive(Clone, Debug)]
-struct SeriesBatcher<B: Backend> {
-    backend: PhantomData<B>,
-}
+struct SeriesBatcher;
 
-impl<B: Backend> SeriesBatcher<B> {
-    // Construct a batcher for the selected backend.
-    fn new() -> Self {
-        Self {
-            backend: PhantomData,
-        }
-    }
-}
-
-impl<B: Backend> Batcher<B, SeriesItem, SeriesBatch<B>> for SeriesBatcher<B> {
+impl Batcher<SeriesItem, SeriesBatch> for SeriesBatcher {
     // Stack each window into a two-dimensional batch.
-    fn batch(&self, items: Vec<SeriesItem>, device: &B::Device) -> SeriesBatch<B> {
+    fn batch(&self, items: Vec<SeriesItem>, device: &Device) -> SeriesBatch {
         // Convert every input window before concatenating along the batch dimension.
         let inputs = items
             .iter()
-            .map(|item| Tensor::<B, 1>::from_floats(item.inputs.as_slice(), device).unsqueeze())
+            .map(|item| Tensor::<1>::from_floats(item.inputs.as_slice(), device).unsqueeze())
             .collect();
-        let inputs = Tensor::cat(inputs, 0);
+        let inputs = Tensor::cat(inputs, 0_usize);
 
         // Convert every outcome into the class index expected by cross-entropy loss.
         let targets = items
             .iter()
-            .map(|item| Tensor::<B, 1, Int>::from_ints([item.target as i32], device))
+            .map(|item| Tensor::<1, Int>::from_ints([item.target as i32], device))
             .collect();
-        let targets = Tensor::cat(targets, 0);
+        let targets = Tensor::cat(targets, 0_usize);
 
         SeriesBatch { inputs, targets }
     }
@@ -158,12 +137,12 @@ impl<B: Backend> Batcher<B, SeriesItem, SeriesBatch<B>> for SeriesBatcher<B> {
 
 // This model predicts which price barrier will be reached first, if either.
 #[derive(Module, Debug)]
-pub struct Model<B: Backend> {
+pub struct Model {
     pooling: AvgPool1d,
-    first_linear: Linear<B>,
+    first_linear: Linear,
     dropout: Dropout,
     activation: Relu,
-    second_linear: Linear<B>,
+    second_linear: Linear,
 }
 
 // This configuration records the model, training, and preprocessing settings.
@@ -179,7 +158,7 @@ pub struct ModelConfig {
 
 impl ModelConfig {
     // Initialize every model layer on the selected device.
-    pub fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
+    pub fn init(&self, device: &Device) -> Model {
         Model {
             pooling: AvgPool1dConfig::new(POOL_SIZE).init(),
             first_linear: LinearConfig::new(POOLED_LENGTH, LINEAR_OUTPUTS).init(device),
@@ -190,12 +169,12 @@ impl ModelConfig {
     }
 }
 
-impl<B: Backend> Model<B> {
+impl Model {
     // Downsample each return window before producing the outcome logits.
-    pub fn forward(&self, inputs: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn forward(&self, inputs: Tensor<2>) -> Tensor<2> {
         let values = self
             .pooling
-            .forward(inputs.unsqueeze_dim::<3>(1))
+            .forward(inputs.unsqueeze_dim::<3>(1_usize))
             .flatten(1_usize, 2_usize);
         let values = self.first_linear.forward(values);
         let values = self.dropout.forward(values);
@@ -227,8 +206,8 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     let data = prepare_data(&training_series, &validation_series, INPUTS, OUTPUTS)?;
 
     // Use Burn's CPU backend for consistent training and inference calculations.
-    let device = FlexDevice;
-    train::<Autodiff<Flex>>(&device, args, &data)?;
+    let device = Device::flex();
+    train(&device, args, &data)?;
 
     Ok(())
 }
@@ -248,11 +227,7 @@ fn load_series(paths: &[PathBuf]) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
 }
 
 // Train the model, evaluate it chronologically, and save its artifacts.
-fn train<B: AutodiffBackend>(
-    device: &B::Device,
-    args: &Args,
-    data: &PreparedData,
-) -> Result<(), Box<dyn Error>> {
+fn train(device: &Device, args: &Args, data: &PreparedData) -> Result<(), Box<dyn Error>> {
     // Collect every reproducibility setting into the model's saved configuration.
     let mut config = ModelConfig::new(
         args.epochs,
@@ -263,25 +238,28 @@ fn train<B: AutodiffBackend>(
         data.deviation,
     );
 
-    // Seed Burn and construct the fixed architecture.
-    B::seed(device, config.seed);
-    let mut model = config.init::<B>(device);
-    let mut optimizer = AdamConfig::new().init::<B, Model<B>>();
+    // Seed Burn and construct the fixed architecture on a device that records gradients.
+    device.seed(config.seed);
+    let training_device = device.clone().autodiff();
+    let mut model = config.init(&training_device);
+    let mut optimizer = AdamConfig::new().init();
 
     // Scan all windows while shuffling only the training order each epoch.
-    let training_loader = DataLoaderBuilder::new(SeriesBatcher::<B>::new())
+    let training_loader = DataLoaderBuilder::new(SeriesBatcher)
         .batch_size(BATCH_SIZE)
         .shuffle(config.seed)
         .num_workers(1)
+        .set_device(training_device)
         .build(InMemDataset::new(data.training.clone()));
-    let training_evaluation_loader =
-        DataLoaderBuilder::new(SeriesBatcher::<B::InnerBackend>::new())
-            .batch_size(BATCH_SIZE)
-            .num_workers(1)
-            .build(InMemDataset::new(data.training.clone()));
-    let validation_loader = DataLoaderBuilder::new(SeriesBatcher::<B::InnerBackend>::new())
+    let training_evaluation_loader = DataLoaderBuilder::new(SeriesBatcher)
         .batch_size(BATCH_SIZE)
         .num_workers(1)
+        .set_device(device.clone())
+        .build(InMemDataset::new(data.training.clone()));
+    let validation_loader = DataLoaderBuilder::new(SeriesBatcher)
+        .batch_size(BATCH_SIZE)
+        .num_workers(1)
+        .set_device(device.clone())
         .build(InMemDataset::new(data.validation.clone()));
 
     // Report the dataset sizes before calculating initial reference metrics.
@@ -312,8 +290,8 @@ fn train<B: AutodiffBackend>(
 
     // Report the initialized model's classification quality before optimizer steps.
     let initial_model = model.valid();
-    let initial_training = validation_metrics(&initial_model, &training_evaluation_loader);
-    let initial_validation = validation_metrics(&initial_model, &validation_loader);
+    let initial_training = validation_metrics(&initial_model, &training_evaluation_loader)?;
+    let initial_validation = validation_metrics(&initial_model, &validation_loader)?;
     report_metrics("Initial", &initial_training, &initial_validation);
 
     // Retain the requested duration while the saved configuration tracks completed work.
@@ -324,12 +302,12 @@ fn train<B: AutodiffBackend>(
             &mut optimizer,
             &training_loader,
             config.learning_rate,
-        );
+        )?;
 
         // Evaluate the fully updated model on both splits for comparable epoch metrics.
         let valid_model = model.valid();
-        let training = validation_metrics(&valid_model, &training_evaluation_loader);
-        let validation = validation_metrics(&valid_model, &validation_loader);
+        let training = validation_metrics(&valid_model, &training_evaluation_loader)?;
+        let validation = validation_metrics(&valid_model, &validation_loader)?;
         let label = format!("Epoch {epoch:>2}/{requested_epochs}");
         report_metrics(&label, &training, &validation);
 
@@ -351,8 +329,8 @@ fn train<B: AutodiffBackend>(
 }
 
 // Stage a complete checkpoint before atomically replacing its final files.
-fn save_checkpoint<B: Backend>(
-    model: Model<B>,
+fn save_checkpoint(
+    model: Model,
     config: &ModelConfig,
     directory: &Path,
 ) -> Result<(), Box<dyn Error>> {
@@ -367,17 +345,17 @@ fn save_checkpoint<B: Backend>(
         .tempfile_in(parent)?
         .into_temp_path();
     let staged_model = TempFileBuilder::new()
-        .suffix(".mpk")
+        .suffix(".bpk")
         .tempfile_in(parent)?
         .into_temp_path();
 
     // Finish serializing both temporary files before exposing either one to inference.
     config.save(&staged_config)?;
-    model.save_file(staged_model.with_extension(""), &CompactRecorder::new())?;
+    model.save_file(&staged_model)?;
 
     // Replace the model last so an interruption during serialization preserves the prior model.
     persist_file(&staged_config, &directory.join("model.json"))?;
-    persist_file(&staged_model, &directory.join("model.mpk"))?;
+    persist_file(&staged_model, &directory.join("model.bpk"))?;
 
     Ok(())
 }
@@ -398,16 +376,15 @@ fn persist_file(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>>
 }
 
 // Optimize the model over one complete shuffled pass through the training data.
-fn train_epoch<B: AutodiffBackend, O>(
-    model: &mut Model<B>,
-    optimizer: &mut O,
-    loader: &Arc<dyn DataLoader<B, SeriesBatch<B>>>,
+fn train_epoch(
+    model: &mut Model,
+    optimizer: &mut ModuleOptimizer,
+    loader: &Arc<dyn DataLoader<SeriesBatch>>,
     learning_rate: f64,
-) where
-    O: Optimizer<Model<B>, B>,
-{
+) -> Result<(), Box<dyn Error>> {
     // Apply one gradient update for every shuffled batch.
     for batch in loader.iter() {
+        let batch = batch?;
         let predictions = model.forward(batch.inputs);
         let loss = CrossEntropyLossConfig::new()
             .init(&model.devices()[0])
@@ -417,6 +394,8 @@ fn train_epoch<B: AutodiffBackend, O>(
         let gradients = GradientsParams::from_grads(loss.backward(), model);
         *model = optimizer.step(learning_rate, model.clone(), gradients);
     }
+
+    Ok(())
 }
 
 // Transform and normalize raw prices before windowing every independent series.
@@ -591,10 +570,10 @@ fn report_metrics(
 }
 
 // Measure multiclass loss and classification quality without autodiff.
-fn validation_metrics<B: Backend>(
-    model: &Model<B>,
-    loader: &Arc<dyn DataLoader<B, SeriesBatch<B>>>,
-) -> ClassificationMetrics {
+fn validation_metrics(
+    model: &Model,
+    loader: &Arc<dyn DataLoader<SeriesBatch>>,
+) -> Result<ClassificationMetrics, Box<dyn Error>> {
     // Accumulate sample-weighted loss and confusion counts across ordered windows.
     let mut total_loss = 0.0_f32;
     let mut metrics = ClassificationMetrics {
@@ -606,14 +585,15 @@ fn validation_metrics<B: Backend>(
         actual_positives: [0; OUTCOME_COUNT],
     };
     for batch in loader.iter() {
+        let batch = batch?;
         let item_count = batch.targets.dims()[0];
         let predictions = model.forward(batch.inputs);
         let loss = CrossEntropyLossConfig::new()
             .init(&model.devices()[0])
             .forward(predictions.clone(), batch.targets.clone());
-        total_loss += loss.into_scalar().elem::<f32>() * usize_to_f32(item_count);
-        let logits = predictions.into_data().to_vec::<f32>().unwrap();
-        let targets = batch.targets.into_data().to_vec::<i32>().unwrap();
+        total_loss += loss.into_scalar::<f32>() * usize_to_f32(item_count);
+        let logits = predictions.into_data().try_to_vec::<f32>()?;
+        let targets = batch.targets.into_data().try_to_vec::<i32>()?;
 
         // Count classifications directly so the reporting logic remains easy to inspect.
         for (class_logits, target) in logits.as_chunks::<OUTCOME_COUNT>().0.iter().zip(targets) {
@@ -633,7 +613,7 @@ fn validation_metrics<B: Backend>(
     }
 
     metrics.loss = total_loss / usize_to_f32(metrics.total);
-    metrics
+    Ok(metrics)
 }
 
 // Convert raw prices into successive logarithmic returns.
