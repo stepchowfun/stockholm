@@ -1,13 +1,7 @@
 use crate::train::{
     BATCH_SIZE, INPUTS, ModelConfig, OUTCOME_COUNT, log_returns, parse_price_series,
 };
-use burn::{
-    backend::{Flex, flex::FlexDevice},
-    module::Module,
-    prelude::*,
-    record::CompactRecorder,
-    tensor::activation::softmax,
-};
+use burn::{prelude::*, tensor::activation::softmax};
 use clap::Args as ClapArgs;
 use std::{error::Error, fs, path::PathBuf};
 
@@ -21,9 +15,9 @@ pub struct OutcomeProbabilities {
 
 // This predictor retains one loaded model for repeated inference calls.
 pub struct Predictor {
-    model: crate::train::Model<Flex>,
+    model: crate::train::Model,
     config: ModelConfig,
-    device: FlexDevice,
+    device: Device,
 }
 
 impl Predictor {
@@ -38,12 +32,10 @@ impl Predictor {
         }
 
         // Restore model parameters once so callers can evaluate many rolling windows cheaply.
-        let device = FlexDevice;
-        let model = config.init::<Flex>(&device).load_file(
-            model_directory.join("model"),
-            &CompactRecorder::new(),
-            &device,
-        )?;
+        let device = Device::flex();
+        let model = config
+            .init(&device)
+            .try_load_file(model_directory.join("model.bpk"))?;
         Ok(Self {
             model,
             config,
@@ -62,11 +54,11 @@ impl Predictor {
             .into_iter()
             .map(|value| (value - self.config.return_mean) / self.config.return_deviation)
             .collect::<Vec<_>>();
-        let inputs = Tensor::<Flex, 1>::from_floats(normalized.as_slice(), &self.device)
-            .reshape([1, INPUTS]);
-        let values = softmax(self.model.forward(inputs), 1)
+        let inputs =
+            Tensor::<1>::from_floats(normalized.as_slice(), &self.device).reshape([1, INPUTS]);
+        let values = softmax(self.model.forward(inputs), 1_usize)
             .into_data()
-            .to_vec::<f32>()?;
+            .try_to_vec::<f32>()?;
         let [lower, upper, neither] = values.as_slice() else {
             return Err("the model returned an unexpected number of outcomes".into());
         };
@@ -144,11 +136,11 @@ pub fn run(args: &Args) -> Result<(), Box<dyn Error>> {
         }
 
         // Pair each outcome distribution with the timestamp ending its input window.
-        let inputs = Tensor::<Flex, 1>::from_floats(normalized.as_slice(), device)
+        let inputs = Tensor::<1>::from_floats(normalized.as_slice(), device)
             .reshape([batch_end - batch_start, INPUTS]);
-        let probabilities = softmax(predictor.model.forward(inputs), 1)
+        let probabilities = softmax(predictor.model.forward(inputs), 1_usize)
             .into_data()
-            .to_vec::<f32>()?;
+            .try_to_vec::<f32>()?;
         for (offset, outcomes) in probabilities
             .as_chunks::<OUTCOME_COUNT>()
             .0
