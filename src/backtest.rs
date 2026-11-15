@@ -409,7 +409,11 @@ fn fill_model_orders(
             remaining_bar_volume -= filled_shares;
             info!(
                 "{} @ {}: Executed {} shares of model buy from timestamp {} @ ${:.2}",
-                day.filename, bar.timestamp, filled_shares, order.placed_timestamp, order.price,
+                day.filename,
+                bar.timestamp,
+                filled_shares,
+                order.placed_timestamp,
+                order.price,
             );
         }
     }
@@ -820,7 +824,10 @@ impl MarketMakerLogger<'_> {
                     "{} @ {}: Executed liquidation sell for {} shares ",
                     "@ ${:.2}",
                 ),
-                filename, timestamp, shares, price,
+                filename,
+                timestamp,
+                shares,
+                price,
             );
         }
     }
