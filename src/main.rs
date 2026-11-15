@@ -5,9 +5,6 @@ mod run;
 mod state;
 mod train;
 
-#[macro_use]
-extern crate log;
-
 use chrono::Local;
 use clap::{ArgAction, Parser, Subcommand as ClapSubcommand};
 use env_logger::{Builder, fmt::style::Effects};

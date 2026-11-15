@@ -625,7 +625,7 @@ pub fn log_returns(prices: &[f32]) -> Vec<f32> {
 }
 
 // Convert collection sizes for floating-point averages where minor rounding is acceptable.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn usize_to_f32(value: usize) -> f32 {
     value as f32
 }
