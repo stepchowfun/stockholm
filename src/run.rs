@@ -8,6 +8,7 @@ use ibapi::{
     orders::{Action, OrderData, OrderStatus, OrderUpdate, Orders},
     prelude::{StreamExt, Subscription, SubscriptionItemStreamExt},
 };
+use log::{debug, error, info, warn};
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
@@ -105,7 +106,6 @@ struct RuntimeState {
 }
 
 // These connection-local details describe one open Stockholm order.
-#[allow(dead_code)]
 struct VolatileOrder {
     // The stable Stockholm-generated reference attached to the order.
     order_ref: String,

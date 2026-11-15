@@ -4,6 +4,7 @@ use crate::{
     train::{INPUTS, MARKET_CLOSE_TIME, MARKET_OPEN_TIME, MAXIMUM_DECREASE, TARGET_INCREASE},
 };
 use clap::{Args as ClapArgs, ValueEnum};
+use log::info;
 use rayon::prelude::*;
 use std::{error::Error, fs, path::PathBuf, sync::Mutex};
 use time::{OffsetDateTime, Time};
