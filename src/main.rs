@@ -51,7 +51,7 @@ fn set_up_logging() {
         env!("CARGO_PKG_DESCRIPTION"),
         "\n\n",
         "More information can be found at: ",
-        env!("CARGO_PKG_HOMEPAGE"),
+        env!("CARGO_PKG_REPOSITORY"),
     ),
     version,
     display_name = "Stockholm",

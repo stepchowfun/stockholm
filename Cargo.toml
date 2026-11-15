@@ -6,7 +6,6 @@ edition = "2024"
 description = "A laboratory for algorithmic trading."
 license = "MIT"
 documentation = "https://github.com/stepchowfun/stockholm"
-homepage = "https://github.com/stepchowfun/stockholm"
 repository = "https://github.com/stepchowfun/stockholm"
 readme = "README.md"
 
