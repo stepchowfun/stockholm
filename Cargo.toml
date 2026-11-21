@@ -1,19 +1,12 @@
 [package]
 name = "stockholm"
 version = "0.2.50"
-authors = ["Stephan Boyer <stephan@stephanboyer.com>"]
 edition = "2024"
 description = "A laboratory for algorithmic trading."
-license = "MIT"
 documentation = "https://github.com/stepchowfun/stockholm"
-repository = "https://github.com/stepchowfun/stockholm"
 readme = "README.md"
-
-[lints]
-clippy.all = { level = "deny", priority = -1 }
-clippy.default_numeric_fallback = "deny"
-clippy.pedantic = { level = "deny", priority = -1 }
-rust.warnings = "deny"
+repository = "https://github.com/stepchowfun/stockholm"
+license = "MIT"
 
 [dependencies]
 burn = { version = "0.22.1", features = ["autodiff", "dataset", "flex"] }
@@ -32,3 +25,9 @@ time-tz = "2.0.0"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1.29.3", features = ["v4"] }
 yaml_serde = "0.10.7"
+
+[lints]
+clippy.all = { level = "deny", priority = -1 }
+clippy.default_numeric_fallback = "deny"
+clippy.pedantic = { level = "deny", priority = -1 }
+rust.warnings = "deny"
