@@ -440,7 +440,7 @@ async fn run_control_step(
     buying_power_buffer: f64,
     initial_margin_requirement: f64,
 ) -> Result<(), Box<dyn Error>> {
-    // Select order lifetimes and trading behavior from the current Eastern time.
+    // Request cancellations for the current session before sizing new orders.
     let liquidating = is_liquidating(OffsetDateTime::now_utc());
     cancel_expired_orders(client, runtime_state, contract, strategy, liquidating).await?;
 
@@ -510,7 +510,7 @@ fn market_maker_snapshot(
         )
     });
 
-    // Reserve working sells and offer only whole shares through the broker.
+    // Exclude shares committed to working sells and round down to whole shares.
     let reserved_sell_shares = calculate_open_sell_shares(&state.open_orders, contract);
     let sellable_shares = state
         .position_shares
@@ -551,7 +551,7 @@ fn format_open_orders(open_orders: &HashMap<i32, VolatileOrder>) -> String {
     format!("[{open_orders}]")
 }
 
-// Cancel expired orders whose most recent cancellation attempt is old enough to retry.
+// Request cancellations allowed by the strategy and the retry delay.
 async fn cancel_expired_orders(
     client: &Client,
     runtime_state: &RwLock<RuntimeState>,
@@ -1190,7 +1190,7 @@ mod tests {
             Some((10.29_f64, 4.0_f64)),
         );
 
-        // Keep the same inventory but quote directly at the ask during liquidation.
+        // During liquidation, offer the same inventory at the ask rounded up to cents.
         let snapshot = market_maker_snapshot(&state, &contract, 20.0_f64, 75.0_f64);
         let placements = LIVE_CONFIG.orders(&snapshot, true);
         assert!(placements.buy.is_none());
@@ -1218,7 +1218,7 @@ mod tests {
             live
         };
 
-        // Start with no reservations and use the close as both sides of the recorded quote.
+        // Start with no reservations and set both live quote prices to the bar close.
         let mut state = initial_volatile_state();
         state.bid_price = Some(close);
         state.ask_price = Some(close);
@@ -1264,7 +1264,7 @@ mod tests {
             Some(3.0_f64),
         );
 
-        // Flatten only the unreserved inventory once the strategy enters liquidation.
+        // Request a sell for the unreserved shares during liquidation.
         let liquidating = placements(&state, 913.33_f64, 3.0_f64, true);
         assert!(liquidating.buy.is_none());
         assert_eq!(

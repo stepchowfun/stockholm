@@ -45,7 +45,7 @@ pub struct Order {
     pub shares: f64,
 }
 
-// A decision may place one order on each side independently.
+// A decision may request one buy and one sell independently.
 #[derive(Debug, PartialEq)]
 pub struct Placements {
     pub buy: Option<Order>,
@@ -90,7 +90,7 @@ impl Config {
 
     // Price and size new orders using only the snapshot at the current decision.
     pub fn orders(&self, snapshot: &Snapshot, liquidating: bool) -> Placements {
-        // Spend the available buying power on whole shares before the liquidation window.
+        // Size discounted whole-share buys outside the liquidation window.
         let buy = snapshot
             .bid_price
             .zip(snapshot.buying_power)
@@ -127,7 +127,7 @@ impl Config {
         Placements { buy, sell: offer }
     }
 
-    // Decide when to release or request cancellation of an already working order.
+    // Decide whether a working order is eligible for cancellation.
     pub fn should_cancel(&self, side: Side, age: Duration, liquidating: bool) -> bool {
         // Select the normal lifetime for this side before applying any liquidation rules.
         let lifetime = match side {
@@ -135,7 +135,7 @@ impl Config {
             Side::Sell => self.sell_ttl,
         };
 
-        // Replay cancels every order during liquidation. Live lets sells rest briefly.
+        // The at-lifetime preset gives liquidation sells a separate lifetime.
         match self.expiry {
             Expiry::AfterLifetime => liquidating || age > lifetime,
             Expiry::AtLifetime {
@@ -184,12 +184,12 @@ mod tests {
 
     #[test]
     fn preserve_liquidation_cancellation_rules() {
-        // Live cancels buys immediately and allows sells to rest for one minute.
+        // The live preset requests immediate buy cancellation and gives sells one minute.
         assert!(LIVE_CONFIG.should_cancel(Side::Buy, Duration::ZERO, true));
         assert!(!LIVE_CONFIG.should_cancel(Side::Sell, Duration::seconds(59), true));
         assert!(LIVE_CONFIG.should_cancel(Side::Sell, Duration::MINUTE, true));
 
-        // Replay releases the full reservation for both sides on entering liquidation.
+        // The replay preset requests cancellation on both sides during liquidation.
         let replay = Config::backtest(0.25_f64, 0.25_f64, Duration::HOUR, Duration::hours(4));
         assert!(replay.should_cancel(Side::Buy, Duration::ZERO, true));
         assert!(replay.should_cancel(Side::Sell, Duration::ZERO, true));

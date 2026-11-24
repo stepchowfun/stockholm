@@ -660,9 +660,9 @@ fn simulate_market_maker_day(
     let mut buy_orders = Vec::<LimitOrder>::new();
     let mut sell_orders = Vec::<LimitOrder>::new();
 
-    // Cancel, fill, and replace orders once for every chronological bar.
+    // Apply cancellations and fills before placing new orders on each bar.
     for bar in bars {
-        // Return the resources that the strategy releases before processing this bar.
+        // Release reservations for orders the strategy marks for cancellation.
         expire_market_maker_orders(
             bar.timestamp,
             strategy,
@@ -718,7 +718,7 @@ fn simulate_market_maker_day(
         }
         sell_orders.retain(|order| order.remaining_shares > 0.0_f64);
 
-        // Keep the configured share of liquidation value available for buying.
+        // Size new buys using only cash above the configured floor.
         let reserved_cash = buy_orders
             .iter()
             .map(|order| order.remaining_shares * order.price)
@@ -729,7 +729,7 @@ fn simulate_market_maker_day(
         let cash_floor = liquidation_value * (1.0_f64 - config.bet_size / 100.0_f64);
         let cash_available_to_bet = (available_cash - cash_floor).max(0.0_f64);
 
-        // Reserve resources for the strategy's orders after the bar's fills are complete.
+        // Use the completed bar to plan new orders and reserve cash for the buy.
         let snapshot = market_maker_snapshot(bar.close, cash_available_to_bet, available_shares);
         let placements = strategy.orders(&snapshot, false);
         if let Some(buy) = placements.buy {
@@ -741,7 +741,7 @@ fn simulate_market_maker_day(
             });
         }
 
-        // Reserve every available share for one marked-up sell order.
+        // Reserve shares for the strategy's sell order.
         if let Some(sell) = placements.sell {
             sell_orders.push(LimitOrder {
                 placed_timestamp: bar.timestamp,
@@ -752,7 +752,7 @@ fn simulate_market_maker_day(
         }
     }
 
-    // Mark reserved cash and all held shares to the final close.
+    // Include reserved cash and value all held shares at the final close.
     let final_price = bars.last().unwrap().close;
     let reserved_cash = buy_orders
         .iter()
@@ -772,7 +772,7 @@ pub fn market_maker_snapshot(close: f64, buying_power: f64, sellable_shares: f64
     }
 }
 
-// Cancel expired orders and return their reserved resources to the portfolio.
+// Apply the strategy's cancellations and release reserved cash and shares.
 fn expire_market_maker_orders(
     timestamp: i64,
     strategy: &Config,
@@ -796,7 +796,7 @@ fn expire_market_maker_orders(
         .extract_if(.., |order| should_cancel(Side::Sell, order))
         .map(|order| order.remaining_shares);
 
-    // Preserve the different floating-point addition order used during liquidation.
+    // Sum liquidation refunds before crediting balances to preserve historical rounding.
     if liquidating {
         *available_cash += cash_refunds.sum::<f64>();
         *available_shares += share_refunds.sum::<f64>();
