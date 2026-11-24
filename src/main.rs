@@ -1,6 +1,7 @@
 mod backtest;
 mod historical;
 mod infer;
+mod market_maker;
 mod run;
 mod state;
 mod train;

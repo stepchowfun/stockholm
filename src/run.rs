@@ -1,4 +1,8 @@
-use crate::{DEFAULT_SYMBOL, state};
+use crate::{
+    DEFAULT_SYMBOL,
+    market_maker::{Config, LIVE_CONFIG, Side, Snapshot, is_liquidating, round_down_to_cent},
+    state,
+};
 use clap::Args as ClapArgs;
 use ibapi::{
     Client,
@@ -14,8 +18,7 @@ use std::{
     error::Error,
     io,
 };
-use time::{Duration, OffsetDateTime, Time};
-use time_tz::{OffsetDateTimeExt, timezones::db::america::NEW_YORK};
+use time::{Duration, OffsetDateTime};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -25,25 +28,10 @@ const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 const CONTRACT_DETAILS_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 const DEFAULT_BUYING_POWER_BUFFER: f64 = 20.0_f64;
 const DEFAULT_INITIAL_MARGIN_REQUIREMENT: f64 = 75.0_f64;
-const BUY_DISCOUNT_PERCENT: f64 = 1.0_f64;
-const SELL_MARKUP_PERCENT: f64 = 0.5_f64;
-const BUY_ORDER_TTL: Duration = Duration::seconds(5);
-const SELL_ORDER_TTL: Duration = Duration::seconds(120);
-const LIQUIDATION_SELL_ORDER_TTL: Duration = Duration::minutes(1);
 const QUOTE_MAX_AGE: Duration = Duration::minutes(5);
 const CANCEL_RETRY_DELAY: Duration = Duration::seconds(10);
 const ORDER_REF_PREFIX: &str = "stockholm:";
 const SMART_EXCHANGE: &str = "SMART";
-
-// These Eastern times bound the daily liquidation window.
-pub const LIQUIDATION_START_TIME: Time = match Time::from_hms(15, 45, 0) {
-    Ok(time) => time,
-    Err(_) => panic!("The liquidation start time must be valid."),
-};
-pub const LIQUIDATION_END_TIME: Time = match Time::from_hms(20, 5, 0) {
-    Ok(time) => time,
-    Err(_) => panic!("The liquidation end time must be valid."),
-};
 
 // These arguments configure the trading bot.
 #[derive(ClapArgs)]
@@ -124,13 +112,6 @@ struct VolatileOrder {
 
     // The number of shares still awaiting execution.
     remaining_shares: f64,
-}
-
-// This direction distinguishes buy orders from sell orders.
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Side {
-    Buy,
-    Sell,
 }
 
 // Supply the same defaults when the run subcommand is omitted.
@@ -284,6 +265,7 @@ async fn control_loop(
             client,
             runtime_state,
             contract,
+            &LIVE_CONFIG,
             buying_power_buffer,
             initial_margin_requirement,
         )
@@ -454,35 +436,24 @@ async fn run_control_step(
     client: &Client,
     runtime_state: &RwLock<RuntimeState>,
     contract: &Contract,
+    strategy: &Config,
     buying_power_buffer: f64,
     initial_margin_requirement: f64,
 ) -> Result<(), Box<dyn Error>> {
     // Select order lifetimes and trading behavior from the current Eastern time.
-    let liquidating = is_liquidating();
-    cancel_expired_orders(client, runtime_state, contract, liquidating).await?;
+    let liquidating = is_liquidating(OffsetDateTime::now_utc());
+    cancel_expired_orders(client, runtime_state, contract, strategy, liquidating).await?;
 
     // Snapshot resources and quotes without retaining the state lock across submissions.
-    let (buying_power, bid_price, ask_price, sellable_shares) = {
+    let snapshot = {
         let state = runtime_state.read().await;
         let state = &state.volatile;
-        let open_buy_order_value = calculate_open_buy_order_value(&state.open_orders);
-        let buying_power =
-            state
-                .equity_with_loan_value
-                .zip(state.init_margin_req)
-                .map(|(equity, margin)| {
-                    calculate_buying_power(
-                        equity,
-                        margin,
-                        buying_power_buffer,
-                        initial_margin_requirement,
-                        open_buy_order_value,
-                    )
-                });
-        let reserved_sell_shares = calculate_open_sell_shares(&state.open_orders, contract);
-        let sellable_shares = state
-            .position_shares
-            .map(|shares| (shares - reserved_sell_shares).max(0.0_f64).floor());
+        let snapshot = market_maker_snapshot(
+            state,
+            contract,
+            buying_power_buffer,
+            initial_margin_requirement,
+        );
         let open_orders = format_open_orders(&state.open_orders);
         info!(
             concat!(
@@ -492,7 +463,9 @@ async fn run_control_step(
             state
                 .equity_with_loan_value
                 .map_or_else(|| "unavailable".to_string(), |equity| equity.to_string()),
-            buying_power.map_or_else(|| "unavailable".to_string(), |power| power.to_string()),
+            snapshot
+                .buying_power
+                .map_or_else(|| "unavailable".to_string(), |power| power.to_string()),
             open_orders,
             state
                 .bid_price
@@ -502,36 +475,52 @@ async fn run_control_step(
                 .map_or_else(|| "unavailable".to_string(), |price| price.to_string()),
             liquidating,
         );
-        (
-            buying_power,
-            state.bid_price,
-            state.ask_price,
-            sellable_shares,
-        )
+        snapshot
     };
 
-    // Choose ordinary market-making limits or a liquidation limit at the ask.
-    let (buy_limit, sell_limit) = calculate_order_limits(bid_price, ask_price, liquidating);
-
-    // Use all available buying power for one whole-share discounted limit order.
-    if let (Some(buying_power), Some(limit)) = (buying_power, buy_limit)
-        && limit > 0.0_f64
-    {
-        let shares = (buying_power / limit).floor();
-        if shares >= 1.0_f64 {
-            place_limit_buy(client, contract, shares, limit, runtime_state).await?;
-        }
+    // Submit the strategy's instructions in buy-then-sell order.
+    let placements = strategy.orders(&snapshot, liquidating);
+    if let Some(buy) = placements.buy {
+        place_limit_buy(client, contract, buy.shares, buy.price, runtime_state).await?;
     }
-
-    // Offer shares only after the initial position snapshot establishes inventory.
-    if let (Some(limit), Some(sellable_shares)) = (sell_limit, sellable_shares)
-        && limit > 0.0_f64
-        && sellable_shares > 0.0_f64
-    {
-        place_limit_sell(client, contract, sellable_shares, limit, runtime_state).await?;
+    if let Some(sell) = placements.sell {
+        place_limit_sell(client, contract, sell.shares, sell.price, runtime_state).await?;
     }
 
     Ok(())
+}
+
+// Normalize broker quotes and net resources into the strategy's decision inputs.
+fn market_maker_snapshot(
+    state: &VolatileState,
+    contract: &Contract,
+    buying_power_buffer: f64,
+    initial_margin_requirement: f64,
+) -> Snapshot {
+    // Compute usable buying power after reserving margin for working buy orders.
+    let open_buy_order_value = calculate_open_buy_order_value(&state.open_orders);
+    let account = state.equity_with_loan_value.zip(state.init_margin_req);
+    let buying_power = account.map(|(equity, margin)| {
+        calculate_buying_power(
+            equity,
+            margin,
+            buying_power_buffer,
+            initial_margin_requirement,
+            open_buy_order_value,
+        )
+    });
+
+    // Reserve working sells and offer only whole shares through the broker.
+    let reserved_sell_shares = calculate_open_sell_shares(&state.open_orders, contract);
+    let sellable_shares = state
+        .position_shares
+        .map(|shares| (shares - reserved_sell_shares).max(0.0_f64).floor());
+    Snapshot {
+        bid_price: state.bid_price,
+        ask_price: state.ask_price,
+        buying_power,
+        sellable_shares,
+    }
 }
 
 // Format open orders consistently for the control-loop status log.
@@ -567,6 +556,7 @@ async fn cancel_expired_orders(
     client: &Client,
     runtime_state: &RwLock<RuntimeState>,
     contract: &Contract,
+    strategy: &Config,
     liquidating: bool,
 ) -> Result<(), Box<dyn Error>> {
     // Join order representations and persist cancellation attempts under one state guard.
@@ -589,8 +579,9 @@ async fn cancel_expired_orders(
                 continue;
             };
             let liquidation_order = liquidating && *contract_id == contract.contract_id;
-            if cancellation_due(order, *side, liquidation_order) {
-                order.last_cancelled_at = Some(OffsetDateTime::now_utc());
+            let now = OffsetDateTime::now_utc();
+            if cancellation_due(strategy, order, *side, liquidation_order, now) {
+                order.last_cancelled_at = Some(now);
                 attempts.push((*order_id, order.order_ref.clone()));
             }
         }
@@ -607,13 +598,6 @@ async fn cancel_expired_orders(
     }
 
     Ok(())
-}
-
-// Determine whether the Eastern clock is inside the daily liquidation window.
-fn is_liquidating() -> bool {
-    let eastern_time = OffsetDateTime::now_utc().to_timezone(NEW_YORK).time();
-
-    eastern_time >= LIQUIDATION_START_TIME && eastern_time < LIQUIDATION_END_TIME
 }
 
 // Place a limit order to buy the requested number of shares.
@@ -957,25 +941,6 @@ fn calculate_open_sell_shares(
         .sum()
 }
 
-// Calculate the limits used by the current normal or liquidation behavior.
-fn calculate_order_limits(
-    bid_price: Option<f64>,
-    ask_price: Option<f64>,
-    liquidating: bool,
-) -> (Option<f64>, Option<f64>) {
-    if liquidating {
-        (None, ask_price.map(round_up_to_cent))
-    } else {
-        (
-            bid_price.map(|price| {
-                round_down_to_cent(price * (1.0_f64 - BUY_DISCOUNT_PERCENT / 100.0_f64))
-            }),
-            ask_price
-                .map(|price| round_up_to_cent(price * (1.0_f64 + SELL_MARKUP_PERCENT / 100.0_f64))),
-        )
-    }
-}
-
 // Clear each quote side independently once its source timestamp exceeds the age limit.
 fn clear_stale_quote_prices(state: &mut VolatileState) {
     let cutoff = OffsetDateTime::now_utc() - QUOTE_MAX_AGE;
@@ -999,26 +964,18 @@ fn clear_stale_quote_prices(state: &mut VolatileState) {
     }
 }
 
-// Determine whether an open order has expired and is eligible for another cancellation attempt.
-fn cancellation_due(order: &state::OpenOrder, side: Side, liquidating: bool) -> bool {
-    // Apply the liquidation lifetime or the normal side-specific lifetime.
-    let time_to_live = if liquidating {
-        match side {
-            Side::Buy => Duration::ZERO,
-            Side::Sell => LIQUIDATION_SELL_ORDER_TTL,
-        }
-    } else {
-        match side {
-            Side::Buy => BUY_ORDER_TTL,
-            Side::Sell => SELL_ORDER_TTL,
-        }
-    };
-
-    // Space repeated cancellation requests even after the order has expired.
-    OffsetDateTime::now_utc() >= order.created_at + time_to_live
-        && order.last_cancelled_at.is_none_or(|last_cancelled_at| {
-            OffsetDateTime::now_utc() >= last_cancelled_at + CANCEL_RETRY_DELAY
-        })
+// Space repeated broker cancellations even if the strategy already wants to cancel the order.
+pub fn cancellation_due(
+    strategy: &Config,
+    order: &state::OpenOrder,
+    side: Side,
+    liquidating: bool,
+    now: OffsetDateTime,
+) -> bool {
+    strategy.should_cancel(side, now - order.created_at, liquidating)
+        && order
+            .last_cancelled_at
+            .is_none_or(|last_cancelled_at| now >= last_cancelled_at + CANCEL_RETRY_DELAY)
 }
 
 // Calculate buffered buying power and round it down to the nearest cent.
@@ -1037,31 +994,22 @@ fn calculate_buying_power(
     round_down_to_cent(margin_capacity / margin_ratio)
 }
 
-// Round a positive limit price down to an accepted cent boundary.
-fn round_down_to_cent(price: f64) -> f64 {
-    (price * 100.0_f64).floor() / 100.0_f64
-}
-
-// Round a positive limit price up to an accepted cent boundary.
-fn round_up_to_cent(price: f64) -> f64 {
-    (price * 100.0_f64).ceil() / 100.0_f64
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, RuntimeState, Side, VolatileOrder, calculate_buying_power,
-        calculate_open_buy_order_value, calculate_open_sell_shares, calculate_order_limits,
-        initial_volatile_state, resolve_contract_id, round_down_to_cent, round_up_to_cent,
+        Args, LIVE_CONFIG, RuntimeState, Side, VolatileOrder, VolatileState,
+        calculate_buying_power, calculate_open_buy_order_value, calculate_open_sell_shares,
+        cancellation_due, initial_volatile_state, market_maker_snapshot, resolve_contract_id,
         update_account_metric,
     };
-    use crate::state;
+    use crate::{backtest, state};
     use clap::Parser;
     use ibapi::{
         accounts::AccountSummaryTags,
         contracts::{Contract, ContractDetails},
     };
     use std::collections::HashMap;
+    use time::{Duration, OffsetDateTime};
     use tokio::sync::RwLock;
 
     // This parser exposes the run arguments for focused tests.
@@ -1213,27 +1161,143 @@ mod tests {
     }
 
     #[test]
-    fn select_limits_for_current_trading_behavior() {
-        // Suppress buys and quote directly at the ask only while liquidating.
+    fn plan_orders_from_broker_snapshots() {
+        // A quote alone permits neither side until the broker reports its available resources.
+        let contract = Contract {
+            contract_id: 101_i32,
+            ..Contract::stock("SOXL").build()
+        };
+        let mut state = initial_volatile_state();
+        state.bid_price = Some(10.129_f64);
+        state.ask_price = Some(10.231_f64);
+        let snapshot = market_maker_snapshot(&state, &contract, 20.0_f64, 75.0_f64);
+        let placements = LIVE_CONFIG.orders(&snapshot, false);
+        assert!(placements.buy.is_none());
+        assert!(placements.sell.is_none());
+
+        // Apply the strategy to the margin budget and whole-share inventory once they arrive.
+        state.equity_with_loan_value = Some(1_000.0_f64);
+        state.init_margin_req = Some(100.0_f64);
+        state.position_shares = Some(4.5_f64);
+        let snapshot = market_maker_snapshot(&state, &contract, 20.0_f64, 75.0_f64);
+        let placements = LIVE_CONFIG.orders(&snapshot, false);
         assert_eq!(
-            calculate_order_limits(Some(10.129_f64), Some(10.231_f64), false),
-            (Some(10.02_f64), Some(10.29_f64)),
+            placements.buy.map(|order| (order.price, order.shares)),
+            Some((10.02_f64, 93.0_f64)),
         );
         assert_eq!(
-            calculate_order_limits(Some(10.129_f64), Some(10.231_f64), true),
-            (None, Some(10.24_f64)),
+            placements.sell.map(|order| (order.price, order.shares)),
+            Some((10.29_f64, 4.0_f64)),
         );
+
+        // Keep the same inventory but quote directly at the ask during liquidation.
+        let snapshot = market_maker_snapshot(&state, &contract, 20.0_f64, 75.0_f64);
+        let placements = LIVE_CONFIG.orders(&snapshot, true);
+        assert!(placements.buy.is_none());
         assert_eq!(
-            calculate_order_limits(Some(10.129_f64), None, true),
-            (None, None),
+            placements.sell.map(|order| (order.price, order.shares)),
+            Some((10.24_f64, 4.0_f64)),
         );
     }
 
     #[test]
-    fn round_limit_prices_conservatively() {
-        // Keep buys below and sells above fractional-cent strategy prices.
-        assert!((round_down_to_cent(10.129_f64) - 10.12_f64).abs() < f64::EPSILON);
-        assert!((round_up_to_cent(10.121_f64) - 10.13_f64).abs() < f64::EPSILON);
+    fn match_replay_orders_with_equivalent_inputs() {
+        // Compare the two runners' input conversions with the same market-maker configuration.
+        let contract = Contract {
+            contract_id: 101_i32,
+            ..Contract::stock("SOXL").build()
+        };
+        let close = 10.129_f64;
+        let placements = |state: &VolatileState, buying_power, sellable_shares, liquidating| {
+            let live_snapshot = market_maker_snapshot(state, &contract, 20.0_f64, 75.0_f64);
+            let replay_snapshot =
+                backtest::market_maker_snapshot(close, buying_power, sellable_shares);
+            let live = LIVE_CONFIG.orders(&live_snapshot, liquidating);
+            let replay = LIVE_CONFIG.orders(&replay_snapshot, liquidating);
+            assert_eq!(live, replay);
+            live
+        };
+
+        // Start with no reservations and use the close as both sides of the recorded quote.
+        let mut state = initial_volatile_state();
+        state.bid_price = Some(close);
+        state.ask_price = Some(close);
+        state.equity_with_loan_value = Some(1_000.0_f64);
+        state.init_margin_req = Some(100.0_f64);
+        state.position_shares = Some(4.5_f64);
+        let initial = placements(&state, 933.33_f64, 4.0_f64, false);
+        assert_eq!(initial.buy.map(|order| order.shares), Some(93.0_f64));
+        assert_eq!(initial.sell.map(|order| order.shares), Some(4.0_f64));
+
+        // Treat the remaining portions of partially filled orders as reserved resources.
+        state.open_orders = HashMap::from([
+            (
+                1_i32,
+                VolatileOrder {
+                    order_ref: "stockholm:buy".to_string(),
+                    contract: contract.clone(),
+                    price: 10.0_f64,
+                    side: Side::Buy,
+                    filled_shares: 3.0_f64,
+                    remaining_shares: 2.0_f64,
+                },
+            ),
+            (
+                2_i32,
+                VolatileOrder {
+                    order_ref: "stockholm:sell".to_string(),
+                    contract: contract.clone(),
+                    price: 10.30_f64,
+                    side: Side::Sell,
+                    filled_shares: 1.0_f64,
+                    remaining_shares: 1.25_f64,
+                },
+            ),
+        ]);
+        let partially_filled = placements(&state, 913.33_f64, 3.0_f64, false);
+        assert_eq!(
+            partially_filled.buy.map(|order| order.shares),
+            Some(91.0_f64),
+        );
+        assert_eq!(
+            partially_filled.sell.map(|order| order.shares),
+            Some(3.0_f64),
+        );
+
+        // Flatten only the unreserved inventory once the strategy enters liquidation.
+        let liquidating = placements(&state, 913.33_f64, 3.0_f64, true);
+        assert!(liquidating.buy.is_none());
+        assert_eq!(
+            liquidating.sell.map(|order| (order.price, order.shares)),
+            Some((10.13_f64, 3.0_f64)),
+        );
+    }
+
+    #[test]
+    fn throttle_cancellation_retries() {
+        // Keep the broker retry delay independent from the strategy's order lifetime.
+        let created_at = OffsetDateTime::UNIX_EPOCH;
+        let cancelled_at = created_at + Duration::seconds(5);
+        let order = state::OpenOrder {
+            order_ref: "stockholm:buy".to_string(),
+            perm_id: None,
+            created_at,
+            last_cancelled_at: Some(cancelled_at),
+        };
+        assert!(!cancellation_due(
+            &LIVE_CONFIG,
+            &order,
+            Side::Buy,
+            false,
+            cancelled_at,
+        ));
+        assert!(cancellation_due(
+            &LIVE_CONFIG,
+            &order,
+            Side::Buy,
+            false,
+            cancelled_at + Duration::seconds(10),
+        ));
     }
 
     #[tokio::test]

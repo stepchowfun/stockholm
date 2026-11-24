@@ -1,13 +1,15 @@
 use crate::{
     infer::{OutcomeProbabilities, Predictor},
-    run::{LIQUIDATION_END_TIME, LIQUIDATION_START_TIME},
+    market_maker::{
+        Config, LIQUIDATION_END_TIME, LIQUIDATION_START_TIME, Side, Snapshot, is_liquidating,
+    },
     train::{INPUTS, MARKET_CLOSE_TIME, MARKET_OPEN_TIME, MAXIMUM_DECREASE, TARGET_INCREASE},
 };
 use clap::{Args as ClapArgs, ValueEnum};
 use log::info;
 use rayon::prelude::*;
 use std::{error::Error, fs, path::PathBuf, sync::Mutex};
-use time::{OffsetDateTime, Time};
+use time::{Duration, OffsetDateTime, Time};
 use time_tz::{OffsetDateTimeExt, timezones::db::america::NEW_YORK};
 
 // These Eastern times bound the unreliable early-morning trade-reporting window.
@@ -608,13 +610,27 @@ fn simulate_market_maker(
     config: MarketMakerConfig,
     log_orders: bool,
 ) -> Result<MarketMakerResult, Box<dyn Error>> {
+    // Use the same strategy settings for every day in this simulation.
+    let strategy = Config::backtest(
+        config.discount_percent,
+        config.markup_percent,
+        Duration::seconds(i64::try_from(config.buy_ttl)?),
+        Duration::seconds(i64::try_from(config.sell_ttl)?),
+    );
+
     // Compound account value across days while retaining each daily return for risk measurement.
     let mut final_value = config.initial_cash;
     let mut daily_returns = Vec::with_capacity(days.len());
     for day in days {
         let initial_value = final_value;
-        final_value =
-            simulate_market_maker_day(&day.bars, initial_value, config, &day.filename, log_orders)?;
+        final_value = simulate_market_maker_day(
+            &day.bars,
+            initial_value,
+            config,
+            &strategy,
+            &day.filename,
+            log_orders,
+        );
         daily_returns.push(final_value / initial_value - 1.0_f64);
     }
 
@@ -630,9 +646,10 @@ fn simulate_market_maker_day(
     bars: &[Bar],
     initial_value: f64,
     config: MarketMakerConfig,
+    strategy: &Config,
     filename: &str,
     log_orders: bool,
-) -> Result<f64, Box<dyn Error>> {
+) -> f64 {
     // Start the day with the entire incoming account value available as cash.
     let logger = MarketMakerLogger {
         enabled: log_orders,
@@ -642,38 +659,31 @@ fn simulate_market_maker_day(
     let mut available_shares = 0.0_f64;
     let mut buy_orders = Vec::<LimitOrder>::new();
     let mut sell_orders = Vec::<LimitOrder>::new();
-    let buy_ttl = i64::try_from(config.buy_ttl)?;
-    let sell_ttl = i64::try_from(config.sell_ttl)?;
 
     // Cancel, fill, and replace orders once for every chronological bar.
     for bar in bars {
-        // Cancel pending orders and sell up to one bar's volume at the current close.
-        if bar.liquidate {
-            available_cash += buy_orders
-                .drain(..)
-                .map(|order| order.remaining_shares * order.price)
-                .sum::<f64>();
-            available_shares += sell_orders
-                .drain(..)
-                .map(|order| order.remaining_shares)
-                .sum::<f64>();
-            let filled_shares = available_shares.min(config.bar_volume_limit);
-            available_cash += filled_shares * bar.close;
-            available_shares -= filled_shares;
-            logger.liquidation(bar.timestamp, filled_shares, bar.close);
-            continue;
-        }
-
-        // Return resources reserved by orders older than their configured lifetimes.
+        // Return the resources that the strategy releases before processing this bar.
         expire_market_maker_orders(
             bar.timestamp,
-            buy_ttl,
-            sell_ttl,
+            strategy,
+            bar.liquidate,
             &mut available_cash,
             &mut available_shares,
             &mut buy_orders,
             &mut sell_orders,
         );
+
+        // Simulate immediate liquidation at the close with the existing bar-volume cap.
+        if bar.liquidate {
+            let snapshot = market_maker_snapshot(bar.close, 0.0_f64, available_shares);
+            if let Some(sell) = strategy.orders(&snapshot, true).sell {
+                let filled_shares = sell.shares.min(config.bar_volume_limit);
+                available_cash += filled_shares * sell.price;
+                available_shares -= filled_shares;
+                logger.liquidation(bar.timestamp, filled_shares, sell.price);
+            }
+            continue;
+        }
 
         // Share one fill budget across every order eligible during this bar.
         let mut remaining_bar_volume = config.bar_volume_limit;
@@ -719,25 +729,24 @@ fn simulate_market_maker_day(
         let cash_floor = liquidation_value * (1.0_f64 - config.bet_size / 100.0_f64);
         let cash_available_to_bet = (available_cash - cash_floor).max(0.0_f64);
 
-        // Reserve usable cash for the largest whole-share discounted buy order.
-        let buy_limit = bar.close * (1.0_f64 - config.discount_percent / 100.0_f64);
-        let buy_shares = (cash_available_to_bet / buy_limit).floor();
-        if buy_shares >= 1.0_f64 {
-            available_cash -= buy_shares * buy_limit;
+        // Reserve resources for the strategy's orders after the bar's fills are complete.
+        let snapshot = market_maker_snapshot(bar.close, cash_available_to_bet, available_shares);
+        let placements = strategy.orders(&snapshot, false);
+        if let Some(buy) = placements.buy {
+            available_cash -= buy.shares * buy.price;
             buy_orders.push(LimitOrder {
                 placed_timestamp: bar.timestamp,
-                price: buy_limit,
-                remaining_shares: buy_shares,
+                price: buy.price,
+                remaining_shares: buy.shares,
             });
         }
 
         // Reserve every available share for one marked-up sell order.
-        if available_shares > 0.0_f64 {
-            let sell_limit = bar.close * (1.0_f64 + config.markup_percent / 100.0_f64);
+        if let Some(sell) = placements.sell {
             sell_orders.push(LimitOrder {
                 placed_timestamp: bar.timestamp,
-                price: sell_limit,
-                remaining_shares: available_shares,
+                price: sell.price,
+                remaining_shares: sell.shares,
             });
             available_shares = 0.0_f64;
         }
@@ -750,25 +759,51 @@ fn simulate_market_maker_day(
         .map(|order| order.remaining_shares * order.price)
         .sum::<f64>();
     let reserved_shares = sum_remaining_shares(&sell_orders);
-    let final_value =
-        available_cash + reserved_cash + (available_shares + reserved_shares) * final_price;
+    available_cash + reserved_cash + (available_shares + reserved_shares) * final_price
+}
 
-    Ok(final_value)
+// Use the completed trade bar's close as a proxy for each side of a quote.
+pub fn market_maker_snapshot(close: f64, buying_power: f64, sellable_shares: f64) -> Snapshot {
+    Snapshot {
+        bid_price: Some(close),
+        ask_price: Some(close),
+        buying_power: Some(buying_power),
+        sellable_shares: Some(sellable_shares),
+    }
 }
 
 // Cancel expired orders and return their reserved resources to the portfolio.
 fn expire_market_maker_orders(
     timestamp: i64,
-    buy_ttl: i64,
-    sell_ttl: i64,
+    strategy: &Config,
+    liquidating: bool,
     available_cash: &mut f64,
     available_shares: &mut f64,
     buy_orders: &mut Vec<LimitOrder>,
     sell_orders: &mut Vec<LimitOrder>,
 ) {
+    // Apply the common strategy to orders on this replay clock.
+    let should_cancel = |side, order: &LimitOrder| {
+        let age = Duration::seconds(timestamp.saturating_sub(order.placed_timestamp));
+        strategy.should_cancel(side, age, liquidating)
+    };
+
+    // Release liquidation reservations as a batch to preserve the simulator's accounting.
+    if liquidating {
+        *available_cash += buy_orders
+            .extract_if(.., |order| should_cancel(Side::Buy, order))
+            .map(|order| order.remaining_shares * order.price)
+            .sum::<f64>();
+        *available_shares += sell_orders
+            .extract_if(.., |order| should_cancel(Side::Sell, order))
+            .map(|order| order.remaining_shares)
+            .sum::<f64>();
+        return;
+    }
+
     // Refund cash reserved by buy orders that have exceeded their lifetime.
     buy_orders.retain(|order| {
-        if timestamp.saturating_sub(order.placed_timestamp) > buy_ttl {
+        if should_cancel(Side::Buy, order) {
             *available_cash += order.remaining_shares * order.price;
             false
         } else {
@@ -778,7 +813,7 @@ fn expire_market_maker_orders(
 
     // Release shares reserved by sell orders that have exceeded their lifetime.
     sell_orders.retain(|order| {
-        if timestamp.saturating_sub(order.placed_timestamp) > sell_ttl {
+        if should_cancel(Side::Sell, order) {
             *available_shares += order.remaining_shares;
             false
         } else {
@@ -1079,13 +1114,6 @@ fn is_unreliable_early_data(timestamp: OffsetDateTime) -> bool {
     eastern_time >= UNRELIABLE_DATA_START_TIME && eastern_time < UNRELIABLE_DATA_END_TIME
 }
 
-// Identify bars inside the shared Eastern-time liquidation window.
-fn is_liquidating(timestamp: OffsetDateTime) -> bool {
-    let eastern_time = timestamp.to_timezone(NEW_YORK).time();
-
-    eastern_time >= LIQUIDATION_START_TIME && eastern_time < LIQUIDATION_END_TIME
-}
-
 // Locate one required CSV column.
 fn column_index(
     headers: &csv::StringRecord,
@@ -1245,15 +1273,17 @@ fn parse_percent(value: &str) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, Bar, Day, MarketMakerConfig, ModelSellKind, OwnedLot, Strategy,
-        TRADING_DAYS_PER_YEAR, annualized_sharpe_ratio, buy_and_hold, is_unreliable_early_data,
-        market_maker, market_maker_grid, model_order_scale, parse_days,
+        Args, Bar, Day, LimitOrder, MarketMakerConfig, ModelSellKind, OwnedLot, Side, Strategy,
+        TRADING_DAYS_PER_YEAR, annualized_sharpe_ratio, buy_and_hold, expire_market_maker_orders,
+        is_unreliable_early_data, market_maker, market_maker_grid, model_order_scale, parse_days,
         reconcile_model_sell_orders, simulate_market_maker,
     };
-    use crate::{Cli, Subcommand, infer::OutcomeProbabilities};
+    use crate::{
+        Cli, Subcommand, infer::OutcomeProbabilities, market_maker::LIVE_CONFIG, run, state,
+    };
     use clap::Parser;
     use std::path::PathBuf;
-    use time::OffsetDateTime;
+    use time::{Duration, OffsetDateTime};
 
     #[test]
     fn parse_backtest_subcommand() {
@@ -1463,6 +1493,59 @@ mod tests {
         let result = market_maker(&files, &args).unwrap();
         assert!((result.final_value - 1_020.0).abs() < f64::EPSILON);
         assert_eq!(result.annualized_sharpe, None);
+    }
+
+    #[test]
+    fn place_market_maker_orders_after_bar_fills() {
+        // The first bar's low crosses the new buy limit before the strategy can place it.
+        let files = vec![(
+            PathBuf::from("prices.csv"),
+            "date,low,high,close\n36000,90,110,100\n".to_string(),
+        )];
+        let args = market_maker_args(1_000.0, 3_600, 14_400);
+        let result = market_maker(&files, &args).unwrap();
+        assert!((result.final_value - args.initial_cash).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn match_live_cancellations_with_equivalent_order_ages() {
+        // Give each runner an equally old order without a pending cancellation request.
+        let live_order = state::OpenOrder {
+            order_ref: "stockholm:parity".to_string(),
+            perm_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            last_cancelled_at: None,
+        };
+        let replay_order = || LimitOrder {
+            placed_timestamp: 0,
+            price: 10.0_f64,
+            remaining_shares: 1.0_f64,
+        };
+
+        // Compare both adapters immediately before and at their configured expiry boundaries.
+        let checkpoints = [(4, false), (5, false), (120, false), (59, true), (60, true)];
+        for (seconds, liquidating) in checkpoints {
+            let mut buy_orders = vec![replay_order()];
+            let mut sell_orders = vec![replay_order()];
+            let mut cash = 0.0_f64;
+            let mut shares = 0.0_f64;
+            expire_market_maker_orders(
+                seconds,
+                &LIVE_CONFIG,
+                liquidating,
+                &mut cash,
+                &mut shares,
+                &mut buy_orders,
+                &mut sell_orders,
+            );
+            let now = live_order.created_at + Duration::seconds(seconds);
+            for (side, orders) in [(Side::Buy, buy_orders), (Side::Sell, sell_orders)] {
+                assert_eq!(
+                    orders.is_empty(),
+                    run::cancellation_due(&LIVE_CONFIG, &live_order, side, liquidating, now),
+                );
+            }
+        }
     }
 
     #[test]
