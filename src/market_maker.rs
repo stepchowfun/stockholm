@@ -17,8 +17,9 @@ pub const LIVE_CONFIG: Config = Config {
     markup_percent: 0.5_f64,
     buy_ttl: Duration::seconds(5),
     sell_ttl: Duration::seconds(120),
-    expiry: Expiry::AtLifetime,
-    liquidation: Liquidation::RestingSells(Duration::minutes(1)),
+    expiry: Expiry::AtLifetime {
+        liquidation_sell_ttl: Duration::minutes(1),
+    },
     round_to_cents: true,
 };
 
@@ -51,18 +52,11 @@ pub struct Placements {
     pub sell: Option<Order>,
 }
 
-// These boundaries preserve whether an order is still eligible at its exact lifetime.
+// These presets pair each expiry boundary with its liquidation rules.
 #[derive(Clone, Copy)]
 enum Expiry {
-    AtLifetime,
+    AtLifetime { liquidation_sell_ttl: Duration },
     AfterLifetime,
-}
-
-// These policies determine which resting orders must be canceled during liquidation.
-#[derive(Clone, Copy)]
-enum Liquidation {
-    CancelAll,
-    RestingSells(Duration),
 }
 
 // These settings control pricing and expiration independently of order execution.
@@ -73,7 +67,6 @@ pub struct Config {
     buy_ttl: Duration,
     sell_ttl: Duration,
     expiry: Expiry,
-    liquidation: Liquidation,
     round_to_cents: bool,
 }
 
@@ -91,7 +84,6 @@ impl Config {
             buy_ttl,
             sell_ttl,
             expiry: Expiry::AfterLifetime,
-            liquidation: Liquidation::CancelAll,
             round_to_cents: false,
         }
     }
@@ -137,26 +129,25 @@ impl Config {
 
     // Decide when to release or request cancellation of an already working order.
     pub fn should_cancel(&self, side: Side, age: Duration, liquidating: bool) -> bool {
-        // Use the liquidation policy whenever opening buys are suspended.
-        let lifetime = if liquidating {
-            match self.liquidation {
-                Liquidation::CancelAll => return true,
-                Liquidation::RestingSells(sell_ttl) => match side {
-                    Side::Buy => Duration::ZERO,
-                    Side::Sell => sell_ttl,
-                },
-            }
-        } else {
-            match side {
-                Side::Buy => self.buy_ttl,
-                Side::Sell => self.sell_ttl,
-            }
+        // Select the normal lifetime for this side before applying any liquidation rules.
+        let lifetime = match side {
+            Side::Buy => self.buy_ttl,
+            Side::Sell => self.sell_ttl,
         };
 
-        // Apply the preset's boundary to the elapsed age supplied by the runner.
+        // Replay cancels every order during liquidation. Live lets sells rest briefly.
         match self.expiry {
-            Expiry::AtLifetime => age >= lifetime,
-            Expiry::AfterLifetime => age > lifetime,
+            Expiry::AfterLifetime => liquidating || age > lifetime,
+            Expiry::AtLifetime {
+                liquidation_sell_ttl,
+            } => {
+                let lifetime = match (liquidating, side) {
+                    (true, Side::Buy) => Duration::ZERO,
+                    (true, Side::Sell) => liquidation_sell_ttl,
+                    (false, _) => lifetime,
+                };
+                age >= lifetime
+            }
         }
     }
 }

@@ -788,38 +788,26 @@ fn expire_market_maker_orders(
         strategy.should_cancel(side, age, liquidating)
     };
 
-    // Release liquidation reservations as a batch to preserve the simulator's accounting.
+    // Release each canceled order while preserving the original order of refunds.
+    let cash_refunds = buy_orders
+        .extract_if(.., |order| should_cancel(Side::Buy, order))
+        .map(|order| order.remaining_shares * order.price);
+    let share_refunds = sell_orders
+        .extract_if(.., |order| should_cancel(Side::Sell, order))
+        .map(|order| order.remaining_shares);
+
+    // Preserve the different floating-point addition order used during liquidation.
     if liquidating {
-        *available_cash += buy_orders
-            .extract_if(.., |order| should_cancel(Side::Buy, order))
-            .map(|order| order.remaining_shares * order.price)
-            .sum::<f64>();
-        *available_shares += sell_orders
-            .extract_if(.., |order| should_cancel(Side::Sell, order))
-            .map(|order| order.remaining_shares)
-            .sum::<f64>();
-        return;
+        *available_cash += cash_refunds.sum::<f64>();
+        *available_shares += share_refunds.sum::<f64>();
+    } else {
+        for refund in cash_refunds {
+            *available_cash += refund;
+        }
+        for refund in share_refunds {
+            *available_shares += refund;
+        }
     }
-
-    // Refund cash reserved by buy orders that have exceeded their lifetime.
-    buy_orders.retain(|order| {
-        if should_cancel(Side::Buy, order) {
-            *available_cash += order.remaining_shares * order.price;
-            false
-        } else {
-            true
-        }
-    });
-
-    // Release shares reserved by sell orders that have exceeded their lifetime.
-    sell_orders.retain(|order| {
-        if should_cancel(Side::Sell, order) {
-            *available_shares += order.remaining_shares;
-            false
-        } else {
-            true
-        }
-    });
 }
 
 // Total the unfilled shares across a collection of limit orders.
