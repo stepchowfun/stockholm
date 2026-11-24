@@ -3,7 +3,10 @@ use clap::Args as ClapArgs;
 use ibapi::{
     Client,
     contracts::Contract,
-    market_data::{TradingHours, historical::BarSize},
+    market_data::{
+        TradingHours,
+        historical::{BarSize, BarTimestamp},
+    },
 };
 use std::{error::Error, io};
 use time::{self, OffsetDateTime, format_description::well_known::Iso8601};
@@ -79,7 +82,7 @@ async fn fetch_data(client: &Client, args: &Args) -> Result<(), Box<dyn Error>> 
             .filter(|bar| bar.date >= chunk_start.into() && bar.date < chunk_end.into())
         {
             writer.write_record([
-                bar.date.to_string(),
+                bar_unix_timestamp(bar.date).to_string(),
                 bar.open.to_string(),
                 bar.high.to_string(),
                 bar.low.to_string(),
@@ -95,6 +98,14 @@ async fn fetch_data(client: &Client, args: &Args) -> Result<(), Box<dyn Error>> 
     // Surface any buffered output error before reporting success.
     writer.flush()?;
     Ok(())
+}
+
+// Encode date-only bars at midnight UTC, matching how IBKR compares them to range bounds.
+fn bar_unix_timestamp(timestamp: BarTimestamp) -> i64 {
+    match timestamp {
+        BarTimestamp::Date(date) => date.midnight().assume_utc().unix_timestamp(),
+        BarTimestamp::DateTime(datetime) => datetime.unix_timestamp(),
+    }
 }
 
 // Include the preceding second while requesting enough time for the selected bar size.
@@ -148,9 +159,9 @@ fn parse_datetime(value: &str) -> Result<OffsetDateTime, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, chunk_seconds, request_start};
+    use super::{Args, bar_unix_timestamp, chunk_seconds, parse_datetime, request_start};
     use clap::Parser;
-    use ibapi::market_data::historical::BarSize;
+    use ibapi::market_data::historical::{BarSize, BarTimestamp};
     use time::OffsetDateTime;
 
     // This parser exposes the historical arguments for focused tests.
@@ -192,6 +203,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(cli.args.interval, BarSize::Min5);
+    }
+
+    #[test]
+    fn encode_bar_timestamps_as_unix_seconds() {
+        // Use midnight UTC for the calendar date and preserve the instant of the intraday bar.
+        let date_only = BarTimestamp::from(parse_datetime("2026-06-15T00:00:00Z").unwrap().date());
+        let intraday = BarTimestamp::from(parse_datetime("2026-06-15T04:00:00-04:00").unwrap());
+        assert_eq!(bar_unix_timestamp(date_only), 1_781_481_600);
+        assert_eq!(bar_unix_timestamp(intraday), 1_781_510_400);
     }
 
     #[test]
