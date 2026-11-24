@@ -47,7 +47,7 @@ Use the `run` subcommand to trade a symbol with the live strategy:
 stockholm run --symbol AAPL
 ```
 
-Use the `historical` subcommand to fetch historical bars as CSV:
+Use the `historical` subcommand to fetch historical bars as CSV. The `date` column contains Unix timestamps in seconds. Bars with only a calendar date use midnight UTC on that date.
 
 ```sh
 stockholm historical --start 2026-07-31T13:30:00Z --end 2026-07-31T20:00:00Z --symbol SOXL --interval MIN5
