@@ -1,6 +1,6 @@
 [package]
 name = "stockholm"
-version = "0.2.50"
+version = "0.2.51"
 edition = "2024"
 description = "A laboratory for algorithmic trading."
 documentation = "https://github.com/stepchowfun/stockholm"

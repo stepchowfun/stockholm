@@ -3,7 +3,7 @@ use clap::Args as ClapArgs;
 use ibapi::{
     Client,
     accounts::{AccountSummaryResult, AccountSummaryTags, PositionUpdate, types::AccountGroup},
-    contracts::Contract,
+    contracts::{Contract, ContractDetails},
     market_data::IgnoreSize,
     orders::{Action, OrderData, OrderStatus, OrderUpdate, Orders},
     prelude::{StreamExt, Subscription, SubscriptionItemStreamExt},
@@ -22,6 +22,7 @@ use uuid::Uuid;
 // These constants configure trading defaults, routing, and failure recovery.
 const RUN_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 const RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+const CONTRACT_DETAILS_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 const DEFAULT_BUYING_POWER_BUFFER: f64 = 20.0_f64;
 const DEFAULT_INITIAL_MARGIN_REQUIREMENT: f64 = 75.0_f64;
 const BUY_DISCOUNT_PERCENT: f64 = 1.0_f64;
@@ -73,7 +74,7 @@ struct VolatileState {
     // Details for open orders, keyed by their connection-specific order identifier.
     open_orders: HashMap<i32, VolatileOrder>,
 
-    // The current position in the configured symbol after its initial snapshot arrives.
+    // The current position in the configured contract after its initial snapshot arrives.
     position_shares: Option<f64>,
 
     // The most recently reported account equity including loan value.
@@ -109,8 +110,8 @@ struct VolatileOrder {
     // The stable Stockholm-generated reference attached to the order.
     order_ref: String,
 
-    // The instrument being traded.
-    symbol: String,
+    // The contract associated with this order.
+    contract: Contract,
 
     // The order's limit price.
     price: f64,
@@ -159,6 +160,11 @@ fn initial_volatile_state() -> VolatileState {
 
 // Run the main trading loop.
 pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<dyn Error>> {
+    // Use one instrument for quotes and order placement across all connections.
+    let mut contract = Contract::stock(&args.symbol)
+        .on_exchange(SMART_EXCHANGE)
+        .build();
+
     // Load persisted state once and pair it with empty connection-local state.
     let runtime_state = RwLock::new(RuntimeState {
         persistent: state::load().unwrap_or_else(|error| {
@@ -175,7 +181,9 @@ pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<d
         // Connect to the configured TWS or IB Gateway instance for this attempt.
         match Client::connect(address, client_id).await {
             Ok(client) => {
-                if let Err(error) = run_with_connection(&client, args, &runtime_state).await {
+                if let Err(error) =
+                    run_with_connection(&client, &mut contract, args, &runtime_state).await
+                {
                     error!("{error}");
                 }
             }
@@ -189,9 +197,26 @@ pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<d
 // Run the control and streaming futures together on one connection.
 async fn run_with_connection(
     client: &Client,
+    contract: &mut Contract,
     args: &Args,
     runtime_state: &RwLock<RuntimeState>,
 ) -> Result<(), Box<dyn Error>> {
+    // Resolve the instrument on the first connection and retain its ID across reconnects.
+    if contract.contract_id == 0_i32 {
+        let matches = client
+            .contract_details_stream(contract)
+            .subscribe()
+            .await?
+            .collect_to_end_within(CONTRACT_DETAILS_TIMEOUT)
+            .await?;
+        contract.contract_id = resolve_contract_id(contract, &matches)?;
+        info!(
+            "Resolved {} to IBKR contract ID {}.",
+            contract.symbol,
+            contract.contract_id,
+        );
+    }
+
     // Discard details from the previous connection before rebuilding broker snapshots.
     runtime_state.write().await.volatile = initial_volatile_state();
 
@@ -204,25 +229,53 @@ async fn run_with_connection(
         control_loop(
             client,
             runtime_state,
-            &args.symbol,
+            contract,
             args.buying_power_buffer,
             args.initial_margin_requirement,
         ),
         stream_account_summary(client, runtime_state),
         stream_order_updates(order_updates, runtime_state),
-        stream_positions(client, &args.symbol, runtime_state),
-        stream_tick_by_tick(client, &args.symbol, runtime_state),
+        stream_positions(client, contract, runtime_state),
+        stream_tick_by_tick(client, contract, runtime_state),
         clear_stale_quotes(runtime_state),
     )?;
 
     Ok(())
 }
 
+// Accept one positive instrument ID even when IBKR returns it for multiple venues.
+fn resolve_contract_id(contract: &Contract, matches: &[ContractDetails]) -> io::Result<i32> {
+    // Report empty results separately so invalid and ambiguous matches are easy to diagnose.
+    let Some(first_match) = matches.first() else {
+        return Err(io::Error::other(format!(
+            "IBKR returned no contract for {} on {}.",
+            contract.symbol,
+            contract.exchange,
+        )));
+    };
+
+    // Reject invalid IDs or any result that points to a different instrument.
+    let contract_id = first_match.contract.contract_id;
+    if contract_id <= 0_i32
+        || matches
+            .iter()
+            .any(|details| details.contract.contract_id != contract_id)
+    {
+        return Err(io::Error::other(format!(
+            "IBKR returned invalid or ambiguous contract IDs for {} on {}.",
+            contract.symbol,
+            contract.exchange,
+        )));
+    }
+
+    Ok(contract_id)
+}
+
 // Repeat control steps until one fails.
 async fn control_loop(
     client: &Client,
     runtime_state: &RwLock<RuntimeState>,
-    symbol: &str,
+    contract: &Contract,
     buying_power_buffer: f64,
     initial_margin_requirement: f64,
 ) -> Result<(), Box<dyn Error>> {
@@ -230,7 +283,7 @@ async fn control_loop(
         run_control_step(
             client,
             runtime_state,
-            symbol,
+            contract,
             buying_power_buffer,
             initial_margin_requirement,
         )
@@ -319,22 +372,24 @@ async fn stream_order_updates(
     Err(ibapi::Error::UnexpectedEndOfStream.into())
 }
 
-// Stream positions for the configured symbol for the life of the connection.
+// Stream positions for the configured contract for the life of the connection.
 async fn stream_positions(
     client: &Client,
-    symbol: &str,
+    contract: &Contract,
     runtime_state: &RwLock<RuntimeState>,
 ) -> Result<(), Box<dyn Error>> {
     // Subscribe to an initial snapshot followed by incremental position updates.
     let subscription = client.positions().await?;
     let mut updates = subscription.filter_data();
-    debug!("Streaming positions for {symbol}…");
+    debug!("Streaming positions for {}…", contract.symbol);
 
-    // Retain the matching position and use zero when the initial snapshot omits the symbol.
+    // Retain the matching position and use zero when the initial snapshot omits the contract.
     while let Some(update) = updates.next().await {
         let mut state = runtime_state.write().await;
         match update? {
-            PositionUpdate::Position(position) if position.contract.symbol == symbol => {
+            PositionUpdate::Position(position)
+                if position.contract.contract_id == contract.contract_id =>
+            {
                 state.volatile.position_shares = Some(position.position);
             }
             PositionUpdate::Position(_) => {}
@@ -360,17 +415,20 @@ async fn clear_stale_quotes(runtime_state: &RwLock<RuntimeState>) -> Result<(), 
 // Stream tick-by-tick SMART bid and ask prices for the configured symbol.
 async fn stream_tick_by_tick(
     client: &Client,
-    symbol: &str,
+    contract: &Contract,
     runtime_state: &RwLock<RuntimeState>,
 ) -> Result<(), Box<dyn Error>> {
-    // Subscribe to a continuous SMART quote stream.
-    let contract = Contract::stock(symbol).on_exchange(SMART_EXCHANGE).build();
+    // Subscribe to a continuous quote stream for the trading contract.
+    let exchange = &contract.exchange;
     let subscription = client
-        .tick_by_tick(&contract, 0)
+        .tick_by_tick(contract, 0)
         .bid_ask(IgnoreSize::Yes)
         .await?;
     let mut quotes = subscription.filter_data();
-    debug!("Streaming tick-by-tick quotes for {symbol} from {SMART_EXCHANGE}…");
+    debug!(
+        "Streaming tick-by-tick quotes for {} from {exchange}…",
+        contract.symbol,
+    );
 
     // Update both sides atomically and propagate stream failures to the connection loop.
     while let Some(quote) = quotes.next().await {
@@ -382,7 +440,10 @@ async fn stream_tick_by_tick(
             state.volatile.ask_price = (quote.ask_price > 0.0_f64).then_some(quote.ask_price);
             state.volatile.ask_price_timestamp = state.volatile.ask_price.map(|_| quote.time);
         }
-        debug!("Tick-by-tick quote for {symbol} ({SMART_EXCHANGE}): {quote:?}");
+        debug!(
+            "Tick-by-tick quote for {} ({exchange}): {quote:?}",
+            contract.symbol,
+        );
     }
 
     Err(ibapi::Error::UnexpectedEndOfStream.into())
@@ -392,13 +453,13 @@ async fn stream_tick_by_tick(
 async fn run_control_step(
     client: &Client,
     runtime_state: &RwLock<RuntimeState>,
-    symbol: &str,
+    contract: &Contract,
     buying_power_buffer: f64,
     initial_margin_requirement: f64,
 ) -> Result<(), Box<dyn Error>> {
     // Select order lifetimes and trading behavior from the current Eastern time.
     let liquidating = is_liquidating();
-    cancel_expired_orders(client, runtime_state, symbol, liquidating).await?;
+    cancel_expired_orders(client, runtime_state, contract, liquidating).await?;
 
     // Snapshot resources and quotes without retaining the state lock across submissions.
     let (buying_power, bid_price, ask_price, sellable_shares) = {
@@ -418,7 +479,7 @@ async fn run_control_step(
                         open_buy_order_value,
                     )
                 });
-        let reserved_sell_shares = calculate_open_sell_shares(&state.open_orders, symbol);
+        let reserved_sell_shares = calculate_open_sell_shares(&state.open_orders, contract);
         let sellable_shares = state
             .position_shares
             .map(|shares| (shares - reserved_sell_shares).max(0.0_f64).floor());
@@ -458,7 +519,7 @@ async fn run_control_step(
     {
         let shares = (buying_power / limit).floor();
         if shares >= 1.0_f64 {
-            place_limit_buy(client, symbol, shares, limit, runtime_state).await?;
+            place_limit_buy(client, contract, shares, limit, runtime_state).await?;
         }
     }
 
@@ -467,7 +528,7 @@ async fn run_control_step(
         && limit > 0.0_f64
         && sellable_shares > 0.0_f64
     {
-        place_limit_sell(client, symbol, sellable_shares, limit, runtime_state).await?;
+        place_limit_sell(client, contract, sellable_shares, limit, runtime_state).await?;
     }
 
     Ok(())
@@ -489,7 +550,7 @@ fn format_open_orders(open_orders: &HashMap<i32, VolatileOrder>) -> String {
             };
             format!(
                 "{side} {} @ ${:.2} ({} filled, {} remaining)",
-                order.symbol,
+                order.contract.symbol,
                 order.price,
                 order.filled_shares,
                 order.remaining_shares,
@@ -505,7 +566,7 @@ fn format_open_orders(open_orders: &HashMap<i32, VolatileOrder>) -> String {
 async fn cancel_expired_orders(
     client: &Client,
     runtime_state: &RwLock<RuntimeState>,
-    symbol: &str,
+    contract: &Contract,
     liquidating: bool,
 ) -> Result<(), Box<dyn Error>> {
     // Join order representations and persist cancellation attempts under one state guard.
@@ -518,16 +579,16 @@ async fn cancel_expired_orders(
             .map(|(&order_id, order)| {
                 (
                     order.order_ref.clone(),
-                    (order_id, order.side, order.symbol.clone()),
+                    (order_id, order.side, order.contract.contract_id),
                 )
             })
             .collect::<HashMap<_, _>>();
         let mut attempts = Vec::new();
         for order in &mut state.persistent.open_orders {
-            let Some((order_id, side, order_symbol)) = volatile_orders.get(&order.order_ref) else {
+            let Some((order_id, side, contract_id)) = volatile_orders.get(&order.order_ref) else {
                 continue;
             };
-            let liquidation_order = liquidating && order_symbol == symbol;
+            let liquidation_order = liquidating && *contract_id == contract.contract_id;
             if cancellation_due(order, *side, liquidation_order) {
                 order.last_cancelled_at = Some(OffsetDateTime::now_utc());
                 attempts.push((*order_id, order.order_ref.clone()));
@@ -558,16 +619,15 @@ fn is_liquidating() -> bool {
 // Place a limit order to buy the requested number of shares.
 async fn place_limit_buy(
     client: &Client,
-    symbol: &str,
+    contract: &Contract,
     shares: f64,
     limit: f64,
     runtime_state: &RwLock<RuntimeState>,
 ) -> Result<(), Box<dyn Error>> {
-    // Build a SMART order with a stable Stockholm-generated correlation reference.
-    let contract = Contract::stock(symbol).on_exchange(SMART_EXCHANGE).build();
+    // Build an order with a stable Stockholm-generated correlation reference.
     let order_ref = format!("{ORDER_REF_PREFIX}{}", Uuid::new_v4().simple());
     let mut order = client
-        .order(&contract)
+        .order(contract)
         .buy(shares)
         .limit(limit)
         .outside_rth()
@@ -589,7 +649,7 @@ async fn place_limit_buy(
             order_id,
             VolatileOrder {
                 order_ref: order_ref.clone(),
-                symbol: symbol.to_string(),
+                contract: contract.clone(),
                 price: limit,
                 side: Side::Buy,
                 filled_shares: 0.0_f64,
@@ -600,8 +660,11 @@ async fn place_limit_buy(
     }
 
     // Submit the order only after its state has been safely persisted.
-    client.submit_order(order_id, &contract, &order).await?;
-    info!("Submitted limit buy {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}");
+    client.submit_order(order_id, contract, &order).await?;
+    info!(
+        "Submitted limit buy {order_id} ({order_ref}): {shares} {} @ ${limit:.2}",
+        contract.symbol,
+    );
 
     Ok(())
 }
@@ -609,16 +672,15 @@ async fn place_limit_buy(
 // Place a limit order to sell the requested number of shares.
 async fn place_limit_sell(
     client: &Client,
-    symbol: &str,
+    contract: &Contract,
     shares: f64,
     limit: f64,
     runtime_state: &RwLock<RuntimeState>,
 ) -> Result<(), Box<dyn Error>> {
-    // Build a SMART order with a stable Stockholm-generated correlation reference.
-    let contract = Contract::stock(symbol).on_exchange(SMART_EXCHANGE).build();
+    // Build an order with a stable Stockholm-generated correlation reference.
     let order_ref = format!("{ORDER_REF_PREFIX}{}", Uuid::new_v4().simple());
     let mut order = client
-        .order(&contract)
+        .order(contract)
         .sell(shares)
         .limit(limit)
         .outside_rth()
@@ -640,7 +702,7 @@ async fn place_limit_sell(
             order_id,
             VolatileOrder {
                 order_ref: order_ref.clone(),
-                symbol: symbol.to_string(),
+                contract: contract.clone(),
                 price: limit,
                 side: Side::Sell,
                 filled_shares: 0.0_f64,
@@ -651,8 +713,11 @@ async fn place_limit_sell(
     }
 
     // Submit the order only after its state has been safely persisted.
-    client.submit_order(order_id, &contract, &order).await?;
-    info!("Submitted limit sell {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}");
+    client.submit_order(order_id, contract, &order).await?;
+    info!(
+        "Submitted limit sell {order_id} ({order_ref}): {shares} {} @ ${limit:.2}",
+        contract.symbol,
+    );
 
     Ok(())
 }
@@ -748,10 +813,18 @@ async fn update_open_order(
     runtime_state: &RwLock<RuntimeState>,
     data: &OrderData,
 ) -> io::Result<()> {
+    // Require a broker identity so tracked orders can be matched to the correct position.
+    if data.contract.contract_id <= 0_i32 {
+        return Err(io::Error::other(format!(
+            "IBKR returned no valid contract ID for Stockholm order {}.",
+            data.order.order_ref,
+        )));
+    }
+
     // Validate connection-specific details before changing either representation.
     let volatile_order = VolatileOrder {
         order_ref: data.order.order_ref.clone(),
-        symbol: data.contract.symbol.to_string(),
+        contract: data.contract.clone(),
         price: data
             .order
             .limit_price
@@ -870,11 +943,16 @@ fn calculate_open_buy_order_value(open_orders: &HashMap<i32, VolatileOrder>) -> 
 }
 
 // Total the shares still reserved by active sell orders.
-fn calculate_open_sell_shares(open_orders: &HashMap<i32, VolatileOrder>, symbol: &str) -> f64 {
-    // Reserve only matching unfilled sells because positions are tracked per symbol.
+fn calculate_open_sell_shares(
+    open_orders: &HashMap<i32, VolatileOrder>,
+    contract: &Contract,
+) -> f64 {
+    // Reserve only unfilled sells for the contract whose position we track.
     open_orders
         .values()
-        .filter(|order| order.symbol == symbol && order.side == Side::Sell)
+        .filter(|order| {
+            order.contract.contract_id == contract.contract_id && order.side == Side::Sell
+        })
         .map(|order| order.remaining_shares)
         .sum()
 }
@@ -974,11 +1052,15 @@ mod tests {
     use super::{
         Args, RuntimeState, Side, VolatileOrder, calculate_buying_power,
         calculate_open_buy_order_value, calculate_open_sell_shares, calculate_order_limits,
-        initial_volatile_state, round_down_to_cent, round_up_to_cent, update_account_metric,
+        initial_volatile_state, resolve_contract_id, round_down_to_cent, round_up_to_cent,
+        update_account_metric,
     };
     use crate::state;
     use clap::Parser;
-    use ibapi::accounts::AccountSummaryTags;
+    use ibapi::{
+        accounts::AccountSummaryTags,
+        contracts::{Contract, ContractDetails},
+    };
     use std::collections::HashMap;
     use tokio::sync::RwLock;
 
@@ -1062,14 +1144,45 @@ mod tests {
     }
 
     #[test]
-    fn total_only_remaining_buy_orders() {
-        // Ignore filled quantities and sell orders when totaling reserved notional.
+    fn resolve_only_unambiguous_contract_ids() {
+        // Model lookup rows for the same stock routed to different venues.
+        let stock = Contract::stock("SOXL").build();
+        let details = |contract_id, exchange| ContractDetails {
+            contract: Contract {
+                contract_id,
+                exchange,
+                ..stock.clone()
+            },
+            ..ContractDetails::default()
+        };
+        let smart = details(101_i32, "SMART".into());
+        let arca = details(101_i32, "ARCA".into());
+
+        // Accept equivalent rows and reject absent, invalid, or distinct IDs.
+        assert_eq!(
+            resolve_contract_id(&stock, &[smart.clone(), arca]).unwrap(),
+            101_i32,
+        );
+        assert!(resolve_contract_id(&stock, &[]).is_err());
+        assert!(resolve_contract_id(&stock, &[details(0_i32, "SMART".into())]).is_err());
+        assert!(resolve_contract_id(&stock, &[smart, details(102_i32, "SMART".into())]).is_err());
+    }
+
+    #[test]
+    fn total_outstanding_order_reservations() {
+        // Use different routing for the sell while retaining the same contract ID.
+        let mut soxl = Contract::stock("SOXL").build();
+        soxl.contract_id = 101_i32;
+        let soxl_on_arca = Contract {
+            exchange: "ARCA".into(),
+            ..soxl.clone()
+        };
         let open_orders = HashMap::from([
             (
                 1_i32,
                 VolatileOrder {
                     order_ref: "stockholm:buy".to_string(),
-                    symbol: "SOXL".to_string(),
+                    contract: soxl.clone(),
                     price: 10.0,
                     side: Side::Buy,
                     filled_shares: 3.0,
@@ -1080,7 +1193,7 @@ mod tests {
                 2_i32,
                 VolatileOrder {
                     order_ref: "stockholm:sell".to_string(),
-                    symbol: "SOXL".to_string(),
+                    contract: soxl_on_arca,
                     price: 20.0,
                     side: Side::Sell,
                     filled_shares: 0.0,
@@ -1089,9 +1202,14 @@ mod tests {
             ),
         ]);
 
+        // Reserve orders by ID even when another instrument has the same symbol.
+        let other_contract = Contract {
+            contract_id: 102_i32,
+            ..soxl.clone()
+        };
         assert!((calculate_open_buy_order_value(&open_orders) - 20.0_f64).abs() < f64::EPSILON);
-        assert!((calculate_open_sell_shares(&open_orders, "SOXL") - 4.0_f64).abs() < f64::EPSILON);
-        assert!(calculate_open_sell_shares(&open_orders, "AAPL").abs() < f64::EPSILON);
+        assert!((calculate_open_sell_shares(&open_orders, &soxl) - 4.0_f64).abs() < f64::EPSILON);
+        assert!(calculate_open_sell_shares(&open_orders, &other_contract).abs() < f64::EPSILON);
     }
 
     #[test]

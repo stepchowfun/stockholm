@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.51] - 2026-11-28
+
+### Added
+
+- Backtest the neural-net strategy with a saved model.
+- Plot opening prices alongside the difference between upper- and lower-barrier probabilities with `plot_inference.rb`.
+
+### Changed
+
+- Train the forecasting model to predict which price barrier is reached first or whether neither is reached, and export timestamped probabilities for all three outcomes.
+- Stream live tick-by-tick bid and ask quotes through SMART.
+- Move the bundled historical CSVs to `historical_data` and rename the Interactive Brokers Gateway script to `run_ib_gateway.sh`.
+
+### Fixed
+
+- Match live positions, sell reservations, and liquidation orders by Interactive Brokers contract ID so different instruments with the same ticker stay separate.
+- Export daily and longer historical bars with Unix timestamps in seconds.
+
 ## [0.2.50] - 2026-08-18
 
 ### Changed
