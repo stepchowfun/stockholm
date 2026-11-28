@@ -218,7 +218,7 @@ async fn run_with_connection(
         ),
         stream_account_summary(client, runtime_state),
         stream_order_updates(order_updates, runtime_state),
-        stream_positions(client, contract.symbol.as_str(), runtime_state),
+        stream_positions(client, contract, runtime_state),
         stream_tick_by_tick(client, contract, runtime_state),
         clear_stale_quotes(runtime_state),
     )?;
@@ -330,12 +330,13 @@ async fn stream_order_updates(
 // Stream positions for the configured symbol for the life of the connection.
 async fn stream_positions(
     client: &Client,
-    symbol: &str,
+    contract: &Contract,
     runtime_state: &RwLock<RuntimeState>,
 ) -> Result<(), Box<dyn Error>> {
     // Subscribe to an initial snapshot followed by incremental position updates.
     let subscription = client.positions().await?;
     let mut updates = subscription.filter_data();
+    let symbol = contract.symbol.as_str();
     debug!("Streaming positions for {symbol}…");
 
     // Retain the matching position and use zero when the initial snapshot omits the symbol.
