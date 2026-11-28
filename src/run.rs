@@ -419,14 +419,16 @@ async fn stream_tick_by_tick(
     runtime_state: &RwLock<RuntimeState>,
 ) -> Result<(), Box<dyn Error>> {
     // Subscribe to a continuous quote stream for the trading contract.
-    let symbol = &contract.symbol;
     let exchange = &contract.exchange;
     let subscription = client
         .tick_by_tick(contract, 0)
         .bid_ask(IgnoreSize::Yes)
         .await?;
     let mut quotes = subscription.filter_data();
-    debug!("Streaming tick-by-tick quotes for {symbol} from {exchange}…");
+    debug!(
+        "Streaming tick-by-tick quotes for {} from {exchange}…",
+        contract.symbol,
+    );
 
     // Update both sides atomically and propagate stream failures to the connection loop.
     while let Some(quote) = quotes.next().await {
@@ -438,7 +440,10 @@ async fn stream_tick_by_tick(
             state.volatile.ask_price = (quote.ask_price > 0.0_f64).then_some(quote.ask_price);
             state.volatile.ask_price_timestamp = state.volatile.ask_price.map(|_| quote.time);
         }
-        debug!("Tick-by-tick quote for {symbol} ({exchange}): {quote:?}");
+        debug!(
+            "Tick-by-tick quote for {} ({exchange}): {quote:?}",
+            contract.symbol,
+        );
     }
 
     Err(ibapi::Error::UnexpectedEndOfStream.into())
@@ -620,7 +625,6 @@ async fn place_limit_buy(
     runtime_state: &RwLock<RuntimeState>,
 ) -> Result<(), Box<dyn Error>> {
     // Build an order with a stable Stockholm-generated correlation reference.
-    let symbol = contract.symbol.as_str();
     let order_ref = format!("{ORDER_REF_PREFIX}{}", Uuid::new_v4().simple());
     let mut order = client
         .order(contract)
@@ -657,7 +661,10 @@ async fn place_limit_buy(
 
     // Submit the order only after its state has been safely persisted.
     client.submit_order(order_id, contract, &order).await?;
-    info!("Submitted limit buy {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}");
+    info!(
+        "Submitted limit buy {order_id} ({order_ref}): {shares} {} @ ${limit:.2}",
+        contract.symbol,
+    );
 
     Ok(())
 }
@@ -671,7 +678,6 @@ async fn place_limit_sell(
     runtime_state: &RwLock<RuntimeState>,
 ) -> Result<(), Box<dyn Error>> {
     // Build an order with a stable Stockholm-generated correlation reference.
-    let symbol = contract.symbol.as_str();
     let order_ref = format!("{ORDER_REF_PREFIX}{}", Uuid::new_v4().simple());
     let mut order = client
         .order(contract)
@@ -708,7 +714,10 @@ async fn place_limit_sell(
 
     // Submit the order only after its state has been safely persisted.
     client.submit_order(order_id, contract, &order).await?;
-    info!("Submitted limit sell {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}");
+    info!(
+        "Submitted limit sell {order_id} ({order_ref}): {shares} {} @ ${limit:.2}",
+        contract.symbol,
+    );
 
     Ok(())
 }
