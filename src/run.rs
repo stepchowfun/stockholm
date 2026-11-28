@@ -407,9 +407,8 @@ async fn run_control_step(
     initial_margin_requirement: f64,
 ) -> Result<(), Box<dyn Error>> {
     // Select order lifetimes and trading behavior from the current Eastern time.
-    let symbol = contract.symbol.as_str();
     let liquidating = is_liquidating();
-    cancel_expired_orders(client, runtime_state, symbol, liquidating).await?;
+    cancel_expired_orders(client, runtime_state, contract, liquidating).await?;
 
     // Snapshot resources and quotes without retaining the state lock across submissions.
     let (buying_power, bid_price, ask_price, sellable_shares) = {
@@ -429,7 +428,7 @@ async fn run_control_step(
                         open_buy_order_value,
                     )
                 });
-        let reserved_sell_shares = calculate_open_sell_shares(&state.open_orders, symbol);
+        let reserved_sell_shares = calculate_open_sell_shares(&state.open_orders, contract);
         let sellable_shares = state
             .position_shares
             .map(|shares| (shares - reserved_sell_shares).max(0.0_f64).floor());
@@ -516,10 +515,11 @@ fn format_open_orders(open_orders: &HashMap<i32, VolatileOrder>) -> String {
 async fn cancel_expired_orders(
     client: &Client,
     runtime_state: &RwLock<RuntimeState>,
-    symbol: &str,
+    contract: &Contract,
     liquidating: bool,
 ) -> Result<(), Box<dyn Error>> {
     // Join order representations and persist cancellation attempts under one state guard.
+    let symbol = contract.symbol.as_str();
     let cancellation_attempts = {
         let mut state = runtime_state.write().await;
         let volatile_orders = state
@@ -881,8 +881,12 @@ fn calculate_open_buy_order_value(open_orders: &HashMap<i32, VolatileOrder>) -> 
 }
 
 // Total the shares still reserved by active sell orders.
-fn calculate_open_sell_shares(open_orders: &HashMap<i32, VolatileOrder>, symbol: &str) -> f64 {
+fn calculate_open_sell_shares(
+    open_orders: &HashMap<i32, VolatileOrder>,
+    contract: &Contract,
+) -> f64 {
     // Reserve only matching unfilled sells because positions are tracked per symbol.
+    let symbol = contract.symbol.as_str();
     open_orders
         .values()
         .filter(|order| order.symbol == symbol && order.side == Side::Sell)
@@ -989,7 +993,7 @@ mod tests {
     };
     use crate::state;
     use clap::Parser;
-    use ibapi::accounts::AccountSummaryTags;
+    use ibapi::{accounts::AccountSummaryTags, contracts::Contract};
     use std::collections::HashMap;
     use tokio::sync::RwLock;
 
@@ -1100,9 +1104,12 @@ mod tests {
             ),
         ]);
 
+        // Value outstanding buys and reserve sell shares for the matching contract symbol.
+        let soxl = Contract::stock("SOXL").build();
+        let aapl = Contract::stock("AAPL").build();
         assert!((calculate_open_buy_order_value(&open_orders) - 20.0_f64).abs() < f64::EPSILON);
-        assert!((calculate_open_sell_shares(&open_orders, "SOXL") - 4.0_f64).abs() < f64::EPSILON);
-        assert!(calculate_open_sell_shares(&open_orders, "AAPL").abs() < f64::EPSILON);
+        assert!((calculate_open_sell_shares(&open_orders, &soxl) - 4.0_f64).abs() < f64::EPSILON);
+        assert!(calculate_open_sell_shares(&open_orders, &aapl).abs() < f64::EPSILON);
     }
 
     #[test]
