@@ -159,6 +159,11 @@ fn initial_volatile_state() -> VolatileState {
 
 // Run the main trading loop.
 pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<dyn Error>> {
+    // Use one instrument for quotes and order placement across all connections.
+    let contract = Contract::stock(&args.symbol)
+        .on_exchange(SMART_EXCHANGE)
+        .build();
+
     // Load persisted state once and pair it with empty connection-local state.
     let runtime_state = RwLock::new(RuntimeState {
         persistent: state::load().unwrap_or_else(|error| {
@@ -175,7 +180,9 @@ pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<d
         // Connect to the configured TWS or IB Gateway instance for this attempt.
         match Client::connect(address, client_id).await {
             Ok(client) => {
-                if let Err(error) = run_with_connection(&client, args, &runtime_state).await {
+                if let Err(error) =
+                    run_with_connection(&client, &contract, args, &runtime_state).await
+                {
                     error!("{error}");
                 }
             }
@@ -189,6 +196,7 @@ pub async fn run(address: &str, client_id: i32, args: &Args) -> Result<(), Box<d
 // Run the control and streaming futures together on one connection.
 async fn run_with_connection(
     client: &Client,
+    contract: &Contract,
     args: &Args,
     runtime_state: &RwLock<RuntimeState>,
 ) -> Result<(), Box<dyn Error>> {
@@ -204,14 +212,14 @@ async fn run_with_connection(
         control_loop(
             client,
             runtime_state,
-            &args.symbol,
+            contract,
             args.buying_power_buffer,
             args.initial_margin_requirement,
         ),
         stream_account_summary(client, runtime_state),
         stream_order_updates(order_updates, runtime_state),
-        stream_positions(client, &args.symbol, runtime_state),
-        stream_tick_by_tick(client, &args.symbol, runtime_state),
+        stream_positions(client, contract.symbol.as_str(), runtime_state),
+        stream_tick_by_tick(client, contract, runtime_state),
         clear_stale_quotes(runtime_state),
     )?;
 
@@ -222,7 +230,7 @@ async fn run_with_connection(
 async fn control_loop(
     client: &Client,
     runtime_state: &RwLock<RuntimeState>,
-    symbol: &str,
+    contract: &Contract,
     buying_power_buffer: f64,
     initial_margin_requirement: f64,
 ) -> Result<(), Box<dyn Error>> {
@@ -230,7 +238,7 @@ async fn control_loop(
         run_control_step(
             client,
             runtime_state,
-            symbol,
+            contract,
             buying_power_buffer,
             initial_margin_requirement,
         )
@@ -360,17 +368,18 @@ async fn clear_stale_quotes(runtime_state: &RwLock<RuntimeState>) -> Result<(), 
 // Stream tick-by-tick SMART bid and ask prices for the configured symbol.
 async fn stream_tick_by_tick(
     client: &Client,
-    symbol: &str,
+    contract: &Contract,
     runtime_state: &RwLock<RuntimeState>,
 ) -> Result<(), Box<dyn Error>> {
-    // Subscribe to a continuous SMART quote stream.
-    let contract = Contract::stock(symbol).on_exchange(SMART_EXCHANGE).build();
+    // Subscribe to a continuous quote stream for the trading contract.
+    let symbol = &contract.symbol;
+    let exchange = &contract.exchange;
     let subscription = client
-        .tick_by_tick(&contract, 0)
+        .tick_by_tick(contract, 0)
         .bid_ask(IgnoreSize::Yes)
         .await?;
     let mut quotes = subscription.filter_data();
-    debug!("Streaming tick-by-tick quotes for {symbol} from {SMART_EXCHANGE}…");
+    debug!("Streaming tick-by-tick quotes for {symbol} from {exchange}…");
 
     // Update both sides atomically and propagate stream failures to the connection loop.
     while let Some(quote) = quotes.next().await {
@@ -382,7 +391,7 @@ async fn stream_tick_by_tick(
             state.volatile.ask_price = (quote.ask_price > 0.0_f64).then_some(quote.ask_price);
             state.volatile.ask_price_timestamp = state.volatile.ask_price.map(|_| quote.time);
         }
-        debug!("Tick-by-tick quote for {symbol} ({SMART_EXCHANGE}): {quote:?}");
+        debug!("Tick-by-tick quote for {symbol} ({exchange}): {quote:?}");
     }
 
     Err(ibapi::Error::UnexpectedEndOfStream.into())
@@ -392,11 +401,12 @@ async fn stream_tick_by_tick(
 async fn run_control_step(
     client: &Client,
     runtime_state: &RwLock<RuntimeState>,
-    symbol: &str,
+    contract: &Contract,
     buying_power_buffer: f64,
     initial_margin_requirement: f64,
 ) -> Result<(), Box<dyn Error>> {
     // Select order lifetimes and trading behavior from the current Eastern time.
+    let symbol = contract.symbol.as_str();
     let liquidating = is_liquidating();
     cancel_expired_orders(client, runtime_state, symbol, liquidating).await?;
 
@@ -458,7 +468,7 @@ async fn run_control_step(
     {
         let shares = (buying_power / limit).floor();
         if shares >= 1.0_f64 {
-            place_limit_buy(client, symbol, shares, limit, runtime_state).await?;
+            place_limit_buy(client, contract, shares, limit, runtime_state).await?;
         }
     }
 
@@ -467,7 +477,7 @@ async fn run_control_step(
         && limit > 0.0_f64
         && sellable_shares > 0.0_f64
     {
-        place_limit_sell(client, symbol, sellable_shares, limit, runtime_state).await?;
+        place_limit_sell(client, contract, sellable_shares, limit, runtime_state).await?;
     }
 
     Ok(())
@@ -558,16 +568,16 @@ fn is_liquidating() -> bool {
 // Place a limit order to buy the requested number of shares.
 async fn place_limit_buy(
     client: &Client,
-    symbol: &str,
+    contract: &Contract,
     shares: f64,
     limit: f64,
     runtime_state: &RwLock<RuntimeState>,
 ) -> Result<(), Box<dyn Error>> {
-    // Build a SMART order with a stable Stockholm-generated correlation reference.
-    let contract = Contract::stock(symbol).on_exchange(SMART_EXCHANGE).build();
+    // Build an order with a stable Stockholm-generated correlation reference.
+    let symbol = contract.symbol.as_str();
     let order_ref = format!("{ORDER_REF_PREFIX}{}", Uuid::new_v4().simple());
     let mut order = client
-        .order(&contract)
+        .order(contract)
         .buy(shares)
         .limit(limit)
         .outside_rth()
@@ -600,7 +610,7 @@ async fn place_limit_buy(
     }
 
     // Submit the order only after its state has been safely persisted.
-    client.submit_order(order_id, &contract, &order).await?;
+    client.submit_order(order_id, contract, &order).await?;
     info!("Submitted limit buy {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}");
 
     Ok(())
@@ -609,16 +619,16 @@ async fn place_limit_buy(
 // Place a limit order to sell the requested number of shares.
 async fn place_limit_sell(
     client: &Client,
-    symbol: &str,
+    contract: &Contract,
     shares: f64,
     limit: f64,
     runtime_state: &RwLock<RuntimeState>,
 ) -> Result<(), Box<dyn Error>> {
-    // Build a SMART order with a stable Stockholm-generated correlation reference.
-    let contract = Contract::stock(symbol).on_exchange(SMART_EXCHANGE).build();
+    // Build an order with a stable Stockholm-generated correlation reference.
+    let symbol = contract.symbol.as_str();
     let order_ref = format!("{ORDER_REF_PREFIX}{}", Uuid::new_v4().simple());
     let mut order = client
-        .order(&contract)
+        .order(contract)
         .sell(shares)
         .limit(limit)
         .outside_rth()
@@ -651,7 +661,7 @@ async fn place_limit_sell(
     }
 
     // Submit the order only after its state has been safely persisted.
-    client.submit_order(order_id, &contract, &order).await?;
+    client.submit_order(order_id, contract, &order).await?;
     info!("Submitted limit sell {order_id} ({order_ref}): {shares} {symbol} @ ${limit:.2}");
 
     Ok(())
